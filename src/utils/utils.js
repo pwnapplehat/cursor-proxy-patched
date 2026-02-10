@@ -25,6 +25,16 @@ function generateCursorBody(messages, modelName, tools, toolChoice) {
   let processedMessages = convertToolResultMessages(messages);
   processedMessages = injectToolsIntoMessages(processedMessages, tools, toolChoice);
 
+  // DIAGNOSTIC: Check user messages for workspace/mode context that Cursor's
+  // system prompt might reference to restrict tool access
+  const firstUserMsg = processedMessages.find(m => m.role === 'user');
+  if (firstUserMsg) {
+    const uc = normalizeContent(firstUserMsg.content);
+    if (/workspace|mode|tool|agent|cursor/i.test(uc)) {
+      console.log(`[generateCursorBody] DIAG: User msg has workspace/mode/tool refs (first 400): ${uc.substring(0, 400).replace(/\n/g, '\\n')}`);
+    }
+  }
+
   // Both "system" and "developer" roles go into the protobuf instruction field
   const instruction = processedMessages
     .filter(msg => isSystemRole(msg.role))
