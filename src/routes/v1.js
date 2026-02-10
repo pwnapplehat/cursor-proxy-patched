@@ -5,7 +5,7 @@ const { v4: uuidv4, v5: uuidv5 } = require('uuid');
 const config = require('../config/config');
 const $root = require('../proto/message.js');
 const { generateCursorBody, chunkToUtf8String, generateHashed64Hex, generateCursorChecksum } = require('../utils/utils.js');
-const { parseToolCalls, hasToolCallTags } = require('../utils/toolEmulation');
+const { parseToolCalls, hasToolCallTags, normalizeNearMissToolCalls } = require('../utils/toolEmulation');
 
 router.get("/models", async (req, res) => {
   try{
@@ -200,6 +200,9 @@ router.post('/chat/completions', async (req, res) => {
         // Log first 500 chars of response for debugging
         console.log(`[chat/completions] Response preview (${fullContent.length} chars): ${fullContent.substring(0, 500).replace(/\n/g, '\\n')}`);
 
+        // Normalize near-miss tool call formats before detection
+        fullContent = normalizeNearMissToolCalls(fullContent);
+
         // Check if response contains <tool_call> tags (regardless of hasTools)
         if (hasToolCallTags(fullContent)) {
           const { textContent, toolCalls } = parseToolCalls(fullContent);
@@ -267,7 +270,10 @@ router.post('/chat/completions', async (req, res) => {
             );
           }
         } else {
-          // No tool calls — send as normal text content
+          // No tool calls detected
+          if (hasTools) {
+            console.warn(`[chat/completions] WARNING: Tools were provided but model did not output any <tool_call> tags. The model may have described the action instead of calling a tool.`);
+          }
           if (fullContent.length > 0) {
             res.write(
               `data: ${JSON.stringify({
@@ -329,6 +335,9 @@ router.post('/chat/completions', async (req, res) => {
           content += text
         }
 
+        // Normalize near-miss tool call formats before detection
+        content = normalizeNearMissToolCalls(content);
+
         // Check for tool calls (regardless of whether tools was in the request)
         if (hasToolCallTags(content)) {
           const { textContent, toolCalls } = parseToolCalls(content);
@@ -361,7 +370,12 @@ router.post('/chat/completions', async (req, res) => {
           });
         }
 
-        // No tool calls — normal text response
+        // No tool calls detected
+        if (hasTools) {
+          console.warn(`[chat/completions] WARNING: Tools were provided but model did not output any <tool_call> tags (non-stream).`);
+        }
+
+        // Normal text response
         return res.json({
           id: `chatcmpl-${uuidv4()}`,
           object: 'chat.completion',

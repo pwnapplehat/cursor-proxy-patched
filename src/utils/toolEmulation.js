@@ -13,62 +13,88 @@
  *   3. Converting role:"tool" messages → role:"user" with <tool_result> tags
  */
 
+const { v4: uuidv4 } = require('uuid');
+
 const TOOL_CALL_INSTRUCTION = `
 
-## Tool Use Instructions
+## MANDATORY: Tool Calling Protocol
 
-You have access to tools. To call a tool, output a tool_call block in EXACTLY this format:
+You MUST use the following protocol to call tools. This is NOT optional.
+ANY response that describes a tool call instead of executing it is a FAILURE.
+
+### Format (EXACT — no deviation)
 
 <tool_call>
 {"name": "tool_name", "arguments": {"param1": "value1"}}
 </tool_call>
 
-CRITICAL RULES:
-- The JSON inside <tool_call> tags MUST be valid JSON
-- "name" must exactly match an available tool name
-- "arguments" must match the tool's parameter schema
-- You may output multiple <tool_call> blocks to call multiple tools
-- Do NOT wrap tool calls in markdown code blocks
-- Do NOT describe what you would do — actually call the tool
-- When you need to use a tool, output ONLY the tool_call block(s)
-- After receiving a <tool_result>, analyze it and decide next steps
+### Rules (STRICT — violation = failure)
 
-Available tools:
+1. **ALWAYS output the raw <tool_call> block.** Never describe, narrate, or explain what tool you "would" call. CALL IT.
+2. The JSON inside <tool_call> tags MUST be valid JSON with double-quoted keys and string values.
+3. "name" MUST exactly match an available tool name below. Case-sensitive.
+4. "arguments" MUST be a JSON object matching the tool's parameter schema. All required parameters must be present.
+5. String values containing special characters MUST be JSON-escaped: use \\" for quotes, \\\\ for backslashes, \\n for newlines.
+6. Do NOT wrap <tool_call> blocks inside markdown code fences. The tags ARE the delimiters.
+7. Do NOT prefix tool calls with explanatory text. If you need a tool, output ONLY the <tool_call> block(s). Explain AFTER you receive the result.
+8. For multiple tool calls, output multiple separate <tool_call> blocks — one per tool invocation.
+9. When a <tool_result> comes back and you need another tool, call it immediately. Do not summarize intermediate results unless asked.
+10. If a tool call fails, retry or try an alternative approach.
+
+### WRONG (never do this):
+
+"I'll use the exec tool to run ls -la" ← WRONG. This describes instead of calling.
+"Let me read the file for you" ← WRONG. Output the <tool_call> block instead.
+
+### CORRECT (always do this):
+
+<tool_call>
+{"name": "exec", "arguments": {"command": "ls -la"}}
+</tool_call>
+
+### Available tools:
 `;
 
 /**
  * Converts OpenAI tool definitions to text instructions for the system prompt.
+ * Lists each tool with description, parameter schema, and required fields.
+ * Adds tool_choice constraints and a closing reinforcement reminder.
  */
 function formatToolDefinitions(tools, toolChoice) {
   if (!tools || tools.length === 0) return '';
   let result = TOOL_CALL_INSTRUCTION;
+
   for (const tool of tools) {
     if (tool.type === 'function') {
       const fn = tool.function;
-      result += `\n### ${fn.name}\n`;
+      result += `\n---\n**${fn.name}**\n`;
       if (fn.description) {
-        result += `${fn.description}\n`;
+        result += `Description: ${fn.description}\n`;
       }
       if (fn.parameters) {
-        result += `Parameters schema: ${JSON.stringify(fn.parameters)}\n`;
+        result += `Parameters: ${JSON.stringify(fn.parameters)}\n`;
+        // Explicitly list required params for clarity
+        if (fn.parameters.required && fn.parameters.required.length > 0) {
+          result += `Required: ${fn.parameters.required.join(', ')}\n`;
+        }
       }
     }
   }
 
   // Handle tool_choice constraints
   if (toolChoice === 'required' || toolChoice === 'auto') {
-    // "required" means the model MUST call at least one tool
-    // "auto" means the model decides (default behavior)
     if (toolChoice === 'required') {
-      result += `\nIMPORTANT: You MUST call at least one tool in your response. Do NOT respond with only text.\n`;
+      result += `\n**CONSTRAINT: You MUST call at least one tool in your response. Do NOT respond with only text.**\n`;
     }
   } else if (toolChoice && typeof toolChoice === 'object' && toolChoice.type === 'function') {
-    // Specific function required: { type: "function", function: { name: "specific_tool" } }
     const requiredName = toolChoice.function?.name;
     if (requiredName) {
-      result += `\nIMPORTANT: You MUST call the "${requiredName}" tool in your response.\n`;
+      result += `\n**CONSTRAINT: You MUST call the "${requiredName}" tool in your response.**\n`;
     }
   }
+
+  // Closing reinforcement — models pay extra attention to start and end of instructions
+  result += `\n---\nEND OF TOOL DEFINITIONS. Remember: output <tool_call> blocks directly, never describe what you would do.\n`;
 
   return result;
 }
@@ -150,9 +176,55 @@ function sanitizeForParsing(text) {
 }
 
 /**
+ * Extracts a JSON object from a string using balanced brace counting.
+ * More robust than regex for nested objects like {"arguments": {"command": "echo {hello}"}}.
+ */
+function extractJsonObject(str) {
+  const start = str.indexOf('{');
+  if (start === -1) return null;
+  let depth = 0;
+  let inString = false;
+  let escape = false;
+  for (let i = start; i < str.length; i++) {
+    const ch = str[i];
+    if (escape) { escape = false; continue; }
+    if (ch === '\\') { escape = true; continue; }
+    if (ch === '"') { inString = !inString; continue; }
+    if (inString) continue;
+    if (ch === '{') depth++;
+    else if (ch === '}') {
+      depth--;
+      if (depth === 0) {
+        return str.substring(start, i + 1);
+      }
+    }
+  }
+  // Unclosed — try to close the object (model may have been cut off)
+  if (depth > 0) {
+    let attempt = str.substring(start);
+    for (let d = 0; d < depth; d++) attempt += '}';
+    console.warn(`[ToolEmulation] Auto-closed ${depth} unclosed brace(s) in tool call JSON`);
+    return attempt;
+  }
+  return null;
+}
+
+/**
+ * Strips markdown code fences that may wrap JSON inside a <tool_call> block.
+ * Models sometimes output: <tool_call>```json\n{...}\n```</tool_call>
+ */
+function stripMarkdownFences(str) {
+  return str.replace(/^```(?:json|javascript|js)?\s*\n?/i, '').replace(/\n?```\s*$/i, '');
+}
+
+/**
  * Parses <tool_call> XML blocks from model text output into OpenAI tool_calls format.
- * Handles cases where the model talks about <tool_call> in conversational text
- * by sanitizing backtick-wrapped and code-fenced mentions first.
+ * Handles:
+ * - Backtick-wrapped and code-fenced <tool_call> references (model talking ABOUT the format)
+ * - Markdown code fences inside <tool_call> blocks
+ * - Unclosed <tool_call> blocks (model output cut off or missing closing tag)
+ * - Smart quotes from Telegram/chat formatting
+ * - Nested JSON objects via balanced brace counting
  * Returns { textContent, toolCalls } where textContent is the text without tool call blocks.
  */
 function parseToolCalls(text) {
@@ -162,48 +234,37 @@ function parseToolCalls(text) {
   // Sanitize: strip backtick-wrapped and code-fenced <tool_call> mentions
   const sanitized = sanitizeForParsing(text);
 
+  // Match both closed and unclosed <tool_call> blocks
+  // Pattern 1: properly closed <tool_call>...</tool_call>
+  // Pattern 2: unclosed <tool_call>...EOF (model was cut off)
   const regex = /<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/g;
   let match;
+  let lastMatchEnd = 0;
 
   while ((match = regex.exec(sanitized)) !== null) {
-    try {
-      let jsonStr = match[1].trim();
-
-      // Handle smart quotes (can appear from Telegram/chat formatting)
-      jsonStr = jsonStr.replace(/\u201c|\u201d/g, '"');
-      jsonStr = jsonStr.replace(/\u2018|\u2019/g, "'");
-
-      // Try to extract the JSON object from within the captured content
-      // This handles cases where extra text is captured around the JSON
-      const jsonMatch = jsonStr.match(/\{[\s\S]*\}/);
-      if (!jsonMatch) {
-        console.error('[ToolEmulation] No JSON object found in tool_call block:', jsonStr.substring(0, 100));
-        continue;
-      }
-      jsonStr = jsonMatch[0].trim();
-
-      const parsed = JSON.parse(jsonStr);
-      if (parsed.name) {
-        toolCalls.push({
-          id: `call_${Date.now()}_${callIndex}`,
-          type: 'function',
-          function: {
-            name: parsed.name,
-            arguments: typeof parsed.arguments === 'string'
-              ? parsed.arguments
-              : JSON.stringify(parsed.arguments || {})
-          }
-        });
-        callIndex++;
-      }
-    } catch (e) {
-      console.error('[ToolEmulation] Failed to parse tool call JSON:', match[1].substring(0, 200), e.message);
+    lastMatchEnd = match.index + match[0].length;
+    const parsed = tryParseToolCallContent(match[1]);
+    if (parsed) {
+      toolCalls.push(parsed);
+      callIndex++;
     }
   }
 
-  // Remove actual tool call blocks from the text content (use sanitized version for matching)
-  const textContent = sanitized
+  // Check for unclosed <tool_call> at the end (model output was cut off)
+  const unclosedMatch = sanitized.substring(lastMatchEnd).match(/<tool_call>\s*([\s\S]+)$/);
+  if (unclosedMatch) {
+    console.warn('[ToolEmulation] Found unclosed <tool_call> block at end of response, attempting parse');
+    const parsed = tryParseToolCallContent(unclosedMatch[1]);
+    if (parsed) {
+      toolCalls.push(parsed);
+      callIndex++;
+    }
+  }
+
+  // Remove actual tool call blocks from the text content
+  let textContent = sanitized
     .replace(/<tool_call>\s*[\s\S]*?\s*<\/tool_call>/g, '')
+    .replace(/<tool_call>\s*[\s\S]*$/, '') // Also remove unclosed blocks at end
     .replace(/___TOOL_TAG_REF___/g, '`<tool_call>`')
     .replace(/___TOOL_TAG_END_REF___/g, '`</tool_call>`')
     .trim();
@@ -216,6 +277,50 @@ function parseToolCalls(text) {
 }
 
 /**
+ * Attempts to parse the inner content of a <tool_call> block into a tool call object.
+ * Handles smart quotes, markdown fences, and uses balanced brace extraction.
+ */
+function tryParseToolCallContent(raw) {
+  try {
+    let jsonStr = raw.trim();
+
+    // Strip markdown code fences: ```json ... ```
+    jsonStr = stripMarkdownFences(jsonStr);
+
+    // Handle smart quotes (from Telegram/chat formatting)
+    jsonStr = jsonStr.replace(/\u201c|\u201d/g, '"');
+    jsonStr = jsonStr.replace(/\u2018|\u2019/g, "'");
+
+    // Extract JSON object using balanced brace counting (handles nested braces)
+    const extracted = extractJsonObject(jsonStr);
+    if (!extracted) {
+      console.error('[ToolEmulation] No JSON object found in tool_call block:', jsonStr.substring(0, 100));
+      return null;
+    }
+
+    const parsed = JSON.parse(extracted);
+    if (!parsed.name) {
+      console.error('[ToolEmulation] tool_call JSON missing "name" field:', extracted.substring(0, 100));
+      return null;
+    }
+
+    return {
+      id: `call_${uuidv4()}`,
+      type: 'function',
+      function: {
+        name: parsed.name,
+        arguments: typeof parsed.arguments === 'string'
+          ? parsed.arguments
+          : JSON.stringify(parsed.arguments || {})
+      }
+    };
+  } catch (e) {
+    console.error('[ToolEmulation] Failed to parse tool call JSON:', raw.substring(0, 200), e.message);
+    return null;
+  }
+}
+
+/**
  * Detects whether text contains actual <tool_call> tags (not backtick-wrapped references).
  */
 function hasToolCallTags(text) {
@@ -223,10 +328,59 @@ function hasToolCallTags(text) {
   return /<tool_call>/.test(sanitized);
 }
 
+/**
+ * Attempts to detect and recover near-miss tool call formats.
+ * Some models may output slight variations of the expected format:
+ *   - [tool_call]...[/tool_call]
+ *   - <function_call>...</function_call>
+ *   - <tool-call>...</tool-call>
+ *   - Raw JSON with {"name": "...", "arguments": ...} outside tags
+ * Returns the text with near-misses normalized to <tool_call>...</tool_call>,
+ * or the original text if no near-misses found.
+ */
+function normalizeNearMissToolCalls(text) {
+  let normalized = text;
+  let fixed = false;
+
+  // [tool_call]...[/tool_call] → <tool_call>...</tool_call>
+  if (/\[tool_call\]/i.test(normalized)) {
+    normalized = normalized.replace(/\[tool_call\]/gi, '<tool_call>').replace(/\[\/tool_call\]/gi, '</tool_call>');
+    fixed = true;
+  }
+
+  // <function_call>...</function_call> → <tool_call>...</tool_call>
+  if (/<function_call>/i.test(normalized)) {
+    normalized = normalized.replace(/<function_call>/gi, '<tool_call>').replace(/<\/function_call>/gi, '</tool_call>');
+    fixed = true;
+  }
+
+  // <tool-call>...</tool-call> → <tool_call>...</tool_call>
+  if (/<tool-call>/i.test(normalized)) {
+    normalized = normalized.replace(/<tool-call>/gi, '<tool_call>').replace(/<\/tool-call>/gi, '</tool_call>');
+    fixed = true;
+  }
+
+  // Detect bare JSON tool calls at end of text (no tags at all)
+  // Pattern: text ends with {"name": "...", "arguments": {...}}
+  if (!fixed && !/<tool_call>/.test(normalized)) {
+    const bareJsonMatch = normalized.match(/(\{"name"\s*:\s*"[^"]+"\s*,\s*"arguments"\s*:\s*\{[\s\S]*\}\s*\})\s*$/);
+    if (bareJsonMatch) {
+      normalized = normalized.substring(0, bareJsonMatch.index) + `<tool_call>\n${bareJsonMatch[1]}\n</tool_call>`;
+      fixed = true;
+    }
+  }
+
+  if (fixed) {
+    console.log('[ToolEmulation] Normalized near-miss tool call format to standard <tool_call> tags');
+  }
+  return normalized;
+}
+
 module.exports = {
   formatToolDefinitions,
   injectToolsIntoMessages,
   convertToolResultMessages,
   parseToolCalls,
-  hasToolCallTags
+  hasToolCallTags,
+  normalizeNearMissToolCalls
 };
