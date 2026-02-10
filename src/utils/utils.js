@@ -113,50 +113,88 @@ function generateCursorBody(messages, modelName, tools, toolChoice) {
   return finalBody
 }
 
+/**
+ * Parses Cursor's binary-framed streaming response into text.
+ * Frame format: [1 byte magic] [4 bytes BE length] [N bytes data]
+ *   magic 0 = raw protobuf, 1 = gzipped protobuf (chat content)
+ *   magic 2 = raw JSON,     3 = gzipped JSON     (metadata/errors)
+ *
+ * FIX: The old code had a single try/catch around the entire loop.
+ * When a gzip frame was split across TCP packets, gunzipSync threw
+ * Z_BUF_ERROR and the catch aborted ALL remaining frames — losing content.
+ * Now: per-frame try/catch + frame boundary validation so one bad frame
+ * doesn't kill the parse.
+ */
 function chunkToUtf8String(chunk) {
-  const thinkingOutput = []
-  const textOutput = []
-  const buffer = Buffer.from(chunk, 'hex');
+  const thinkingOutput = [];
+  const textOutput = [];
+  const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
 
-  try {
-    for(let i = 0; i < buffer.length; i++){
-      const magicNumber = parseInt(buffer.subarray(i, i + 1).toString('hex'), 16)
-      const dataLength = parseInt(buffer.subarray(i + 1, i + 5).toString('hex'), 16)
-      const data = buffer.subarray(i + 5, i + 5 + dataLength)
+  let i = 0;
+  while (i < buffer.length) {
+    // Need at least 5 bytes for the frame header (1 magic + 4 length)
+    if (i + 5 > buffer.length) {
+      break;
+    }
 
-      if (magicNumber == 0 || magicNumber == 1) {
-        const gunzipData = magicNumber == 0 ? data : zlib.gunzipSync(data)
+    const magicNumber = buffer[i];
+    const dataLength = buffer.readUInt32BE(i + 1);
+
+    // Validate frame data fits within the buffer
+    if (dataLength === 0 || i + 5 + dataLength > buffer.length) {
+      // Incomplete frame — data extends beyond buffer boundary.
+      // This is the root cause of Z_BUF_ERROR: the gzip frame is split
+      // across two TCP packets so gunzipSync gets a truncated stream.
+      // With buffer accumulation in v1.js this should no longer happen,
+      // but we guard here as a safety net.
+      if (dataLength > 0) {
+        console.warn(`[chunkToUtf8String] Incomplete frame at offset ${i}: need ${dataLength} bytes, only ${buffer.length - i - 5} available — skipping remainder`);
+      }
+      break;
+    }
+
+    const data = buffer.subarray(i + 5, i + 5 + dataLength);
+
+    try {
+      if (magicNumber === 0 || magicNumber === 1) {
+        const gunzipData = magicNumber === 0 ? data : zlib.gunzipSync(data);
         const response = $root.StreamUnifiedChatWithToolsResponse.decode(gunzipData);
 
-        const thinking = response?.message?.thinking?.content
-        if (thinking !== undefined){
-          thinkingOutput.push(thinking)
+        const thinking = response?.message?.thinking?.content;
+        if (thinking !== undefined) {
+          thinkingOutput.push(thinking);
         }
 
-        const content = response?.message?.content
-        if (content !== undefined){
-          textOutput.push(content)
+        const content = response?.message?.content;
+        if (content !== undefined) {
+          textOutput.push(content);
         }
-      } else if (magicNumber == 2 || magicNumber == 3) {
-        const gunzipData = magicNumber == 2 ? data : zlib.gunzipSync(data)
-        const utf8 = gunzipData.toString('utf-8')
-        const message = JSON.parse(utf8)
-        if (message != null && (typeof message !== 'object' || (Array.isArray(message) ? message.length > 0 : Object.keys(message).length > 0))){
-          console.error(utf8)
+      } else if (magicNumber === 2 || magicNumber === 3) {
+        const gunzipData = magicNumber === 2 ? data : zlib.gunzipSync(data);
+        const utf8 = gunzipData.toString('utf-8');
+        try {
+          const message = JSON.parse(utf8);
+          if (message != null && (typeof message !== 'object' || (Array.isArray(message) ? message.length > 0 : Object.keys(message).length > 0))) {
+            console.error(utf8);
+          }
+        } catch (_) {
+          // Non-JSON metadata, ignore
         }
-      } else {
-        // Unknown magic number
       }
-      i += 5 + dataLength - 1
+      // else: unknown magic number, skip frame
+    } catch (err) {
+      // Per-frame error — log and continue parsing subsequent frames
+      // instead of aborting the entire buffer
+      console.warn(`[chunkToUtf8String] Frame parse error at offset ${i} (magic=${magicNumber}, len=${dataLength}): ${err.code || err.message}`);
     }
-  } catch (err) {
-    console.log('Error parsing chunk response:', err)
+
+    i += 5 + dataLength;
   }
 
   return {
     thinking: thinkingOutput.join(''),
     text: textOutput.join('')
-  }
+  };
 }
 
 function generateHashed64Hex(input, salt = '') {

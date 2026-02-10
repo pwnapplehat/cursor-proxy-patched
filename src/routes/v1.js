@@ -176,26 +176,22 @@ router.post('/chat/completions', async (req, res) => {
       // In both cases, we need the full text to detect and convert them.
       // Trade-off: no real-time streaming, but tool calling works reliably.
       try {
-        let fullContent = '';
-        let thinkingStart = "<thinking>";
-        let thinkingEnd = "</thinking>";
-
+        // Accumulate ALL raw chunks before parsing to prevent Z_BUF_ERROR.
+        // Cursor's streaming sometimes splits gzip frames across TCP packets.
+        // Since we buffer the full response for tool call detection anyway,
+        // there is zero downside to parsing the complete buffer at once.
+        const rawChunks = [];
         for await (const chunk of response.body) {
-          const { thinking, text } = chunkToUtf8String(chunk);
-          let content = ""
-
-          if (thinkingStart !== "" && thinking.length > 0){
-            content += thinkingStart + " "
-            thinkingStart = ""
-          }
-          content += thinking
-          if (thinkingEnd !== "" && thinking.length === 0 && text.length !== 0 && thinkingStart === "") {
-            content += " " + thinkingEnd + " "
-            thinkingEnd = ""
-          }
-          content += text
-          fullContent += content;
+          rawChunks.push(Buffer.from(chunk));
         }
+        const fullBuffer = Buffer.concat(rawChunks);
+        const { thinking, text } = chunkToUtf8String(fullBuffer);
+
+        let fullContent = '';
+        if (thinking) {
+          fullContent += '<thinking> ' + thinking + ' </thinking> ';
+        }
+        fullContent += text;
 
         // Log first 500 chars of response for debugging
         console.log(`[chat/completions] Response preview (${fullContent.length} chars): ${fullContent.substring(0, 500).replace(/\n/g, '\\n')}`);
@@ -317,23 +313,19 @@ router.post('/chat/completions', async (req, res) => {
     } else {
       // Non-streaming response — always check for tool calls regardless of hasTools
       try {
-        let thinkingStart = "<thinking>";
-        let thinkingEnd = "</thinking>";
-        let content = '';
-
+        // Accumulate ALL raw chunks before parsing (same Z_BUF_ERROR fix as streaming)
+        const rawChunksNS = [];
         for await (const chunk of response.body) {
-          const { thinking, text } = chunkToUtf8String(chunk);
-          if (thinkingStart !== "" && thinking.length > 0){
-            content += thinkingStart + " "
-            thinkingStart = ""
-          }
-          content += thinking
-          if (thinkingEnd !== "" && thinking.length === 0 && text.length !== 0 && thinkingStart === "") {
-            content += " " + thinkingEnd + " "
-            thinkingEnd = ""
-          }
-          content += text
+          rawChunksNS.push(Buffer.from(chunk));
         }
+        const fullBufferNS = Buffer.concat(rawChunksNS);
+        const { thinking: thinkNS, text: textNS } = chunkToUtf8String(fullBufferNS);
+
+        let content = '';
+        if (thinkNS) {
+          content += '<thinking> ' + thinkNS + ' </thinking> ';
+        }
+        content += textNS;
 
         // Normalize near-miss tool call formats before detection
         content = normalizeNearMissToolCalls(content);

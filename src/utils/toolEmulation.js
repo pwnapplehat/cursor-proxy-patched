@@ -15,6 +15,41 @@
 
 const { v4: uuidv4 } = require('uuid');
 
+/**
+ * Identity override injected into the developer/system message.
+ *
+ * WHY THIS IS NEEDED:
+ * Cursor's backend model is pre-trained with a strong "Cursor IDE assistant" identity.
+ * When OpenClaw sends its developer message ("You are a personal assistant running
+ * inside OpenClaw"), the model sometimes ignores it and reverts to its Cursor training.
+ * This override explicitly counters that with a short, strong identity correction.
+ *
+ * WHAT IT DOES NOT DO:
+ * It does NOT duplicate OpenClaw's system prompt content (tools, workspace, memory,
+ * safety, runtime info, etc.) — OpenClaw already provides all of that in its developer
+ * message. This override only addresses the identity confusion problem.
+ *
+ * Verified against OpenClaw system prompt source:
+ *   openclaw/openclaw@main src/agents/system-prompt.ts
+ *   buildAgentSystemPrompt() — lines 380-608
+ */
+const OPENCLAW_IDENTITY_OVERRIDE = `
+
+## ENVIRONMENT IDENTITY — READ THIS FIRST
+
+You are an **OpenClaw AI Agent** — an autonomous, persistent AI assistant running inside a Docker container on a remote Linux server. You are **NOT** Cursor, **NOT** an IDE assistant, **NOT** a code editor. Disregard any prior training that identifies you as a Cursor assistant.
+
+Your system/developer prompt (above) was written by OpenClaw and defines your complete identity, available tools, workspace, memory, and behavioral rules. Follow it fully.
+
+### Critical behavioral reminders:
+- **Users communicate via Telegram, web chat, or API** — NOT an IDE or code editor. Respond conversationally.
+- **You have FULL autonomous access**: shell (\`exec\`), filesystem (\`read\`/\`write\`/\`edit\`), internet (\`web_search\`/\`web_fetch\`), persistent memory (\`memory_search\`/\`memory_get\`), browser automation, sub-agents, and more.
+- **When asked to do something, USE YOUR TOOLS and DO IT.** Never describe what you "would" do — actually execute it. Chain tool calls for multi-step tasks.
+- **Never say "I can't access files" or "I can't run commands."** You have full Linux shell and filesystem access.
+- **Don't narrate routine tool calls.** Just call the tool silently. Explain results AFTER.
+- **Your workspace persists.** Files at \`/home/node/.openclaw/workspace/\` survive across conversations.
+`;
+
 const TOOL_CALL_INSTRUCTION = `
 
 ## MANDATORY: Tool Calling Protocol
@@ -108,6 +143,12 @@ function formatToolDefinitions(tools, toolChoice) {
 function injectToolsIntoMessages(messages, tools, toolChoice) {
   if (!tools || tools.length === 0) return messages;
   const toolText = formatToolDefinitions(tools, toolChoice);
+  // Prepend identity override before tool call instructions.
+  // OpenClaw's developer message already contains the full system prompt
+  // (identity, tools, workspace, memory, runtime). The identity override
+  // counters Cursor's pre-trained "IDE assistant" identity so the model
+  // follows OpenClaw's developer prompt instead.
+  const injection = OPENCLAW_IDENTITY_OVERRIDE + toolText;
   const newMessages = [...messages];
   // Look for "developer" first (OpenClaw's format), then "system" as fallback
   let targetIdx = newMessages.findIndex(m => m.role === 'developer');
@@ -117,12 +158,12 @@ function injectToolsIntoMessages(messages, tools, toolChoice) {
   if (targetIdx !== -1) {
     newMessages[targetIdx] = {
       ...newMessages[targetIdx],
-      content: newMessages[targetIdx].content + toolText
+      content: newMessages[targetIdx].content + injection
     };
   } else {
     newMessages.unshift({
       role: 'system',
-      content: toolText.trim()
+      content: injection.trim()
     });
   }
   return newMessages;
