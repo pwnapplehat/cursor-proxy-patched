@@ -41,13 +41,18 @@ function generateCursorBody(messages, modelName, tools, toolChoice) {
     .map(msg => normalizeContent(msg.content))
     .join('\n')
 
+  // chatModeEnum: 1=ask, 2=agent, 3=edit. Configurable via env to test different behaviors.
+  // Cursor's backend injects different system prompts based on this value.
+  const chatModeEnumVal = parseInt(process.env.CHAT_MODE_ENUM ?? '2');
+  const chatModeStr = process.env.CHAT_MODE ?? 'Agent';
+
   const formattedMessages = processedMessages
     .filter(msg => !isSystemRole(msg.role))
     .map(msg => ({
       content: normalizeContent(msg.content),
       role: msg.role === 'user' ? 1 : 2,
       messageId: uuidv4(),
-      ...(msg.role === 'user' ? { chatModeEnum: 2 } : {})
+      ...(msg.role === 'user' ? { chatModeEnum: chatModeEnumVal } : {})
     }));
 
   const messageIds = formattedMessages.map(msg => {
@@ -92,15 +97,30 @@ function generateCursorBody(messages, modelName, tools, toolChoice) {
       messageIds: messageIds,
       largeContext: 0,
       unknown38: 0,
-      chatModeEnum: 2,
+      chatModeEnum: chatModeEnumVal,
       unknown47: "",
       unknown48: 0,
       unknown49: 0,
       unknown51: 0,
       unknown53: 1,
-      chatMode: "Agent"
+      chatMode: chatModeStr
     }
   };
+
+  // DEBUG: Dump full request structure (content truncated) for comparison with real Cursor traffic
+  if (process.env.DEBUG_PROTO === '1') {
+    const debugBody = JSON.parse(JSON.stringify(body));
+    if (debugBody.request?.instruction?.instruction) {
+      debugBody.request.instruction.instruction = `[${debugBody.request.instruction.instruction.length} chars]`;
+    }
+    for (const msg of debugBody.request?.messages || []) {
+      if (msg.content && msg.content.length > 100) {
+        msg.content = msg.content.substring(0, 100) + `...[${msg.content.length} total]`;
+      }
+    }
+    console.log(`[generateCursorBody] PROTO REQUEST:\n${JSON.stringify(debugBody, null, 2)}`);
+  }
+  console.log(`[generateCursorBody] chatModeEnum=${chatModeEnumVal} chatMode="${chatModeStr}" instruction=${instruction.length}chars messages=${formattedMessages.length}`);
 
   const errMsg = $root.StreamUnifiedChatWithToolsRequest.verify(body);
   if (errMsg) throw Error(errMsg);
