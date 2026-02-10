@@ -279,11 +279,19 @@ function findNativeToolCalls(data) {
   return toolCalls;
 }
 
-// Cursor ClientSideToolV2 enum → human-readable name (for logging)
+// Cursor ClientSideToolV2 enum → human-readable name (for logging / fallback)
+// These should match what the model ACTUALLY sends in tc.name field.
 const CURSOR_TOOL_NAMES = {
-  5: 'read_file', 6: 'list_dir', 7: 'edit_file', 8: 'file_search',
-  15: 'run_terminal_command', 18: 'web_search', 38: 'edit_file_v2',
-  39: 'list_dir_v2', 40: 'read_file_v2', 41: 'ripgrep_search',
+  5:  'read_file',
+  6:  'list_dir',
+  7:  'edit_file',
+  8:  'file_search',
+  15: 'run_terminal_cmd',      // model sends 'run_terminal_cmd', not 'run_terminal_command'
+  18: 'web_search',
+  38: 'write',                 // model sends 'write', not 'edit_file_v2' (enum name is misleading)
+  39: 'list_dir_v2',
+  40: 'read_file_v2',
+  41: 'ripgrep_raw_search',    // model sends 'ripgrep_raw_search'
   42: 'glob_file_search',
 };
 
@@ -292,15 +300,15 @@ const CURSOR_TOOL_NAMES = {
 // The model uses whichever names Cursor's Agent-mode system prompt provides,
 // so we remap them to match what OpenClaw actually exposes.
 
-// Simple name-only mappings (params use standard rename table below)
+// Simple name-only mappings (params use standard rename table below).
+// Tools that need args-based detection (edit vs write) go in SPECIAL_TOOL_CONVERSIONS instead.
 const CURSOR_TO_OPENCLAW_TOOLS = {
   'run_terminal_cmd': 'exec',
   'run_terminal_command': 'exec',
   'read_file': 'read',
   'read_file_v2': 'read',
-  'edit_file': 'edit',
-  'edit_file_v2': 'edit',
   'web_search': 'web_search',
+  'write': 'write',         // explicit: model sends 'write' for file creation via enum 38
 };
 
 // Cursor parameter names that differ from OpenClaw's
@@ -316,6 +324,7 @@ const CURSOR_DROP_PARAMS = new Set(['explanation', 'is_background', 'blocking'])
 // Tools that need full argument restructuring (not just param rename).
 // Each returns { name, arguments } ready for OpenClaw.
 const SPECIAL_TOOL_CONVERSIONS = {
+  // ─── Directory listing ──────────────────────────────────────────────
   'list_dir': (args) => ({
     name: 'exec',
     arguments: { command: `ls -la ${shellEscape(args.target_directory || args.path || '.')}` },
@@ -324,6 +333,8 @@ const SPECIAL_TOOL_CONVERSIONS = {
     name: 'exec',
     arguments: { command: `ls -la ${shellEscape(args.target_directory || args.path || '.')}` },
   }),
+
+  // ─── Search tools ──────────────────────────────────────────────────
   'ripgrep_raw_search': (args) => {
     const pattern = args.pattern || '';
     const path = args.path || '.';
@@ -344,6 +355,50 @@ const SPECIAL_TOOL_CONVERSIONS = {
     name: 'exec',
     arguments: { command: `find ${shellEscape(args.path || '.')} -name ${shellEscape(args.glob_pattern || args.pattern || '*')} 2>/dev/null` },
   }),
+
+  // ─── File edit/write (args-based detection) ─────────────────────────
+  // Cursor's EDIT_FILE_V2 (enum 38) is used for BOTH write (create/overwrite)
+  // and edit (old_string/new_string) operations. The model's tc.name is usually
+  // 'write' for creation, but the enum fallback is 'edit_file_v2'.
+  // We detect based on which arguments are present.
+  'edit_file': (args) => {
+    if ('contents' in args || 'content' in args) {
+      return {
+        name: 'write',
+        arguments: {
+          path: args.file_path || args.path || '',
+          content: args.contents || args.content || '',
+        },
+      };
+    }
+    return {
+      name: 'edit',
+      arguments: {
+        path: args.file_path || args.path || '',
+        oldText: args.old_string || args.oldText || args.old_text || '',
+        newText: args.new_string || args.newText || args.new_text || '',
+      },
+    };
+  },
+  'edit_file_v2': (args) => {
+    if ('contents' in args || 'content' in args) {
+      return {
+        name: 'write',
+        arguments: {
+          path: args.file_path || args.path || '',
+          content: args.contents || args.content || '',
+        },
+      };
+    }
+    return {
+      name: 'edit',
+      arguments: {
+        path: args.file_path || args.path || '',
+        oldText: args.old_string || args.oldText || args.old_text || '',
+        newText: args.new_string || args.newText || args.new_text || '',
+      },
+    };
+  },
 };
 
 /** Escape a shell argument (wraps in single quotes, escapes existing quotes) */
@@ -394,7 +449,7 @@ function convertNativeToolCall(tc) {
   const specialConvert = SPECIAL_TOOL_CONVERSIONS[cursorName];
   if (specialConvert) {
     const result = specialConvert(args);
-    console.log(`[convertNativeToolCall] ${cursorName} →(special)→ ${result.name} (command: ${JSON.stringify(result.arguments).substring(0, 120)})`);
+    console.log(`[convertNativeToolCall] ${cursorName} →(special)→ ${result.name} (args: ${JSON.stringify(result.arguments).substring(0, 150)})`);
     return result;
   }
 
@@ -427,6 +482,9 @@ function chunkToUtf8String(chunk) {
   const thinkingOutput = [];
   const textOutput = [];
   const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+  // Cross-frame deduplication: a tool call may appear in multiple protobuf
+  // frames (e.g. repeated in a follow-up confirmation frame). Track by ID.
+  const seenToolCallIds = new Set();
 
   let i = 0;
   while (i < buffer.length) {
@@ -475,6 +533,9 @@ function chunkToUtf8String(chunk) {
         // <tool_call> XML block so the existing pipeline handles it.
         const nativeCalls = findNativeToolCalls(gunzipData);
         for (const tc of nativeCalls) {
+          // Skip if we already processed this tool call in a previous frame
+          if (seenToolCallIds.has(tc.toolCallId)) continue;
+          seenToolCallIds.add(tc.toolCallId);
           const cursorName = tc.name || CURSOR_TOOL_NAMES[tc.tool] || `cursor_tool_${tc.tool}`;
           console.log(`[chunkToUtf8String] Intercepted native tool call: ${cursorName} (enum=${tc.tool}, id=${tc.toolCallId}, rawArgs=${tc.rawArgs.substring(0, 200)})`);
           const mapped = convertNativeToolCall(tc);

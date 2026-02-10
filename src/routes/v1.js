@@ -317,14 +317,26 @@ router.post('/chat/completions', async (req, res) => {
       } catch (streamError) {
         console.error('[chat/completions] Stream processing error:', streamError.message || streamError);
         const errMsg = String(streamError.message || streamError);
-        if (streamError.name === 'TimeoutError' || errMsg.includes('timeout') || errMsg.includes('terminated')) {
-          res.write(`data: ${JSON.stringify({ error: 'Cursor API stream timeout — the response was too large or took too long. Try a simpler request.' })}\n\n`);
-        } else {
-          res.write(`data: ${JSON.stringify({ error: `Stream processing error: ${errMsg.substring(0, 200)}` })}\n\n`);
+        try {
+          if (!res.writableEnded) {
+            if (streamError.name === 'TimeoutError' || errMsg.includes('timeout') || errMsg.includes('terminated')) {
+              res.write(`data: ${JSON.stringify({ error: 'Cursor API stream timeout — the response was too large or took too long. Try a simpler request.' })}\n\n`);
+            } else {
+              res.write(`data: ${JSON.stringify({ error: `Stream processing error: ${errMsg.substring(0, 200)}` })}\n\n`);
+            }
+          }
+        } catch (_writeErr) {
+          // Client already disconnected — nothing we can do
         }
       } finally {
-        res.write('data: [DONE]\n\n');
-        res.end();
+        try {
+          if (!res.writableEnded) {
+            res.write('data: [DONE]\n\n');
+            res.end();
+          }
+        } catch (_finalErr) {
+          // Client already disconnected — nothing we can do
+        }
       }
     } else {
       // Non-streaming response — always check for tool calls regardless of hasTools
