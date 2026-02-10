@@ -74,18 +74,23 @@ function formatToolDefinitions(tools, toolChoice) {
 }
 
 /**
- * Injects tool definitions into the system message.
- * If no system message exists, creates one.
+ * Injects tool definitions into the system/developer message.
+ * OpenClaw uses "developer" role (newer OpenAI API format) instead of "system".
+ * If neither exists, creates a new system message.
  */
 function injectToolsIntoMessages(messages, tools, toolChoice) {
   if (!tools || tools.length === 0) return messages;
   const toolText = formatToolDefinitions(tools, toolChoice);
   const newMessages = [...messages];
-  const systemIdx = newMessages.findIndex(m => m.role === 'system');
-  if (systemIdx !== -1) {
-    newMessages[systemIdx] = {
-      ...newMessages[systemIdx],
-      content: newMessages[systemIdx].content + toolText
+  // Look for "developer" first (OpenClaw's format), then "system" as fallback
+  let targetIdx = newMessages.findIndex(m => m.role === 'developer');
+  if (targetIdx === -1) {
+    targetIdx = newMessages.findIndex(m => m.role === 'system');
+  }
+  if (targetIdx !== -1) {
+    newMessages[targetIdx] = {
+      ...newMessages[targetIdx],
+      content: newMessages[targetIdx].content + toolText
     };
   } else {
     newMessages.unshift({

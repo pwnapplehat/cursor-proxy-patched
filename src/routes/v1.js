@@ -197,6 +197,9 @@ router.post('/chat/completions', async (req, res) => {
           fullContent += content;
         }
 
+        // Log first 500 chars of response for debugging
+        console.log(`[chat/completions] Response preview (${fullContent.length} chars): ${fullContent.substring(0, 500).replace(/\n/g, '\\n')}`);
+
         // Check if response contains <tool_call> tags (regardless of hasTools)
         if (hasToolCallTags(fullContent)) {
           const { textContent, toolCalls } = parseToolCalls(fullContent);

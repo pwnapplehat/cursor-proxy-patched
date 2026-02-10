@@ -16,18 +16,23 @@ function normalizeContent(content) {
   return String(content ?? '');
 }
 
+function isSystemRole(role) {
+  return role === 'system' || role === 'developer';
+}
+
 function generateCursorBody(messages, modelName, tools, toolChoice) {
   // Convert tool result messages and inject tool definitions
   let processedMessages = convertToolResultMessages(messages);
   processedMessages = injectToolsIntoMessages(processedMessages, tools, toolChoice);
 
+  // Both "system" and "developer" roles go into the protobuf instruction field
   const instruction = processedMessages
-    .filter(msg => msg.role === 'system')
+    .filter(msg => isSystemRole(msg.role))
     .map(msg => normalizeContent(msg.content))
     .join('\n')
 
   const formattedMessages = processedMessages
-    .filter(msg => msg.role !== 'system')
+    .filter(msg => !isSystemRole(msg.role))
     .map(msg => ({
       content: normalizeContent(msg.content),
       role: msg.role === 'user' ? 1 : 2,
