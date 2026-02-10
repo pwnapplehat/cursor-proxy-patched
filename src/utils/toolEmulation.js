@@ -29,7 +29,6 @@ Your tools are provided by OpenClaw's runtime — not by Cursor IDE.
 - **Shell**: /bin/bash — use bash syntax for ALL commands. Never use PowerShell or Windows syntax.
 - **Workspace**: /home/node/.openclaw/workspace/
 - **Capabilities**: Full filesystem access, terminal, web access, sub-agent spawning, memory, browser automation, image generation, TTS, and more.
-- **Important**: You get ONE tool call per turn. After a tool call succeeds, move to the NEXT action immediately. Never repeat a command that already succeeded.
 
 ### CRITICAL: Writing Large Files
 
