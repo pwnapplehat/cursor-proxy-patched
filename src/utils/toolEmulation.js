@@ -17,6 +17,13 @@ const { v4: uuidv4 } = require('uuid');
 
 const TOOL_CALL_INSTRUCTION = `
 
+## IMPORTANT: Tool Calling Override
+
+You MUST use ONLY the <tool_call> XML protocol below for ALL tool invocations.
+Do NOT use Cursor's native tool calling mechanism. Do NOT use function calling.
+The ONLY way to execute a tool is by outputting a <tool_call> XML block as shown below.
+If you try any other method, it will silently fail. Use <tool_call> tags exclusively.
+
 ## Tool Calling Protocol
 
 You have access to executable tools listed below. Use them whenever the user requests any action.

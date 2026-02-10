@@ -31,12 +31,14 @@ function generateCursorBody(messages, modelName, tools, toolChoice) {
     .map(msg => normalizeContent(msg.content))
     .join('\n');
 
-  // Note: Agent mode is now activated via protobuf fields:
-  // - unknown27 = 1 (is_agentic = true)
-  // - supportedTools = [...] (ClientSideToolV2 enum values)
-  // - chatModeEnum = 2 (UNIFIED_MODE_AGENT)
-  // - chatMode = "Agent" (unified_mode_name)
-  // No text-based identity override is needed.
+  // Agent mode activation strategy (dual approach):
+  //   1. Protobuf fields: unknown27=1, supportedTools=[...], chatModeEnum=2, chatMode="Agent"
+  //      These make Cursor's backend generate an Agent-mode system prompt.
+  //   2. unknown48=1 (should_disable_tools) attempts to prevent native tool dispatch.
+  //      If it works, the model uses our text-based <tool_call> protocol.
+  //   3. Fallback: chunkToUtf8String scans response protobuf for native tool calls
+  //      (ClientSideToolV2Call) and converts them to <tool_call> XML so the
+  //      existing pipeline handles them transparently.
 
   const formattedMessages = processedMessages
     .filter(msg => !isSystemRole(msg.role))
@@ -86,18 +88,31 @@ function generateCursorBody(messages, modelName, tools, toolChoice) {
         timestamp: new Date().toISOString(),
       },
       unknown27: 1, // is_agentic = true (field 27) — REQUIRED for Agent mode
-      // NOTE: Do NOT set supportedTools (field 29). Setting it activates Cursor's
-      // native bidi tool system (tool_call_v2 in protobuf), which requires HTTP/2
-      // bidirectional streaming to send tool results back. Our proxy uses
-      // unidirectional streaming and can't respond to native tool calls.
-      // Instead, we rely on text-based tool emulation via <tool_call> XML tags
-      // injected into the system prompt by toolEmulation.js.
+      // supported_tools (field 29): ClientSideToolV2 enum values.
+      // REQUIRED for Agent mode system prompt. Without these, Cursor's backend
+      // generates an "Ask mode" system prompt regardless of other fields.
+      // The proxy intercepts native tool calls from the response (see
+      // findNativeToolCalls) and converts them to <tool_call> XML so the
+      // existing OpenAI-compatible pipeline handles them.
+      supportedTools: [
+        5,  // READ_FILE
+        6,  // LIST_DIR
+        7,  // EDIT_FILE
+        8,  // FILE_SEARCH
+        15, // RUN_TERMINAL_COMMAND_V2
+        18, // WEB_SEARCH
+        38, // EDIT_FILE_V2
+        39, // LIST_DIR_V2
+        40, // READ_FILE_V2
+        41, // RIPGREP_RAW_SEARCH
+        42, // GLOB_FILE_SEARCH
+      ],
       messageIds: messageIds,
       largeContext: 0,
       unknown38: 0,
       chatModeEnum: 2,
       unknown47: "",
-      unknown48: 0,
+      unknown48: 1, // should_disable_tools (field 48) — prevents native bidi tool dispatch
       unknown49: 0,
       unknown51: 0,
       unknown53: 1,
@@ -125,6 +140,152 @@ function generateCursorBody(messages, modelName, tools, toolChoice) {
 
   return finalBody
 }
+
+// ─── Raw Protobuf Scanner ──────────────────────────────────────────────
+// Extracts native tool calls (ClientSideToolV2Call) from Cursor's response
+// protobuf frames. This is the fallback when unknown48 (should_disable_tools)
+// doesn't prevent native tool dispatch.
+//
+// Based on eisbaw/cursor_api_demo ToolCallDecoder. The proto structure is:
+//   message ClientSideToolV2Call {
+//     ClientSideToolV2 tool = 1;   // enum (varint)
+//     string tool_call_id = 3;     // unique call ID
+//     string name = 9;             // tool function name
+//     string raw_args = 10;        // JSON argument string
+//   }
+// We don't need the full proto definition — just scan for this pattern
+// recursively in any length-delimited (wire type 2) sub-messages.
+// ────────────────────────────────────────────────────────────────────────
+
+function pbDecodeVarint(buf, pos) {
+  let result = 0, shift = 0;
+  while (pos < buf.length) {
+    const b = buf[pos];
+    result |= (b & 0x7F) << shift;
+    pos++;
+    if (!(b & 0x80)) break;
+    shift += 7;
+    if (shift > 35) break; // safety: max 5-byte varint for uint32
+  }
+  return [result, pos];
+}
+
+function pbDecodeFields(buf) {
+  const fields = {};
+  let pos = 0;
+  while (pos < buf.length) {
+    const [tag, tagEnd] = pbDecodeVarint(buf, pos);
+    if (tagEnd === pos) break; // no progress
+    pos = tagEnd;
+    const fieldNum = tag >>> 3;
+    const wireType = tag & 0x07;
+
+    let value;
+    if (wireType === 0) { // varint
+      [value, pos] = pbDecodeVarint(buf, pos);
+    } else if (wireType === 1) { // fixed64
+      if (pos + 8 > buf.length) break;
+      value = buf.subarray(pos, pos + 8);
+      pos += 8;
+    } else if (wireType === 2) { // length-delimited
+      const [len, lenEnd] = pbDecodeVarint(buf, pos);
+      pos = lenEnd;
+      if (pos + len > buf.length) break;
+      value = buf.subarray(pos, pos + len);
+      pos += len;
+    } else if (wireType === 5) { // fixed32
+      if (pos + 4 > buf.length) break;
+      value = buf.subarray(pos, pos + 4);
+      pos += 4;
+    } else {
+      break; // unknown wire type, stop
+    }
+
+    if (!fields[fieldNum]) fields[fieldNum] = [];
+    fields[fieldNum].push({ wireType, value });
+  }
+  return fields;
+}
+
+function pbGetString(fields, num) {
+  const entries = fields[num];
+  if (!entries) return null;
+  for (const { wireType, value } of entries) {
+    if (wireType === 2 && Buffer.isBuffer(value)) {
+      try { return value.toString('utf-8'); } catch (_) { /* skip */ }
+    }
+  }
+  return null;
+}
+
+function pbGetInt(fields, num) {
+  const entries = fields[num];
+  if (!entries) return null;
+  for (const { wireType, value } of entries) {
+    if (wireType === 0) return value;
+  }
+  return null;
+}
+
+/**
+ * Extract a ClientSideToolV2Call from decoded protobuf fields.
+ * Returns { tool, toolCallId, name, rawArgs } or null.
+ */
+function extractToolCallFromFields(fields) {
+  const tool = pbGetInt(fields, 1);          // field 1: tool enum
+  const toolCallId = pbGetString(fields, 3); // field 3: tool_call_id
+  const name = pbGetString(fields, 9);       // field 9: name
+  const rawArgs = pbGetString(fields, 10);   // field 10: raw_args
+
+  // A valid tool call needs the tool enum > 0, a tool_call_id,
+  // AND at least one of name or rawArgs to reduce false positives
+  if (tool != null && tool > 0 && toolCallId && (name || rawArgs)) {
+    return { tool, toolCallId, name: name || '', rawArgs: rawArgs || '{}' };
+  }
+  return null;
+}
+
+/**
+ * Recursively search protobuf bytes for ClientSideToolV2Call messages.
+ * Scans up to 3 levels deep in nested length-delimited fields.
+ */
+function findNativeToolCalls(data) {
+  const toolCalls = [];
+  const seen = new Set(); // deduplicate by tool_call_id
+
+  function scanFields(buf, depth) {
+    if (depth > 3 || buf.length < 5) return;
+    let fields;
+    try { fields = pbDecodeFields(buf); } catch (_) { return; }
+
+    // Check if this message itself is a tool call
+    const tc = extractToolCallFromFields(fields);
+    if (tc && !seen.has(tc.toolCallId)) {
+      seen.add(tc.toolCallId);
+      toolCalls.push(tc);
+    }
+
+    // Recurse into length-delimited sub-fields
+    for (const entries of Object.values(fields)) {
+      for (const { wireType, value } of entries) {
+        if (wireType === 2 && Buffer.isBuffer(value) && value.length > 8) {
+          scanFields(value, depth + 1);
+        }
+      }
+    }
+  }
+
+  scanFields(Buffer.isBuffer(data) ? data : Buffer.from(data), 0);
+  return toolCalls;
+}
+
+// Cursor ClientSideToolV2 enum → human-readable name (for logging/mapping)
+const CURSOR_TOOL_NAMES = {
+  5: 'read_file', 6: 'list_dir', 7: 'edit_file', 8: 'file_search',
+  15: 'run_terminal_command', 18: 'web_search', 38: 'edit_file_v2',
+  39: 'list_dir_v2', 40: 'read_file_v2', 41: 'ripgrep_search',
+  42: 'glob_file_search',
+};
 
 /**
  * Parses Cursor's binary-framed streaming response into text.
@@ -181,6 +342,22 @@ function chunkToUtf8String(chunk) {
         const content = response?.message?.content;
         if (content !== undefined) {
           textOutput.push(content);
+        }
+
+        // Fallback: scan raw protobuf for native tool calls that our proto
+        // definition doesn't cover (e.g. tool_call_v2 at field 36 inside Message).
+        // If Cursor dispatches a native tool call, we intercept it here and
+        // convert it to a <tool_call> XML block so the existing pipeline
+        // (parseToolCalls in toolEmulation.js) handles it transparently.
+        const nativeCalls = findNativeToolCalls(gunzipData);
+        for (const tc of nativeCalls) {
+          const cursorName = CURSOR_TOOL_NAMES[tc.tool] || `cursor_tool_${tc.tool}`;
+          // Use the model's own name/rawArgs if present (field 9 & 10),
+          // otherwise fall back to the Cursor enum name.
+          const toolName = tc.name || cursorName;
+          console.log(`[chunkToUtf8String] Intercepted native tool call: ${toolName} (enum=${tc.tool}, id=${tc.toolCallId}, rawArgs=${tc.rawArgs.substring(0, 200)})`);
+          // Inject as <tool_call> so the text-based pipeline picks it up
+          textOutput.push(`\n<tool_call>\n{"name": ${JSON.stringify(toolName)}, "arguments": ${tc.rawArgs}}\n</tool_call>\n`);
         }
       } else if (magicNumber === 2 || magicNumber === 3) {
         const gunzipData = magicNumber === 2 ? data : zlib.gunzipSync(data);
