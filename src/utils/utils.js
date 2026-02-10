@@ -25,26 +25,11 @@ function generateCursorBody(messages, modelName, tools, toolChoice) {
   let processedMessages = convertToolResultMessages(messages);
   processedMessages = injectToolsIntoMessages(processedMessages, tools, toolChoice);
 
-  // DIAGNOSTIC: Check user messages for workspace/mode context that Cursor's
-  // system prompt might reference to restrict tool access
-  const firstUserMsg = processedMessages.find(m => m.role === 'user');
-  if (firstUserMsg) {
-    const uc = normalizeContent(firstUserMsg.content);
-    if (/workspace|mode|tool|agent|cursor/i.test(uc)) {
-      console.log(`[generateCursorBody] DIAG: User msg has workspace/mode/tool refs (first 400): ${uc.substring(0, 400).replace(/\n/g, '\\n')}`);
-    }
-  }
-
   // Both "system" and "developer" roles go into the protobuf instruction field
   const instruction = processedMessages
     .filter(msg => isSystemRole(msg.role))
     .map(msg => normalizeContent(msg.content))
     .join('\n')
-
-  // chatModeEnum: 1=ask, 2=agent, 3=edit. Configurable via env to test different behaviors.
-  // Cursor's backend injects different system prompts based on this value.
-  const chatModeEnumVal = parseInt(process.env.CHAT_MODE_ENUM ?? '2');
-  const chatModeStr = process.env.CHAT_MODE ?? 'Agent';
 
   const formattedMessages = processedMessages
     .filter(msg => !isSystemRole(msg.role))
@@ -52,8 +37,7 @@ function generateCursorBody(messages, modelName, tools, toolChoice) {
       content: normalizeContent(msg.content),
       role: msg.role === 'user' ? 1 : 2,
       messageId: uuidv4(),
-      // User messages need chatModeEnum AND unknown29 to match real Cursor Agent traffic
-      ...(msg.role === 'user' ? { chatModeEnum: chatModeEnumVal, unknown29: "1" } : {})
+      ...(msg.role === 'user' ? { chatModeEnum: 2 } : {})
     }));
 
   const messageIds = formattedMessages.map(msg => {
@@ -86,7 +70,6 @@ function generateCursorBody(messages, modelName, tools, toolChoice) {
         unknown9: 1
       },
       unknown19: 1,
-      unknown22: 1,
       conversationId: uuidv4(),
       metadata: {
         os: "win32",
@@ -95,34 +78,19 @@ function generateCursorBody(messages, modelName, tools, toolChoice) {
         path: "C:\\Program Files\\PowerShell\\7\\pwsh.exe",
         timestamp: new Date().toISOString(),
       },
-      unknown27: 1,
+      unknown27: 0,
       messageIds: messageIds,
-      largeContext: 1,
+      largeContext: 0,
       unknown38: 0,
-      chatModeEnum: chatModeEnumVal,
+      chatModeEnum: 2,
       unknown47: "",
       unknown48: 0,
       unknown49: 0,
       unknown51: 0,
       unknown53: 1,
-      chatMode: chatModeStr
+      chatMode: "Agent"
     }
   };
-
-  // DEBUG: Dump full request structure (content truncated) for comparison with real Cursor traffic
-  if (process.env.DEBUG_PROTO === '1') {
-    const debugBody = JSON.parse(JSON.stringify(body));
-    if (debugBody.request?.instruction?.instruction) {
-      debugBody.request.instruction.instruction = `[${debugBody.request.instruction.instruction.length} chars]`;
-    }
-    for (const msg of debugBody.request?.messages || []) {
-      if (msg.content && msg.content.length > 100) {
-        msg.content = msg.content.substring(0, 100) + `...[${msg.content.length} total]`;
-      }
-    }
-    console.log(`[generateCursorBody] PROTO REQUEST:\n${JSON.stringify(debugBody, null, 2)}`);
-  }
-  console.log(`[generateCursorBody] chatModeEnum=${chatModeEnumVal} chatMode="${chatModeStr}" instruction=${instruction.length}chars messages=${formattedMessages.length}`);
 
   const errMsg = $root.StreamUnifiedChatWithToolsRequest.verify(body);
   if (errMsg) throw Error(errMsg);
