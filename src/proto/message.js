@@ -1558,6 +1558,11 @@ $root.StreamUnifiedChatWithToolsRequest = (function() {
                 writer.uint32(/* id 27, wireType 0 =*/216).int32(message.unknown27);
             if (message.unknown29 != null && Object.hasOwnProperty.call(message, "unknown29"))
                 writer.uint32(/* id 29, wireType 2 =*/234).string(message.unknown29);
+            // supported_tools: repeated int32 enum at field 29 (wire type 0 = varint)
+            // This encodes ClientSideToolV2 enum values to enable Agent mode tools
+            if (message.supportedTools != null && message.supportedTools.length)
+                for (var i = 0; i < message.supportedTools.length; ++i)
+                    writer.uint32(/* id 29, wireType 0 =*/232).int32(message.supportedTools[i]);
             if (message.messageIds != null && message.messageIds.length)
                 for (var i = 0; i < message.messageIds.length; ++i)
                     $root.StreamUnifiedChatWithToolsRequest.Request.MessageId.encode(message.messageIds[i], writer.uint32(/* id 30, wireType 2 =*/242).fork()).ldelim();
