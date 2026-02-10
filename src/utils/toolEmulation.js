@@ -15,6 +15,106 @@
 
 const { v4: uuidv4 } = require('uuid');
 
+// ─── Environment Context ──────────────────────────────────────────────
+// PREPENDED to the developer message so the model knows its actual runtime.
+// This overrides Cursor's Agent-mode system prompt assumptions (Windows, IDE, etc.)
+// and provides critical behavioral guidance for the proxy bridge architecture.
+const ENVIRONMENT_CONTEXT = `
+## Runtime Environment — READ FIRST
+
+You are an AI agent running inside **OpenClaw** on a Linux Docker container (Ubuntu 24.04).
+You are connected through a Cursor-to-OpenAI proxy bridge on a cloud server.
+Your tools are provided by OpenClaw's runtime — not by Cursor IDE.
+
+- **Shell**: /bin/bash — use bash syntax for ALL commands. Never use PowerShell or Windows syntax.
+- **Workspace**: /home/node/.openclaw/workspace/
+- **Capabilities**: Full filesystem access, terminal, web access, sub-agent spawning, memory, browser automation, image generation, TTS, and more.
+
+### CRITICAL: Writing Large Files
+
+The file write tool **silently truncates** files larger than ~2KB due to streaming limitations.
+For ANY file with substantial content (HTML pages, scripts, configs, anything >30 lines):
+
+**ALWAYS split into chunks via terminal commands using heredoc:**
+
+Chunk 1 (create file):
+  exec command: cat << 'CHUNK1' > path/to/file.ext
+  ...first 30-40 lines of content...
+  CHUNK1
+
+Chunk 2 (append to file — note >> not >):
+  exec command: cat << 'CHUNK2' >> path/to/file.ext
+  ...next 30-40 lines of content...
+  CHUNK2
+
+Continue with CHUNK3, CHUNK4, etc. until the entire file is written.
+Each chunk is a separate tool call — wait for the result before sending the next.
+Use a different delimiter name for each chunk (CHUNK1, CHUNK2, CHUNK3...).
+
+For small files (<30 lines), the write tool works fine.
+
+### Parallel Sub-Agents
+
+Spawn independent sub-agents for parallel work using these tools:
+
+- **sessions_spawn**: Create a new agent with a task description
+  <tool_call>
+  {"name": "sessions_spawn", "arguments": {"task": "Build the CSS stylesheet for the landing page"}}
+  </tool_call>
+
+- **session_status**: Check if an agent finished
+  <tool_call>
+  {"name": "session_status", "arguments": {"session_id": "the-session-id-from-spawn"}}
+  </tool_call>
+
+- **sessions_send**: Send a follow-up instruction to a running agent
+  <tool_call>
+  {"name": "sessions_send", "arguments": {"session_id": "the-session-id", "message": "Also add a dark mode toggle"}}
+  </tool_call>
+
+- **agents_list**: List all available agents
+- **sessions_list**: List all active sessions
+- **sessions_history**: Get conversation history of a session
+
+### Additional OpenClaw Tools
+
+These tools have no terminal equivalent — invoke them with <tool_call> tags:
+
+- **web_fetch**: Fetch and read content from any URL
+  <tool_call>
+  {"name": "web_fetch", "arguments": {"url": "https://example.com/api/data"}}
+  </tool_call>
+
+- **image**: Generate an image from a description
+  <tool_call>
+  {"name": "image", "arguments": {"image": "a futuristic city skyline at sunset"}}
+  </tool_call>
+
+- **memory_search**: Search persistent memory across sessions
+  <tool_call>
+  {"name": "memory_search", "arguments": {"query": "user preferences for UI design"}}
+  </tool_call>
+
+- **memory_get**: Retrieve a specific memory entry
+  <tool_call>
+  {"name": "memory_get", "arguments": {"path": "preferences/theme"}}
+  </tool_call>
+
+- **browser**: Automate browser interactions (navigate, click, type, screenshot)
+  <tool_call>
+  {"name": "browser", "arguments": {"action": "navigate", "url": "https://example.com"}}
+  </tool_call>
+
+- **tts**: Convert text to speech audio
+- **message**: Send messages to external channels (Telegram, etc.)
+- **canvas**: Create and manipulate visual canvases
+- **nodes**: Manage workflow nodes
+- **cron**: Schedule recurring tasks
+- **gateway**: Manage API gateway endpoints
+- **process**: List and manage running processes
+
+`;
+
 const TOOL_CALL_INSTRUCTION = `
 
 ## IMPORTANT: Tool Calling Override
@@ -103,9 +203,17 @@ function formatToolDefinitions(tools, toolChoice) {
 }
 
 /**
- * Injects tool definitions into the system/developer message.
+ * Injects environment context and tool definitions into the system/developer message.
  * OpenClaw uses "developer" role (newer OpenAI API format) instead of "system".
  * If neither exists, creates a new system message.
+ *
+ * Layout of the injected content:
+ *   [ENVIRONMENT_CONTEXT]   ← prepended: runtime info, chunked write strategy, agent tools
+ *   [original developer msg] ← OpenClaw's identity/persona instructions
+ *   [TOOL_CALL_INSTRUCTION] ← appended: protocol + all 23 tool definitions
+ *
+ * The environment context appears FIRST so the model reads it before Cursor's
+ * Agent-mode system prompt can override its understanding of the runtime.
  */
 function injectToolsIntoMessages(messages, tools, toolChoice) {
   if (!tools || tools.length === 0) return messages;
@@ -117,14 +225,15 @@ function injectToolsIntoMessages(messages, tools, toolChoice) {
     targetIdx = newMessages.findIndex(m => m.role === 'system');
   }
   if (targetIdx !== -1) {
+    // Prepend environment context + append tool definitions around original content
     newMessages[targetIdx] = {
       ...newMessages[targetIdx],
-      content: newMessages[targetIdx].content + toolText
+      content: ENVIRONMENT_CONTEXT + newMessages[targetIdx].content + toolText
     };
   } else {
     newMessages.unshift({
       role: 'system',
-      content: toolText.trim()
+      content: ENVIRONMENT_CONTEXT.trim() + '\n' + toolText.trim()
     });
   }
   return newMessages;
