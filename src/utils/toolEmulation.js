@@ -39,12 +39,12 @@ For ANY file with substantial content (HTML pages, scripts, configs, anything >3
 
 Chunk 1 (create file):
   exec command: cat << 'CHUNK1' > path/to/file.ext
-  ...first 30-40 lines of content...
+  ...first 30-40 or according to the file size lines of content or lowers the chunk size more dynamiclly if still encountering any issues...
   CHUNK1
 
 Chunk 2 (append to file — note >> not >):
   exec command: cat << 'CHUNK2' >> path/to/file.ext
-  ...next 30-40 lines of content...
+  ...next 30-40 or according to the file size lines of content or lowers the chunk size more dynamiclly if still encountering any issues...
   CHUNK2
 
 Continue with CHUNK3, CHUNK4, etc. until the entire file is written.

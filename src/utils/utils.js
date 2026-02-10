@@ -433,12 +433,15 @@ function convertNativeToolCall(tc) {
       // Try to extract the file path from the partial JSON
       const pathMatch = tc.rawArgs.match(/"(?:file_path|path)"\s*:\s*"([^"]+)"/);
       const filePath = pathMatch ? pathMatch[1] : 'unknown';
-      console.warn(`[convertNativeToolCall] Truncated file write for "${filePath}" — returning exec fallback hint`);
+      console.warn(`[convertNativeToolCall] Truncated file write for "${filePath}" — returning exec fallback with hint`);
       return {
         truncated: true,
-        hint: `[System: The file write tool call for "${filePath}" was too large and got truncated. ` +
-              `Use the exec tool with a heredoc instead, e.g.: exec with command: cat << 'HTMLEOF' > ${filePath}\n...content...\nHTMLEOF\n` +
-              `Or break the file into smaller write operations.]`,
+        filePath: filePath,
+        hint: `[System: File write for "${filePath}" was truncated due to payload size limits. ` +
+              `You MUST now write this file using chunked heredoc via the exec tool. ` +
+              `Step 1: exec with command: cat << 'CHUNK1' > ${filePath} followed by the first 30-40 lines of content, then CHUNK1. ` +
+              `Step 2: exec with command: cat << 'CHUNK2' >> ${filePath} (note: >> to append) for the next 30-40 lines. ` +
+              `Continue with CHUNK3, CHUNK4, etc. until the entire file is written. Start writing CHUNK1 now.]`,
       };
     }
     console.warn(`[convertNativeToolCall] Skipping tool call with truncated/invalid JSON: ${cursorName} (rawArgs=${tc.rawArgs.substring(0, 120)}...)`);
@@ -540,8 +543,21 @@ function chunkToUtf8String(chunk) {
           console.log(`[chunkToUtf8String] Intercepted native tool call: ${cursorName} (enum=${tc.tool}, id=${tc.toolCallId}, rawArgs=${tc.rawArgs.substring(0, 200)})`);
           const mapped = convertNativeToolCall(tc);
           if (mapped && mapped.truncated) {
-            // Truncated file write — inject hint text so the model adapts
+            // Truncated file write — inject hint text AND a fallback exec tool call.
+            // The exec triggers a tool result cycle through OpenClaw, giving the
+            // model a follow-up turn to write the file using chunked heredoc.
+            // Without a tool call, the response would be text-only (finish_reason='stop')
+            // and the model would never get another turn to act on the hint.
             textOutput.push(`\n${mapped.hint}\n`);
+            const safeFilePath = (mapped.filePath || 'file').replace(/'/g, "'\\''");
+            const fallbackExec = {
+              name: 'exec',
+              arguments: {
+                command: `echo "Ready for chunked heredoc write to: ${safeFilePath}"`
+              }
+            };
+            textOutput.push(`\n<tool_call>\n${JSON.stringify(fallbackExec)}\n</tool_call>\n`);
+            console.log(`[chunkToUtf8String] Injected fallback exec for truncated write → triggers new turn`);
           } else if (mapped) {
             textOutput.push(`\n<tool_call>\n${JSON.stringify(mapped)}\n</tool_call>\n`);
           }
