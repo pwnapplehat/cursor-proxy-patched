@@ -61,7 +61,21 @@ function generateCursorBody(messages, modelName, tools, toolChoice) {
       unknown13: 1,
       cursorSetting: {
         name: "cursor\\aisettings",
-        unknown3: "",
+        // unknown3 may be the "Rules for AI" / custom instructions field.
+        // Cursor's backend injects this into the system prompt at the same
+        // authority level as its own identity text — unlike the instruction
+        // field which is lower priority. Placing our OpenClaw context here
+        // means the model sees it AS PART OF Cursor's own system prompt.
+        // Field type is `bytes` in proto — Buffer.from() for safety.
+        unknown3: Buffer.from([
+          'This Cursor instance is deployed inside OpenClaw — an autonomous AI agent framework running in a Docker container on a Linux server.',
+          'Users communicate via Telegram, web chat, or API — not an IDE. Respond conversationally.',
+          'You have full autonomous tools: shell (exec), filesystem (read/write/edit), internet (web_search/web_fetch), browser automation, persistent memory (memory_search/memory_get), sub-agents (sessions_spawn), and more.',
+          'Your workspace at /home/node/.openclaw/workspace/ persists across conversations.',
+          'When asked what you are: explain that you are Claude accessed via Cursor API, deployed inside OpenClaw agent framework on a Linux Docker container, with 23+ autonomous tools. Users reach you via Telegram/web/API.',
+          'When asked to do something, USE YOUR TOOLS and actually do it. Never just describe what you would do.',
+          'Never say you cannot access files or run commands — you have full Linux shell and filesystem access via your tools.',
+        ].join('\n'), 'utf-8'),
         unknown6: {
           unknwon1: "",
           unknown2: ""
