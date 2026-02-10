@@ -292,6 +292,7 @@ const CURSOR_TOOL_NAMES = {
 // The model uses whichever names Cursor's Agent-mode system prompt provides,
 // so we remap them to match what OpenClaw actually exposes.
 
+// Simple name-only mappings (params use standard rename table below)
 const CURSOR_TO_OPENCLAW_TOOLS = {
   'run_terminal_cmd': 'exec',
   'run_terminal_command': 'exec',
@@ -299,8 +300,7 @@ const CURSOR_TO_OPENCLAW_TOOLS = {
   'read_file_v2': 'read',
   'edit_file': 'edit',
   'edit_file_v2': 'edit',
-  // list_dir, grep, file_search → no direct OpenClaw equivalent;
-  // pass through as-is and let OpenClaw return an error so the model adapts.
+  'web_search': 'web_search',
 };
 
 // Cursor parameter names that differ from OpenClaw's
@@ -312,6 +312,47 @@ const CURSOR_TO_OPENCLAW_PARAMS = {
 
 // Cursor-specific params to drop (not used by OpenClaw)
 const CURSOR_DROP_PARAMS = new Set(['explanation', 'is_background', 'blocking']);
+
+// Tools that need full argument restructuring (not just param rename).
+// Each returns { name, arguments } ready for OpenClaw.
+const SPECIAL_TOOL_CONVERSIONS = {
+  'list_dir': (args) => ({
+    name: 'exec',
+    arguments: { command: `ls -la ${shellEscape(args.target_directory || args.path || '.')}` },
+  }),
+  'list_dir_v2': (args) => ({
+    name: 'exec',
+    arguments: { command: `ls -la ${shellEscape(args.target_directory || args.path || '.')}` },
+  }),
+  'ripgrep_raw_search': (args) => {
+    const pattern = args.pattern || '';
+    const path = args.path || '.';
+    const limit = args.head_limit ? ` | head -${args.head_limit}` : '';
+    return { name: 'exec', arguments: { command: `rg ${shellEscape(pattern)} ${shellEscape(path)}${limit}` } };
+  },
+  'ripgrep_search': (args) => {
+    const pattern = args.pattern || '';
+    const path = args.path || '.';
+    const limit = args.head_limit ? ` | head -${args.head_limit}` : '';
+    return { name: 'exec', arguments: { command: `rg ${shellEscape(pattern)} ${shellEscape(path)}${limit}` } };
+  },
+  'file_search': (args) => ({
+    name: 'exec',
+    arguments: { command: `find ${shellEscape(args.path || '.')} -name ${shellEscape(args.pattern || args.query || '*')} 2>/dev/null` },
+  }),
+  'glob_file_search': (args) => ({
+    name: 'exec',
+    arguments: { command: `find ${shellEscape(args.path || '.')} -name ${shellEscape(args.glob_pattern || args.pattern || '*')} 2>/dev/null` },
+  }),
+};
+
+/** Escape a shell argument (wraps in single quotes, escapes existing quotes) */
+function shellEscape(s) {
+  if (!s || typeof s !== 'string') return "''";
+  // Already looks safe (alphanumeric, dots, slashes, dashes)
+  if (/^[a-zA-Z0-9._\-\/]+$/.test(s)) return s;
+  return "'" + s.replace(/'/g, "'\\''") + "'";
+}
 
 // Tool types that involve large payloads (file content) and are prone to truncation
 const FILE_WRITE_TOOLS = new Set(['write', 'edit', 'edit_file', 'edit_file_v2', 'write_to_file']);
@@ -349,10 +390,16 @@ function convertNativeToolCall(tc) {
     return null;
   }
 
-  // 2. Map to OpenClaw tool name
-  const openclawName = CURSOR_TO_OPENCLAW_TOOLS[cursorName] || cursorName;
+  // 2. Check for special conversions that need full arg restructuring
+  const specialConvert = SPECIAL_TOOL_CONVERSIONS[cursorName];
+  if (specialConvert) {
+    const result = specialConvert(args);
+    console.log(`[convertNativeToolCall] ${cursorName} →(special)→ ${result.name} (command: ${JSON.stringify(result.arguments).substring(0, 120)})`);
+    return result;
+  }
 
-  // 3. Map parameter names and drop Cursor-specific params
+  // 3. Standard name mapping + parameter rename
+  const openclawName = CURSOR_TO_OPENCLAW_TOOLS[cursorName] || cursorName;
   const mappedArgs = {};
   for (const [key, value] of Object.entries(args)) {
     if (CURSOR_DROP_PARAMS.has(key)) continue;

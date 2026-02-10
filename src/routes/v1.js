@@ -180,9 +180,24 @@ router.post('/chat/completions', async (req, res) => {
         // Cursor's streaming sometimes splits gzip frames across TCP packets.
         // Since we buffer the full response for tool call detection anyway,
         // there is zero downside to parsing the complete buffer at once.
+        //
+        // IMPORTANT: The stream may terminate early due to:
+        //   - HTTP/2 timeout (300s) when Cursor waits for native tool results
+        //   - ERROR_USER_ABORTED_REQUEST from native tool dispatch
+        // In both cases, we still process whatever chunks arrived so far.
         const rawChunks = [];
-        for await (const chunk of response.body) {
-          rawChunks.push(Buffer.from(chunk));
+        let streamTerminated = false;
+        try {
+          for await (const chunk of response.body) {
+            rawChunks.push(Buffer.from(chunk));
+          }
+        } catch (streamReadError) {
+          streamTerminated = true;
+          console.warn(`[chat/completions] Stream terminated early (${rawChunks.length} chunks accumulated): ${streamReadError.message || streamReadError}`);
+          // Continue processing whatever we have — don't throw
+        }
+        if (rawChunks.length === 0) {
+          throw new Error('No data received from Cursor API');
         }
         const fullBuffer = Buffer.concat(rawChunks);
         const { thinking, text } = chunkToUtf8String(fullBuffer);
@@ -300,11 +315,12 @@ router.post('/chat/completions', async (req, res) => {
           );
         }
       } catch (streamError) {
-        console.error('Stream error:', streamError);
-        if (streamError.name === 'TimeoutError') {
-          res.write(`data: ${JSON.stringify({ error: 'Server response timeout' })}\n\n`);
+        console.error('[chat/completions] Stream processing error:', streamError.message || streamError);
+        const errMsg = String(streamError.message || streamError);
+        if (streamError.name === 'TimeoutError' || errMsg.includes('timeout') || errMsg.includes('terminated')) {
+          res.write(`data: ${JSON.stringify({ error: 'Cursor API stream timeout — the response was too large or took too long. Try a simpler request.' })}\n\n`);
         } else {
-          res.write(`data: ${JSON.stringify({ error: 'Stream processing error' })}\n\n`);
+          res.write(`data: ${JSON.stringify({ error: `Stream processing error: ${errMsg.substring(0, 200)}` })}\n\n`);
         }
       } finally {
         res.write('data: [DONE]\n\n');
@@ -315,8 +331,15 @@ router.post('/chat/completions', async (req, res) => {
       try {
         // Accumulate ALL raw chunks before parsing (same Z_BUF_ERROR fix as streaming)
         const rawChunksNS = [];
-        for await (const chunk of response.body) {
-          rawChunksNS.push(Buffer.from(chunk));
+        try {
+          for await (const chunk of response.body) {
+            rawChunksNS.push(Buffer.from(chunk));
+          }
+        } catch (nsStreamErr) {
+          console.warn(`[chat/completions] Non-stream terminated early (${rawChunksNS.length} chunks): ${nsStreamErr.message || nsStreamErr}`);
+        }
+        if (rawChunksNS.length === 0) {
+          throw new Error('No data received from Cursor API (non-stream)');
         }
         const fullBufferNS = Buffer.concat(rawChunksNS);
         const { thinking: thinkNS, text: textNS } = chunkToUtf8String(fullBufferNS);
