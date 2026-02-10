@@ -17,7 +17,10 @@ function normalizeContent(content) {
 }
 
 function isSystemRole(role) {
-  return role === 'system' || role === 'developer';
+  // Only 'system' goes into the instruction field.
+  // 'developer' now goes into the conversation as role 1 (user) so that
+  // Cursor's internal system prompt does NOT override the OpenClaw agent identity.
+  return role === 'system';
 }
 
 function generateCursorBody(messages, modelName, tools, toolChoice) {
@@ -25,26 +28,31 @@ function generateCursorBody(messages, modelName, tools, toolChoice) {
   let processedMessages = convertToolResultMessages(messages);
   processedMessages = injectToolsIntoMessages(processedMessages, tools, toolChoice);
 
-  // Both "system" and "developer" roles go into the protobuf instruction field
+  // Only role:"system" goes into the protobuf instruction field.
+  // role:"developer" (OpenClaw's agent identity + appended tool definitions)
+  // goes into the conversation as a user message (role 1) so the model
+  // sees it as legitimate conversation content, not a system prompt that
+  // Cursor's backend can override.
   let instruction = processedMessages
     .filter(msg => isSystemRole(msg.role))
     .map(msg => normalizeContent(msg.content))
     .join('\n');
 
-  // Note: Agent mode is now activated via protobuf fields:
+  // Agent mode is activated via protobuf fields:
   // - unknown27 = 1 (is_agentic = true)
   // - supportedTools = [...] (ClientSideToolV2 enum values)
   // - chatModeEnum = 2 (UNIFIED_MODE_AGENT)
   // - chatMode = "Agent" (unified_mode_name)
-  // No text-based identity override is needed.
 
   const formattedMessages = processedMessages
     .filter(msg => !isSystemRole(msg.role))
     .map(msg => ({
       content: normalizeContent(msg.content),
-      role: msg.role === 'user' ? 1 : 2,
+      // 'developer' and 'user' both map to role 1 (human);
+      // 'assistant' maps to role 2 (AI)
+      role: (msg.role === 'user' || msg.role === 'developer') ? 1 : 2,
       messageId: uuidv4(),
-      ...(msg.role === 'user' ? { chatModeEnum: 2 } : {})
+      ...((msg.role === 'user' || msg.role === 'developer') ? { chatModeEnum: 2 } : {})
     }));
 
   const messageIds = formattedMessages.map(msg => {
