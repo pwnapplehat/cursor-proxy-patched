@@ -17,10 +17,7 @@ function normalizeContent(content) {
 }
 
 function isSystemRole(role) {
-  // Only 'system' goes into the instruction field.
-  // 'developer' now goes into the conversation as role 1 (user) so that
-  // Cursor's internal system prompt does NOT override the OpenClaw agent identity.
-  return role === 'system';
+  return role === 'system' || role === 'developer';
 }
 
 function generateCursorBody(messages, modelName, tools, toolChoice) {
@@ -28,31 +25,26 @@ function generateCursorBody(messages, modelName, tools, toolChoice) {
   let processedMessages = convertToolResultMessages(messages);
   processedMessages = injectToolsIntoMessages(processedMessages, tools, toolChoice);
 
-  // Only role:"system" goes into the protobuf instruction field.
-  // role:"developer" (OpenClaw's agent identity + appended tool definitions)
-  // goes into the conversation as a user message (role 1) so the model
-  // sees it as legitimate conversation content, not a system prompt that
-  // Cursor's backend can override.
+  // Both "system" and "developer" roles go into the protobuf instruction field
   let instruction = processedMessages
     .filter(msg => isSystemRole(msg.role))
     .map(msg => normalizeContent(msg.content))
     .join('\n');
 
-  // Agent mode is activated via protobuf fields:
+  // Note: Agent mode is now activated via protobuf fields:
   // - unknown27 = 1 (is_agentic = true)
   // - supportedTools = [...] (ClientSideToolV2 enum values)
   // - chatModeEnum = 2 (UNIFIED_MODE_AGENT)
   // - chatMode = "Agent" (unified_mode_name)
+  // No text-based identity override is needed.
 
   const formattedMessages = processedMessages
     .filter(msg => !isSystemRole(msg.role))
     .map(msg => ({
       content: normalizeContent(msg.content),
-      // 'developer' and 'user' both map to role 1 (human);
-      // 'assistant' maps to role 2 (AI)
-      role: (msg.role === 'user' || msg.role === 'developer') ? 1 : 2,
+      role: msg.role === 'user' ? 1 : 2,
       messageId: uuidv4(),
-      ...((msg.role === 'user' || msg.role === 'developer') ? { chatModeEnum: 2 } : {})
+      ...(msg.role === 'user' ? { chatModeEnum: 2 } : {})
     }));
 
   const messageIds = formattedMessages.map(msg => {
@@ -94,22 +86,12 @@ function generateCursorBody(messages, modelName, tools, toolChoice) {
         timestamp: new Date().toISOString(),
       },
       unknown27: 1, // is_agentic = true (field 27) — REQUIRED for Agent mode
-      // supported_tools (field 29): ClientSideToolV2 enum values
-      // These tell Cursor's backend which tools the client supports for Agent mode.
-      // Values from aiserver.v1.ClientSideToolV2 (reverse-engineered from Cursor v2.3.41):
-      supportedTools: [
-        5,  // READ_FILE
-        6,  // LIST_DIR
-        7,  // EDIT_FILE
-        8,  // FILE_SEARCH
-        15, // RUN_TERMINAL_COMMAND_V2
-        18, // WEB_SEARCH
-        38, // EDIT_FILE_V2
-        39, // LIST_DIR_V2
-        40, // READ_FILE_V2
-        41, // RIPGREP_RAW_SEARCH
-        42, // GLOB_FILE_SEARCH
-      ],
+      // NOTE: Do NOT set supportedTools (field 29). Setting it activates Cursor's
+      // native bidi tool system (tool_call_v2 in protobuf), which requires HTTP/2
+      // bidirectional streaming to send tool results back. Our proxy uses
+      // unidirectional streaming and can't respond to native tool calls.
+      // Instead, we rely on text-based tool emulation via <tool_call> XML tags
+      // injected into the system prompt by toolEmulation.js.
       messageIds: messageIds,
       largeContext: 0,
       unknown38: 0,
