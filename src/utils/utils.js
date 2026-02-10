@@ -83,10 +83,7 @@ function generateCursorBody(messages, modelName, tools, toolChoice) {
       largeContext: 0,
       unknown38: 0,
       chatModeEnum: 2,
-      // unknown47 might be workspace_root_path — Cursor's system prompt template
-      // includes <<user_info>> with "The absolute path of the user's workspace is {workspace_path}"
-      // If this is the right field, the model will see our OpenClaw workspace path.
-      unknown47: "/home/node/.openclaw/workspace",
+      unknown47: "",
       unknown48: 0,
       unknown49: 0,
       unknown51: 0,
@@ -99,7 +96,7 @@ function generateCursorBody(messages, modelName, tools, toolChoice) {
   if (instruction) {
     console.log(`[generateCursorBody] instruction (first 300 chars): ${instruction.substring(0, 300)}`);
   }
-  console.log(`[generateCursorBody] metadata: os=${body.request.metadata.os}, path=${body.request.metadata.path}, unknown47=${body.request.unknown47}`);
+  console.log(`[generateCursorBody] metadata: os=${body.request.metadata.os}, path=${body.request.metadata.path}`);
 
   const errMsg = $root.StreamUnifiedChatWithToolsRequest.verify(body);
   if (errMsg) throw Error(errMsg);
