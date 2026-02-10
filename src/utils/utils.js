@@ -412,6 +412,49 @@ function shellEscape(s) {
 // Tool types that involve large payloads (file content) and are prone to truncation
 const FILE_WRITE_TOOLS = new Set(['write', 'edit', 'edit_file', 'edit_file_v2', 'write_to_file']);
 
+// ─── Loop Detection ──────────────────────────────────────────────────
+// Tracks recently emitted tool call signatures across requests.
+// If the model emits the exact same tool+command 2+ times in a row,
+// we inject a "[System: ...]" hint telling it to stop repeating and
+// proceed to the next step. Entries expire after 60 seconds to avoid
+// false positives across unrelated conversations.
+const RECENT_TOOL_CALLS = [];     // Array of { signature, timestamp }
+const LOOP_MAX_REPEATS = 2;       // How many identical calls before we intervene
+const LOOP_WINDOW_MS = 60_000;    // Only compare within this time window
+
+/**
+ * Generates a stable string fingerprint for a mapped tool call,
+ * so we can detect repeated identical calls across turns.
+ */
+function toolCallSignature(mapped) {
+  if (!mapped || mapped.truncated) return null;
+  // Normalize: tool name + sorted argument keys/values
+  const argStr = mapped.arguments
+    ? JSON.stringify(mapped.arguments, Object.keys(mapped.arguments).sort())
+    : '';
+  return `${mapped.name}::${argStr}`;
+}
+
+/**
+ * Records a tool call and returns true if it's a repeated loop
+ * that should be suppressed / hinted.
+ */
+function checkToolCallLoop(signature) {
+  if (!signature) return false;
+  const now = Date.now();
+  // Purge stale entries outside the window
+  while (RECENT_TOOL_CALLS.length > 0 && now - RECENT_TOOL_CALLS[0].timestamp > LOOP_WINDOW_MS) {
+    RECENT_TOOL_CALLS.shift();
+  }
+  // Count how many recent entries match this exact signature
+  const repeatCount = RECENT_TOOL_CALLS.filter(e => e.signature === signature).length;
+  // Record this one
+  RECENT_TOOL_CALLS.push({ signature, timestamp: now });
+  // Keep the array bounded (max 20 entries)
+  if (RECENT_TOOL_CALLS.length > 20) RECENT_TOOL_CALLS.shift();
+  return repeatCount >= LOOP_MAX_REPEATS;
+}
+
 /**
  * Convert an intercepted native Cursor tool call to OpenClaw format.
  * Returns:
@@ -437,11 +480,14 @@ function convertNativeToolCall(tc) {
       return {
         truncated: true,
         filePath: filePath,
-        hint: `[System: File write for "${filePath}" was truncated due to payload size limits. ` +
+        hint: `[System: File write for "${filePath}" was truncated due to streaming payload limits. ` +
               `You MUST now write this file using chunked heredoc via the exec tool. ` +
-              `Step 1: exec with command: cat << 'CHUNK1' > ${filePath} followed by the first 30-40 lines of content, then CHUNK1. ` +
-              `Step 2: exec with command: cat << 'CHUNK2' >> ${filePath} (note: >> to append) for the next 30-40 lines. ` +
-              `Continue with CHUNK3, CHUNK4, etc. until the entire file is written. Start writing CHUNK1 now.]`,
+              `Determine the chunk size dynamically based on the total file length — ` +
+              `divide the file into the fewest chunks that will fit through the stream. ` +
+              `Use cat << 'CHUNK1' > ${filePath} for the first chunk (creates file), ` +
+              `then cat << 'CHUNK2' >> ${filePath} (>> appends) for each subsequent chunk. ` +
+              `If any chunk still gets truncated or fails, automatically retry that chunk with fewer lines until it succeeds, then continue. ` +
+              `Do NOT stop or ask the user — keep writing until the entire file is complete. Start CHUNK1 now.]`,
       };
     }
     console.warn(`[convertNativeToolCall] Skipping tool call with truncated/invalid JSON: ${cursorName} (rawArgs=${tc.rawArgs.substring(0, 120)}...)`);
@@ -559,6 +605,19 @@ function chunkToUtf8String(chunk) {
             textOutput.push(`\n<tool_call>\n${JSON.stringify(fallbackExec)}\n</tool_call>\n`);
             console.log(`[chunkToUtf8String] Injected fallback exec for truncated write → triggers new turn`);
           } else if (mapped) {
+            // Loop detection: if the model keeps emitting the exact same tool call,
+            // inject a system hint telling it to stop repeating and advance.
+            const sig = toolCallSignature(mapped);
+            const isLoop = checkToolCallLoop(sig);
+            if (isLoop) {
+              console.warn(`[chunkToUtf8String] Loop detected: "${mapped.name}" called ${LOOP_MAX_REPEATS + 1}+ times with same args — injecting advance hint`);
+              textOutput.push(
+                `\n[System: You have already executed this exact command successfully in a previous turn. ` +
+                `Do NOT repeat it. Proceed to the NEXT step of your task immediately.]\n`
+              );
+              // Still emit the tool call so the turn cycles through OpenClaw,
+              // but the hint text ensures the model reads the guidance next turn.
+            }
             textOutput.push(`\n<tool_call>\n${JSON.stringify(mapped)}\n</tool_call>\n`);
           }
         }

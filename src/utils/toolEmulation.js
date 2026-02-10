@@ -29,27 +29,27 @@ Your tools are provided by OpenClaw's runtime — not by Cursor IDE.
 - **Shell**: /bin/bash — use bash syntax for ALL commands. Never use PowerShell or Windows syntax.
 - **Workspace**: /home/node/.openclaw/workspace/
 - **Capabilities**: Full filesystem access, terminal, web access, sub-agent spawning, memory, browser automation, image generation, TTS, and more.
+- **Important**: You get ONE tool call per turn. After a tool call succeeds, move to the NEXT action immediately. Never repeat a command that already succeeded.
 
 ### CRITICAL: Writing Large Files
 
-The file write tool **silently truncates** files larger than ~2KB due to streaming limitations.
-For ANY file with substantial content (HTML pages, scripts, configs, anything >30 lines):
+The file write tool **silently truncates** files larger than ~2KB due to streaming payload limits.
+For ANY file with substantial content (HTML pages, scripts, configs), use chunked heredoc via exec:
 
-**ALWAYS split into chunks via terminal commands using heredoc:**
-
-Chunk 1 (create file):
-  exec command: cat << 'CHUNK1' > path/to/file.ext
-  ...first 30-40 or according to the file size lines of content or lowers the chunk size more dynamiclly if still encountering any issues...
-  CHUNK1
-
-Chunk 2 (append to file — note >> not >):
-  exec command: cat << 'CHUNK2' >> path/to/file.ext
-  ...next 30-40 or according to the file size lines of content or lowers the chunk size more dynamiclly if still encountering any issues...
-  CHUNK2
-
-Continue with CHUNK3, CHUNK4, etc. until the entire file is written.
-Each chunk is a separate tool call — wait for the result before sending the next.
-Use a different delimiter name for each chunk (CHUNK1, CHUNK2, CHUNK3...).
+**Procedure:**
+1. First, mentally compose the COMPLETE file content.
+2. Divide the file into chunks — determine the chunk size dynamically based on the total file length. Use the fewest chunks possible. You decide the optimal split — there is no fixed line limit.
+3. Write chunk 1 with > (creates file):
+   exec command: cat << 'CHUNK1' > path/to/file.ext
+   ...lines of content...
+   CHUNK1
+4. Write subsequent chunks with >> (appends):
+   exec command: cat << 'CHUNK2' >> path/to/file.ext
+   ...lines of content...
+   CHUNK2
+5. Continue with CHUNK3, CHUNK4, etc. until the entire file is complete.
+6. **If any chunk fails or gets truncated**, automatically retry that specific chunk with fewer lines until it succeeds, then continue from where you left off. Do NOT stop or ask the user.
+7. Each chunk is one tool call — wait for the result before sending the next.
 
 For small files (<30 lines), the write tool works fine.
 
