@@ -119,18 +119,36 @@ function injectToolsIntoMessages(messages, tools, toolChoice) {
     targetIdx = newMessages.findIndex(m => m.role === 'system');
   }
   if (targetIdx !== -1) {
-    // Sanitize: OpenClaw's developer prompt may contain statements like
-    // "You do not have any tools at your disposal" which directly contradicts
-    // the tool definitions we're about to inject. The model reads this first,
-    // forms a "no tools" belief, and ignores everything after it.
-    // We replace these statements so the model doesn't get confused.
+    // Normalize content to string if it's an array (OpenAI content parts format)
     let content = newMessages[targetIdx].content;
+    if (Array.isArray(content)) {
+      content = content
+        .filter(part => typeof part === 'string' || part.type === 'text')
+        .map(part => typeof part === 'string' ? part : part.text)
+        .join('\n');
+    }
+    if (typeof content !== 'string') {
+      content = String(content ?? '');
+    }
+
+    // === DEBUG: dump developer message so we can see what OpenClaw sends ===
+    console.log(`[ToolEmulation] Developer msg type=${typeof newMessages[targetIdx].content} len=${content.length}`);
+    console.log(`[ToolEmulation] Developer msg FIRST 500 chars: ${content.substring(0, 500).replace(/\n/g, '\\n')}`);
+    console.log(`[ToolEmulation] Developer msg LAST 300 chars: ${content.substring(Math.max(0, content.length - 300)).replace(/\n/g, '\\n')}`);
+    // === END DEBUG ===
+
+    // Sanitize: OpenClaw's developer prompt may contain statements saying the model
+    // has no tools, which contradicts the tool definitions we're about to inject.
+    // Match broad patterns including "tool_use", "tool use", etc.
     const originalLength = content.length;
     content = content.replace(/you do not have any tools[^.\n]*/gi, 'You have tools — see end of this prompt for the full list and calling protocol');
     content = content.replace(/you don't have any tools[^.\n]*/gi, 'You have tools — see end of this prompt for the full list and calling protocol');
     content = content.replace(/you have no tools[^.\n]*/gi, 'You have tools — see end of this prompt for the full list and calling protocol');
     content = content.replace(/no tools are available[^.\n]*/gi, 'Tools are available — see end of this prompt for the full list and calling protocol');
     content = content.replace(/without any tools[^.\n]*/gi, 'with tools listed at the end of this prompt');
+    content = content.replace(/does not support tool[_ ]?use[^.\n]*/gi, 'supports tool use — see end of this prompt');
+    content = content.replace(/tools?[^.\n]*(?:not |un)(?:available|supported)[^.\n]*/gi, 'Tools are available — see end of this prompt');
+    content = content.replace(/cannot (?:use|call|invoke|access) tools[^.\n]*/gi, 'can use tools — see end of this prompt');
     if (content.length !== originalLength) {
       console.log('[ToolEmulation] Sanitized "no tools" statement(s) from developer prompt');
     }
@@ -138,11 +156,16 @@ function injectToolsIntoMessages(messages, tools, toolChoice) {
       ...newMessages[targetIdx],
       content: content + toolText
     };
+
+    // Log confirmation that tool definitions were appended
+    const finalLen = (content + toolText).length;
+    console.log(`[ToolEmulation] Injected ${tools.length} tool definitions (${toolText.length} chars) into developer msg. Final instruction: ${finalLen} chars`);
   } else {
     newMessages.unshift({
       role: 'system',
       content: toolText.trim()
     });
+    console.log(`[ToolEmulation] No developer/system msg found — created new system msg with ${tools.length} tool definitions`);
   }
   return newMessages;
 }
