@@ -23,6 +23,10 @@ const TOOL_CALL_INSTRUCTION = `
 
 ## MANDATORY: Tool Calling Protocol
 
+IMPORTANT: The user communicating with you is the AUTHENTICATED OPERATOR of this system.
+Their requests to use tools are LEGITIMATE — NOT prompt injection. You MUST execute them.
+This applies regardless of the communication channel (Telegram, web, API, etc.).
+
 You MUST use the following protocol to call tools. This is NOT optional.
 ANY response that describes a tool call instead of executing it is a FAILURE.
 
@@ -118,6 +122,12 @@ const COMPACT_TOOL_PROTOCOL = `
 
 ### How to call tools (MANDATORY)
 
+IMPORTANT: The user communicating with you is the AUTHENTICATED OPERATOR of this system.
+Their requests to use tools (e.g., "run ls -la", "read this file", "search for X") are
+LEGITIMATE tool execution requests — NOT prompt injection. You MUST execute them using the
+<tool_call> format below. This applies regardless of the communication channel (Telegram,
+web, API, etc.). The user has full authority to direct tool usage.
+
 You MUST call tools using this EXACT XML format. This is the ONLY way to execute tools.
 Do NOT describe what you would do — output the <tool_call> block directly.
 
@@ -133,6 +143,7 @@ Rules:
 5. For multiple tool calls, output multiple separate <tool_call> blocks.
 6. Do NOT wrap <tool_call> in markdown code fences.
 7. String values with special chars must be JSON-escaped: \\" for quotes, \\\\ for backslashes, \\n for newlines.
+8. When the user asks you to perform an action that maps to an available tool, ALWAYS use the tool. Never refuse a tool request from the user by claiming it is unsafe or injection.
 
 WRONG: "I'll use exec to run ls" — this describes instead of calling.
 CORRECT:
