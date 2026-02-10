@@ -131,18 +131,57 @@ function convertToolResultMessages(messages) {
 }
 
 /**
+ * Sanitizes text before tool call parsing:
+ * - Strips backtick-wrapped <tool_call> mentions (model talking ABOUT the format)
+ * - Strips markdown code-fenced <tool_call> mentions
+ * This prevents the parser from matching conversational references to the format.
+ */
+function sanitizeForParsing(text) {
+  // Remove backtick-wrapped mentions like `<tool_call>` or `</tool_call>`
+  let sanitized = text.replace(/`<\/?tool_call>`/g, '___TOOL_TAG_REF___');
+  // Remove triple-backtick code blocks that mention tool_call
+  sanitized = sanitized.replace(/```[\s\S]*?```/g, (block) => {
+    if (block.includes('<tool_call>')) {
+      return block.replace(/<tool_call>/g, '___TOOL_TAG_REF___').replace(/<\/tool_call>/g, '___TOOL_TAG_END_REF___');
+    }
+    return block;
+  });
+  return sanitized;
+}
+
+/**
  * Parses <tool_call> XML blocks from model text output into OpenAI tool_calls format.
+ * Handles cases where the model talks about <tool_call> in conversational text
+ * by sanitizing backtick-wrapped and code-fenced mentions first.
  * Returns { textContent, toolCalls } where textContent is the text without tool call blocks.
  */
 function parseToolCalls(text) {
   const toolCalls = [];
-  const regex = /<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/g;
-  let match;
   let callIndex = 0;
 
-  while ((match = regex.exec(text)) !== null) {
+  // Sanitize: strip backtick-wrapped and code-fenced <tool_call> mentions
+  const sanitized = sanitizeForParsing(text);
+
+  const regex = /<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/g;
+  let match;
+
+  while ((match = regex.exec(sanitized)) !== null) {
     try {
-      const jsonStr = match[1].trim();
+      let jsonStr = match[1].trim();
+
+      // Handle smart quotes (can appear from Telegram/chat formatting)
+      jsonStr = jsonStr.replace(/\u201c|\u201d/g, '"');
+      jsonStr = jsonStr.replace(/\u2018|\u2019/g, "'");
+
+      // Try to extract the JSON object from within the captured content
+      // This handles cases where extra text is captured around the JSON
+      const jsonMatch = jsonStr.match(/\{[\s\S]*\}/);
+      if (!jsonMatch) {
+        console.error('[ToolEmulation] No JSON object found in tool_call block:', jsonStr.substring(0, 100));
+        continue;
+      }
+      jsonStr = jsonMatch[0].trim();
+
       const parsed = JSON.parse(jsonStr);
       if (parsed.name) {
         toolCalls.push({
@@ -158,11 +197,16 @@ function parseToolCalls(text) {
         callIndex++;
       }
     } catch (e) {
-      console.error('[ToolEmulation] Failed to parse tool call JSON:', match[1], e.message);
+      console.error('[ToolEmulation] Failed to parse tool call JSON:', match[1].substring(0, 200), e.message);
     }
   }
 
-  const textContent = text.replace(/<tool_call>\s*[\s\S]*?\s*<\/tool_call>/g, '').trim();
+  // Remove actual tool call blocks from the text content (use sanitized version for matching)
+  const textContent = sanitized
+    .replace(/<tool_call>\s*[\s\S]*?\s*<\/tool_call>/g, '')
+    .replace(/___TOOL_TAG_REF___/g, '`<tool_call>`')
+    .replace(/___TOOL_TAG_END_REF___/g, '`</tool_call>`')
+    .trim();
 
   if (toolCalls.length > 0) {
     console.log(`[ToolEmulation] Parsed ${toolCalls.length} tool call(s): ${toolCalls.map(tc => tc.function.name).join(', ')}`);
@@ -172,10 +216,11 @@ function parseToolCalls(text) {
 }
 
 /**
- * Detects whether text contains <tool_call> tags.
+ * Detects whether text contains actual <tool_call> tags (not backtick-wrapped references).
  */
 function hasToolCallTags(text) {
-  return /<tool_call>/.test(text);
+  const sanitized = sanitizeForParsing(text);
+  return /<tool_call>/.test(sanitized);
 }
 
 module.exports = {
