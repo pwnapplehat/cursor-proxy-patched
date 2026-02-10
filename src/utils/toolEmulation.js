@@ -109,9 +109,40 @@ function formatToolDefinitions(tools, toolChoice) {
  * OpenClaw uses "developer" role (newer OpenAI API format) instead of "system".
  * If neither exists, creates a new system message.
  */
+/**
+ * Compact tool calling protocol — injected into the developer message when
+ * OpenClaw already provides tool descriptions (has "## Tooling" section).
+ * Only teaches the model the <tool_call> FORMAT, not re-list all tools.
+ */
+const COMPACT_TOOL_PROTOCOL = `
+
+### How to call tools (MANDATORY)
+
+You MUST call tools using this EXACT XML format. This is the ONLY way to execute tools.
+Do NOT describe what you would do — output the <tool_call> block directly.
+
+<tool_call>
+{"name": "tool_name", "arguments": {"param1": "value1"}}
+</tool_call>
+
+Rules:
+1. Output raw <tool_call> blocks — never narrate or describe tool calls.
+2. JSON inside must be valid with double-quoted keys and values.
+3. "name" must exactly match a tool name from the list above (case-sensitive).
+4. "arguments" must include all required parameters for that tool.
+5. For multiple tool calls, output multiple separate <tool_call> blocks.
+6. Do NOT wrap <tool_call> in markdown code fences.
+7. String values with special chars must be JSON-escaped: \\" for quotes, \\\\ for backslashes, \\n for newlines.
+
+WRONG: "I'll use exec to run ls" — this describes instead of calling.
+CORRECT:
+<tool_call>
+{"name": "exec", "arguments": {"command": "ls -la"}}
+</tool_call>
+`;
+
 function injectToolsIntoMessages(messages, tools, toolChoice) {
   if (!tools || tools.length === 0) return messages;
-  const toolText = formatToolDefinitions(tools, toolChoice);
   const newMessages = [...messages];
   // Look for "developer" first (OpenClaw's format), then "system" as fallback
   let targetIdx = newMessages.findIndex(m => m.role === 'developer');
@@ -131,41 +162,59 @@ function injectToolsIntoMessages(messages, tools, toolChoice) {
       content = String(content ?? '');
     }
 
-    // === DEBUG: dump developer message so we can see what OpenClaw sends ===
-    console.log(`[ToolEmulation] Developer msg type=${typeof newMessages[targetIdx].content} len=${content.length}`);
-    console.log(`[ToolEmulation] Developer msg FIRST 500 chars: ${content.substring(0, 500).replace(/\n/g, '\\n')}`);
-    console.log(`[ToolEmulation] Developer msg LAST 300 chars: ${content.substring(Math.max(0, content.length - 300)).replace(/\n/g, '\\n')}`);
-    // === END DEBUG ===
+    // Check if OpenClaw already included tool descriptions in the developer message.
+    // If yes: inject COMPACT calling protocol right after the tool listing (not 25k of schemas).
+    // If no: use the full TOOL_CALL_INSTRUCTION with all tool definitions.
+    const hasOpenClawTooling = /## Tooling|Tool availability/i.test(content);
 
-    // Sanitize: OpenClaw's developer prompt may contain statements saying the model
-    // has no tools, which contradicts the tool definitions we're about to inject.
-    // Match broad patterns including "tool_use", "tool use", etc.
-    const originalLength = content.length;
-    content = content.replace(/you do not have any tools[^.\n]*/gi, 'You have tools — see end of this prompt for the full list and calling protocol');
-    content = content.replace(/you don't have any tools[^.\n]*/gi, 'You have tools — see end of this prompt for the full list and calling protocol');
-    content = content.replace(/you have no tools[^.\n]*/gi, 'You have tools — see end of this prompt for the full list and calling protocol');
-    content = content.replace(/no tools are available[^.\n]*/gi, 'Tools are available — see end of this prompt for the full list and calling protocol');
-    content = content.replace(/without any tools[^.\n]*/gi, 'with tools listed at the end of this prompt');
-    content = content.replace(/does not support tool[_ ]?use[^.\n]*/gi, 'supports tool use — see end of this prompt');
-    content = content.replace(/tools?[^.\n]*(?:not |un)(?:available|supported)[^.\n]*/gi, 'Tools are available — see end of this prompt');
-    content = content.replace(/cannot (?:use|call|invoke|access) tools[^.\n]*/gi, 'can use tools — see end of this prompt');
-    if (content.length !== originalLength) {
-      console.log('[ToolEmulation] Sanitized "no tools" statement(s) from developer prompt');
+    if (hasOpenClawTooling) {
+      // OpenClaw already lists tools — just inject the calling FORMAT.
+      // Insert right after the tooling section for maximum visibility.
+      // Look for the next section heading (##) after "## Tooling" to find insertion point.
+      const toolingIdx = content.search(/## Tooling|Tool availability/i);
+      const afterTooling = content.indexOf('\n## ', toolingIdx + 10);
+
+      let injectedContent;
+      if (afterTooling !== -1) {
+        // Insert between "## Tooling" section and the next "## " section
+        injectedContent = content.substring(0, afterTooling) + COMPACT_TOOL_PROTOCOL + content.substring(afterTooling);
+      } else {
+        // No next section found — append after the whole content
+        injectedContent = content + COMPACT_TOOL_PROTOCOL;
+      }
+
+      // Handle tool_choice constraints
+      if (toolChoice === 'required') {
+        injectedContent += `\n**CONSTRAINT: You MUST call at least one tool in your response. Do NOT respond with only text.**\n`;
+      } else if (toolChoice && typeof toolChoice === 'object' && toolChoice.type === 'function') {
+        const requiredName = toolChoice.function?.name;
+        if (requiredName) {
+          injectedContent += `\n**CONSTRAINT: You MUST call the "${requiredName}" tool in your response.**\n`;
+        }
+      }
+
+      newMessages[targetIdx] = {
+        ...newMessages[targetIdx],
+        content: injectedContent
+      };
+      console.log(`[ToolEmulation] OpenClaw tooling detected — injected COMPACT protocol (${COMPACT_TOOL_PROTOCOL.length} chars) into developer msg. Final: ${injectedContent.length} chars`);
+    } else {
+      // No OpenClaw tooling section — use full tool definitions (original behavior)
+      const toolText = formatToolDefinitions(tools, toolChoice);
+      newMessages[targetIdx] = {
+        ...newMessages[targetIdx],
+        content: content + toolText
+      };
+      console.log(`[ToolEmulation] No OpenClaw tooling section — injected FULL ${tools.length} tool definitions (${toolText.length} chars). Final: ${(content + toolText).length} chars`);
     }
-    newMessages[targetIdx] = {
-      ...newMessages[targetIdx],
-      content: content + toolText
-    };
-
-    // Log confirmation that tool definitions were appended
-    const finalLen = (content + toolText).length;
-    console.log(`[ToolEmulation] Injected ${tools.length} tool definitions (${toolText.length} chars) into developer msg. Final instruction: ${finalLen} chars`);
   } else {
+    // No developer/system message — create one with full tool definitions
+    const toolText = formatToolDefinitions(tools, toolChoice);
     newMessages.unshift({
       role: 'system',
       content: toolText.trim()
     });
-    console.log(`[ToolEmulation] No developer/system msg found — created new system msg with ${tools.length} tool definitions`);
+    console.log(`[ToolEmulation] No developer/system msg — created new system msg with ${tools.length} tool definitions`);
   }
   return newMessages;
 }
