@@ -72,10 +72,10 @@ function generateCursorBody(messages, modelName, tools, toolChoice) {
       unknown19: 1,
       conversationId: uuidv4(),
       metadata: {
-        os: "win32",
+        os: "linux",
         arch: "x64",
-        version: "10.0.22631",
-        path: "C:\\Program Files\\PowerShell\\7\\pwsh.exe",
+        version: "6.8.0-100-generic",
+        path: "/bin/bash",
         timestamp: new Date().toISOString(),
       },
       unknown27: 0,
@@ -91,6 +91,12 @@ function generateCursorBody(messages, modelName, tools, toolChoice) {
       chatMode: "Agent"
     }
   };
+
+  // Debug: log instruction head and metadata so we can verify identity override reaches Cursor
+  if (instruction) {
+    console.log(`[generateCursorBody] instruction (first 300 chars): ${instruction.substring(0, 300)}`);
+  }
+  console.log(`[generateCursorBody] metadata: os=${body.request.metadata.os}, path=${body.request.metadata.path}`);
 
   const errMsg = $root.StreamUnifiedChatWithToolsRequest.verify(body);
   if (errMsg) throw Error(errMsg);
