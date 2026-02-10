@@ -81,10 +81,10 @@ function generateCursorBody(messages, modelName, tools, toolChoice) {
       unknown19: 1,
       conversationId: uuidv4(),
       metadata: {
-        os: "win32",
+        os: "linux",
         arch: "x64",
-        version: "10.0.22631",
-        path: "C:\\Program Files\\PowerShell\\7\\pwsh.exe",
+        version: "6.8.0",
+        path: "/bin/bash",
         timestamp: new Date().toISOString(),
       },
       unknown27: 1, // is_agentic = true (field 27) — REQUIRED for Agent mode
@@ -313,23 +313,43 @@ const CURSOR_TO_OPENCLAW_PARAMS = {
 // Cursor-specific params to drop (not used by OpenClaw)
 const CURSOR_DROP_PARAMS = new Set(['explanation', 'is_background', 'blocking']);
 
+// Tool types that involve large payloads (file content) and are prone to truncation
+const FILE_WRITE_TOOLS = new Set(['write', 'edit', 'edit_file', 'edit_file_v2', 'write_to_file']);
+
 /**
  * Convert an intercepted native Cursor tool call to OpenClaw format.
- * Returns { name, arguments } or null if rawArgs is invalid JSON (truncated).
+ * Returns:
+ *   { name, arguments }          — successful conversion
+ *   { truncated: true, hint }    — truncated payload, with guidance text for the model
+ *   null                         — skip entirely (non-file tool with bad JSON)
  */
 function convertNativeToolCall(tc) {
-  // 1. Validate rawArgs as JSON — truncated payloads (from abort) are skipped
+  const cursorName = tc.name || CURSOR_TOOL_NAMES[tc.tool] || `cursor_tool_${tc.tool}`;
+
+  // 1. Validate rawArgs as JSON — truncated payloads need special handling
   let args;
   try {
     args = JSON.parse(tc.rawArgs);
   } catch (_) {
-    console.warn(`[convertNativeToolCall] Skipping tool call with truncated/invalid JSON: ${tc.name || 'unknown'} (rawArgs=${tc.rawArgs.substring(0, 120)}...)`);
+    // For file-write tools, return a hint so the model adapts quickly
+    // instead of retrying the same large payload
+    if (FILE_WRITE_TOOLS.has(cursorName)) {
+      // Try to extract the file path from the partial JSON
+      const pathMatch = tc.rawArgs.match(/"(?:file_path|path)"\s*:\s*"([^"]+)"/);
+      const filePath = pathMatch ? pathMatch[1] : 'unknown';
+      console.warn(`[convertNativeToolCall] Truncated file write for "${filePath}" — returning exec fallback hint`);
+      return {
+        truncated: true,
+        hint: `[System: The file write tool call for "${filePath}" was too large and got truncated. ` +
+              `Use the exec tool with a heredoc instead, e.g.: exec with command: cat << 'HTMLEOF' > ${filePath}\n...content...\nHTMLEOF\n` +
+              `Or break the file into smaller write operations.]`,
+      };
+    }
+    console.warn(`[convertNativeToolCall] Skipping tool call with truncated/invalid JSON: ${cursorName} (rawArgs=${tc.rawArgs.substring(0, 120)}...)`);
     return null;
   }
 
-  // 2. Resolve tool name: prefer the model's own name field (field 9),
-  //    then fall back to the Cursor enum name
-  const cursorName = tc.name || CURSOR_TOOL_NAMES[tc.tool] || `cursor_tool_${tc.tool}`;
+  // 2. Map to OpenClaw tool name
   const openclawName = CURSOR_TO_OPENCLAW_TOOLS[cursorName] || cursorName;
 
   // 3. Map parameter names and drop Cursor-specific params
@@ -411,7 +431,10 @@ function chunkToUtf8String(chunk) {
           const cursorName = tc.name || CURSOR_TOOL_NAMES[tc.tool] || `cursor_tool_${tc.tool}`;
           console.log(`[chunkToUtf8String] Intercepted native tool call: ${cursorName} (enum=${tc.tool}, id=${tc.toolCallId}, rawArgs=${tc.rawArgs.substring(0, 200)})`);
           const mapped = convertNativeToolCall(tc);
-          if (mapped) {
+          if (mapped && mapped.truncated) {
+            // Truncated file write — inject hint text so the model adapts
+            textOutput.push(`\n${mapped.hint}\n`);
+          } else if (mapped) {
             textOutput.push(`\n<tool_call>\n${JSON.stringify(mapped)}\n</tool_call>\n`);
           }
         }
