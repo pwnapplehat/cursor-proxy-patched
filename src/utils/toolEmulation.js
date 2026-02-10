@@ -143,12 +143,6 @@ function formatToolDefinitions(tools, toolChoice) {
 function injectToolsIntoMessages(messages, tools, toolChoice) {
   if (!tools || tools.length === 0) return messages;
   const toolText = formatToolDefinitions(tools, toolChoice);
-  // Prepend identity override before tool call instructions.
-  // OpenClaw's developer message already contains the full system prompt
-  // (identity, tools, workspace, memory, runtime). The identity override
-  // counters Cursor's pre-trained "IDE assistant" identity so the model
-  // follows OpenClaw's developer prompt instead.
-  const injection = OPENCLAW_IDENTITY_OVERRIDE + toolText;
   const newMessages = [...messages];
   // Look for "developer" first (OpenClaw's format), then "system" as fallback
   let targetIdx = newMessages.findIndex(m => m.role === 'developer');
@@ -156,14 +150,20 @@ function injectToolsIntoMessages(messages, tools, toolChoice) {
     targetIdx = newMessages.findIndex(m => m.role === 'system');
   }
   if (targetIdx !== -1) {
+    // PREPEND identity override at the START of the developer message,
+    // then APPEND tool call instructions at the END.
+    // Models pay most attention to the start and end of prompts (primacy/recency).
+    // Placing the identity override FIRST ensures the model reads "You are an
+    // OpenClaw AI Agent, NOT Cursor" before anything else — including any
+    // Cursor-injected system prompt that might precede the developer message.
     newMessages[targetIdx] = {
       ...newMessages[targetIdx],
-      content: newMessages[targetIdx].content + injection
+      content: OPENCLAW_IDENTITY_OVERRIDE + newMessages[targetIdx].content + toolText
     };
   } else {
     newMessages.unshift({
       role: 'system',
-      content: injection.trim()
+      content: (OPENCLAW_IDENTITY_OVERRIDE + toolText).trim()
     });
   }
   return newMessages;
