@@ -26,6 +26,7 @@ Beyond the six core fixes, the emulation layer includes these reliability featur
 - **Unclosed `<tool_call>` block recovery** — if the model output is cut off mid-tag, auto-closes braces and attempts parse
 - **Markdown fence stripping** — handles models wrapping JSON in `` ```json `` code blocks inside `<tool_call>` tags
 - **Near-miss format normalization** — auto-corrects `[tool_call]`, `<function_call>`, `<tool-call>`, and bare JSON tool calls to standard format
+- **Parameter auto-correction** — deterministic alias map (verified against [OpenClaw source](https://github.com/openclaw/openclaw/blob/main/src/agents/pi-tools.read.ts)) remaps common model mistakes (`file_path`→`path`, `old_string`→`oldText`, `cmd`→`command`, etc.) with a safety guard that only fires when the wrong key is genuinely absent from the tool schema
 - **UUID-based tool_call IDs** — proper unique IDs instead of timestamp-based (avoids collisions on rapid multi-tool calls)
 - **Warning logging** — alerts when tools were expected but the model didn't output any `<tool_call>` tags
 
@@ -212,7 +213,7 @@ OpenAI-compatible chat completions endpoint.
 
 For a complete step-by-step guide on configuring OpenClaw to use this proxy (custom provider definition, `openclaw.json` config, troubleshooting), see:
 
-**[docs/cursor-to-openclaw-setup-guide.md](../docs/cursor-to-openclaw-setup-guide.md)**
+**[docs/cursor-to-openclaw-setup-guide.md](docs/cursor-to-openclaw-setup-guide.md)**
 
 ### Quick OpenClaw Config
 
@@ -351,8 +352,9 @@ Example output:
 | `sanitizeForParsing(text)` | Strips backtick-wrapped and code-fenced `<tool_call>` references before parsing |
 | `extractJsonObject(str)` | Balanced brace JSON extraction (handles nested objects where regex fails) |
 | `stripMarkdownFences(str)` | Removes `` ```json `` fences from inside `<tool_call>` blocks |
-| `parseToolCalls(text)` | Parses `<tool_call>` XML from model text → OpenAI `tool_calls` format (with unclosed tag recovery) |
-| `tryParseToolCallContent(raw)` | Attempts to parse a single `<tool_call>` block's inner content with all normalization |
+| `parseToolCalls(text, tools)` | Parses `<tool_call>` XML from model text → OpenAI `tool_calls` format (with unclosed tag recovery and parameter auto-correction) |
+| `tryParseToolCallContent(raw, tools)` | Attempts to parse a single `<tool_call>` block's inner content with all normalization |
+| `validateAndFixToolArgs(toolName, args, tools)` | Deterministic parameter auto-correction verified against OpenClaw source — remaps `file_path`→`path`, `old_string`→`oldText`, `cmd`→`command`, etc. with 4-condition safety guard |
 | `hasToolCallTags(text)` | Detects actual `<tool_call>` tags (ignoring backtick-wrapped references) |
 | `normalizeNearMissToolCalls(text)` | Converts `[tool_call]`, `<function_call>`, `<tool-call>`, and bare JSON to standard format |
 

@@ -205,7 +205,7 @@ router.post('/chat/completions', async (req, res) => {
 
         // Check if response contains <tool_call> tags (regardless of hasTools)
         if (hasToolCallTags(fullContent)) {
-          const { textContent, toolCalls } = parseToolCalls(fullContent);
+          const { textContent, toolCalls } = parseToolCalls(fullContent, tools);
           console.log(`[chat/completions] Response contains ${toolCalls.length} tool call(s), hasTools=${hasTools}`);
 
           // Send text content first if any
@@ -340,7 +340,7 @@ router.post('/chat/completions', async (req, res) => {
 
         // Check for tool calls (regardless of whether tools was in the request)
         if (hasToolCallTags(content)) {
-          const { textContent, toolCalls } = parseToolCalls(content);
+          const { textContent, toolCalls } = parseToolCalls(content, tools);
           console.log(`[chat/completions] Non-stream response contains ${toolCalls.length} tool call(s), hasTools=${hasTools}`);
 
           const message = {

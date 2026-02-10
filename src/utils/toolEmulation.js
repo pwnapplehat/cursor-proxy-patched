@@ -228,7 +228,7 @@ function stripMarkdownFences(str) {
  * - Nested JSON objects via balanced brace counting
  * Returns { textContent, toolCalls } where textContent is the text without tool call blocks.
  */
-function parseToolCalls(text) {
+function parseToolCalls(text, tools) {
   const toolCalls = [];
   let callIndex = 0;
 
@@ -244,7 +244,7 @@ function parseToolCalls(text) {
 
   while ((match = regex.exec(sanitized)) !== null) {
     lastMatchEnd = match.index + match[0].length;
-    const parsed = tryParseToolCallContent(match[1]);
+    const parsed = tryParseToolCallContent(match[1], tools);
     if (parsed) {
       toolCalls.push(parsed);
       callIndex++;
@@ -255,7 +255,7 @@ function parseToolCalls(text) {
   const unclosedMatch = sanitized.substring(lastMatchEnd).match(/<tool_call>\s*([\s\S]+)$/);
   if (unclosedMatch) {
     console.warn('[ToolEmulation] Found unclosed <tool_call> block at end of response, attempting parse');
-    const parsed = tryParseToolCallContent(unclosedMatch[1]);
+    const parsed = tryParseToolCallContent(unclosedMatch[1], tools);
     if (parsed) {
       toolCalls.push(parsed);
       callIndex++;
@@ -278,10 +278,143 @@ function parseToolCalls(text) {
 }
 
 /**
+ * Validates and auto-corrects tool call arguments against the tool's parameter schema.
+ * Fixes common model mistakes where the model uses training-bias parameter names
+ * instead of the schema-defined names (e.g., "file_path" instead of "path").
+ * This is a deterministic correction layer — more reliable than any prompt rule.
+ */
+function validateAndFixToolArgs(toolName, args, tools) {
+  if (!tools || !Array.isArray(tools) || typeof args !== 'object' || args === null) return args;
+
+  const toolDef = tools.find(t => t.type === 'function' && t.function?.name === toolName);
+  if (!toolDef) return args;
+
+  const schema = toolDef.function?.parameters?.properties || {};
+  const schemaKeys = Object.keys(schema);
+  if (schemaKeys.length === 0) return args;
+
+  // Common model mistakes: map wrong key names to the correct schema key.
+  //
+  // VERIFIED against cloned OpenClaw source (openclaw/openclaw@main, 2026-02-06)
+  // and upstream pi-coding-agent (badlogic/pi-mono, v0.52.9):
+  //
+  //   Tool            | Required params          | Source file
+  //   read            | path                     | pi-mono/packages/coding-agent/src/core/tools/read.ts
+  //   write           | path, content            | pi-mono/packages/coding-agent/src/core/tools/write.ts
+  //   edit            | path, oldText, newText    | pi-mono/packages/coding-agent/src/core/tools/edit.ts
+  //   exec            | command                  | openclaw/src/agents/bash-tools.exec.ts
+  //   process         | action                   | openclaw/src/agents/bash-tools.process.ts
+  //   web_search      | query                    | openclaw/src/agents/tools/web-search.ts
+  //   web_fetch       | url                      | openclaw/src/agents/tools/web-fetch.ts
+  //   memory_search   | query                    | openclaw/src/agents/tools/memory-tool.ts
+  //   memory_get      | path                     | openclaw/src/agents/tools/memory-tool.ts
+  //   image           | image                    | openclaw/src/agents/tools/image-tool.ts
+  //   tts             | text                     | openclaw/src/agents/tools/tts-tool.ts
+  //   browser         | action                   | openclaw/src/agents/tools/browser-tool.schema.ts
+  //   message         | action                   | openclaw/src/agents/tools/message-tool.ts
+  //   canvas          | action                   | openclaw/src/agents/tools/canvas-tool.ts
+  //   nodes           | action                   | openclaw/src/agents/tools/nodes-tool.ts
+  //   cron            | action                   | openclaw/src/agents/tools/cron-tool.ts
+  //   gateway         | action                   | openclaw/src/agents/tools/gateway-tool.ts
+  //
+  // OpenClaw also patches read/write/edit schemas with Claude aliases:
+  //   file_path (alias for path), old_string (alias for oldText), new_string (alias for newText)
+  //   via patchToolSchemaForClaudeCompatibility() in pi-tools.read.ts
+  //
+  // Tools with params that MATCH alias wrongKeys (guard MUST prevent remapping):
+  //   tts:     has 'text'    → 'text':'content' blocked     ✓
+  //   cron:    has 'text'    → 'text':'content' blocked     ✓
+  //   process: has 'text'    → 'text':'content' blocked     ✓
+  //   process: has 'data'    → 'data':'content' blocked     ✓
+  //   nodes:   has 'body'    → 'body':'content' blocked     ✓
+  //   canvas:  has 'url'     → 'url':'path'     blocked     ✓
+  //   web_fetch: has 'url'   → 'url':'path'     blocked     ✓
+  //   message: has 'filename'→ 'filename':'path' blocked    ✓
+  //   nodes:   has 'command' → 'cmd':'command'  fires (OK)  ✓
+  //
+  // Safety: the loop below only remaps when wrongKey is NOT in the tool's schema,
+  // preventing false positives (4-condition guard).
+  const COMMON_ALIASES = {
+    // read / write / edit → path
+    'file_path': 'path',
+    'filepath': 'path',
+    'file': 'path',
+    'filename': 'path',
+    'file_name': 'path',
+    'dir': 'path',
+    'directory': 'path',
+    'folder': 'path',
+    'uri': 'path',
+    'url': 'path',
+    // write → content
+    'text': 'content',
+    'body': 'content',
+    'data': 'content',
+    // edit → oldText / newText (OpenClaw primary names; Claude uses old_string/new_string)
+    'old_string': 'oldText',
+    'old_text': 'oldText',
+    'oldString': 'oldText',
+    'original': 'oldText',
+    'new_string': 'newText',
+    'new_text': 'newText',
+    'newString': 'newText',
+    'replacement': 'newText',
+    // exec → command
+    'cmd': 'command',
+    'shell': 'command',
+    // web_search / memory_search → query (models sometimes invent 'search_query')
+    'search_query': 'query',
+    'search': 'query',
+    'q': 'query',
+    // image → image
+    'image_path': 'image',
+    'image_url': 'image',
+    'img': 'image',
+    // tts → text (if model sends 'content' to tts instead of 'text')
+    'content': 'text',
+  };
+
+  const fixed = { ...args };
+  let didFix = false;
+
+  for (const [wrongKey, rightKey] of Object.entries(COMMON_ALIASES)) {
+    // Only remap if:
+    //   1. Model sent the wrong key with a value
+    //   2. Model did NOT send the right key
+    //   3. The right key IS in the tool's schema
+    //   4. The wrong key is NOT in the tool's schema (so it's truly wrong, not a valid param)
+    if (fixed[wrongKey] && !fixed[rightKey] && schemaKeys.includes(rightKey) && !schemaKeys.includes(wrongKey)) {
+      fixed[rightKey] = fixed[wrongKey];
+      delete fixed[wrongKey];
+      console.log(`[ToolEmulation] Auto-fixed param: ${wrongKey} → ${rightKey} for tool ${toolName}`);
+      didFix = true;
+    }
+  }
+
+  // Fallback: if a required param is still missing, try to find any unrecognized arg
+  // that could fill it (single missing required + single extra arg = likely match)
+  const required = toolDef.function?.parameters?.required || [];
+  const missingRequired = required.filter(k => !(k in fixed));
+  const extraKeys = Object.keys(fixed).filter(k => !schemaKeys.includes(k));
+
+  if (missingRequired.length === 1 && extraKeys.length === 1) {
+    const missingKey = missingRequired[0];
+    const extraKey = extraKeys[0];
+    fixed[missingKey] = fixed[extraKey];
+    delete fixed[extraKey];
+    console.log(`[ToolEmulation] Auto-fixed param (fallback): ${extraKey} → ${missingKey} for tool ${toolName}`);
+    didFix = true;
+  }
+
+  return fixed;
+}
+
+/**
  * Attempts to parse the inner content of a <tool_call> block into a tool call object.
  * Handles smart quotes, markdown fences, and uses balanced brace extraction.
+ * If tools array is provided, validates and auto-corrects argument names.
  */
-function tryParseToolCallContent(raw) {
+function tryParseToolCallContent(raw, tools) {
   try {
     let jsonStr = raw.trim();
 
@@ -305,14 +438,21 @@ function tryParseToolCallContent(raw) {
       return null;
     }
 
+    // Validate and auto-correct argument names against the tool schema
+    let args = parsed.arguments || {};
+    if (typeof args === 'string') {
+      try { args = JSON.parse(args); } catch (_) { /* keep as string */ }
+    }
+    if (typeof args === 'object' && args !== null && tools) {
+      args = validateAndFixToolArgs(parsed.name, args, tools);
+    }
+
     return {
       id: `call_${uuidv4()}`,
       type: 'function',
       function: {
         name: parsed.name,
-        arguments: typeof parsed.arguments === 'string'
-          ? parsed.arguments
-          : JSON.stringify(parsed.arguments || {})
+        arguments: typeof args === 'string' ? args : JSON.stringify(args)
       }
     };
   } catch (e) {
