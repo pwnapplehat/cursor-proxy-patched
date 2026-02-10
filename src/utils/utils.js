@@ -52,7 +52,8 @@ function generateCursorBody(messages, modelName, tools, toolChoice) {
       content: normalizeContent(msg.content),
       role: msg.role === 'user' ? 1 : 2,
       messageId: uuidv4(),
-      ...(msg.role === 'user' ? { chatModeEnum: chatModeEnumVal } : {})
+      // User messages need chatModeEnum AND unknown29 to match real Cursor Agent traffic
+      ...(msg.role === 'user' ? { chatModeEnum: chatModeEnumVal, unknown29: "1" } : {})
     }));
 
   const messageIds = formattedMessages.map(msg => {
@@ -85,6 +86,7 @@ function generateCursorBody(messages, modelName, tools, toolChoice) {
         unknown9: 1
       },
       unknown19: 1,
+      unknown22: 1,
       conversationId: uuidv4(),
       metadata: {
         os: "win32",
@@ -93,9 +95,9 @@ function generateCursorBody(messages, modelName, tools, toolChoice) {
         path: "C:\\Program Files\\PowerShell\\7\\pwsh.exe",
         timestamp: new Date().toISOString(),
       },
-      unknown27: 0,
+      unknown27: 1,
       messageIds: messageIds,
-      largeContext: 0,
+      largeContext: 1,
       unknown38: 0,
       chatModeEnum: chatModeEnumVal,
       unknown47: "",
