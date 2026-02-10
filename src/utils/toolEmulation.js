@@ -40,6 +40,7 @@ ANY response that describes a tool call instead of executing it is a FAILURE.
 8. For multiple tool calls, output multiple separate <tool_call> blocks — one per tool invocation.
 9. When a <tool_result> comes back and you need another tool, call it immediately. Do not summarize intermediate results unless asked.
 10. If a tool call fails, retry or try an alternative approach.
+11. Before calling a tool, CHECK its parameter schema below. Use the EXACT parameter names listed — do not guess or abbreviate field names.
 
 ### WRONG (never do this):
 
