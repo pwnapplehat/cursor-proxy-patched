@@ -279,13 +279,70 @@ function findNativeToolCalls(data) {
   return toolCalls;
 }
 
-// Cursor ClientSideToolV2 enum → human-readable name (for logging/mapping)
+// Cursor ClientSideToolV2 enum → human-readable name (for logging)
 const CURSOR_TOOL_NAMES = {
   5: 'read_file', 6: 'list_dir', 7: 'edit_file', 8: 'file_search',
   15: 'run_terminal_command', 18: 'web_search', 38: 'edit_file_v2',
   39: 'list_dir_v2', 40: 'read_file_v2', 41: 'ripgrep_search',
   42: 'glob_file_search',
 };
+
+// ─── Cursor → OpenClaw Tool/Param Mapping ─────────────────────────────
+// Cursor's native tool names differ from OpenClaw's tool names.
+// The model uses whichever names Cursor's Agent-mode system prompt provides,
+// so we remap them to match what OpenClaw actually exposes.
+
+const CURSOR_TO_OPENCLAW_TOOLS = {
+  'run_terminal_cmd': 'exec',
+  'run_terminal_command': 'exec',
+  'read_file': 'read',
+  'read_file_v2': 'read',
+  'edit_file': 'edit',
+  'edit_file_v2': 'edit',
+  // list_dir, grep, file_search → no direct OpenClaw equivalent;
+  // pass through as-is and let OpenClaw return an error so the model adapts.
+};
+
+// Cursor parameter names that differ from OpenClaw's
+const CURSOR_TO_OPENCLAW_PARAMS = {
+  'file_path': 'path',
+  'contents': 'content',
+  'search_term': 'query',
+};
+
+// Cursor-specific params to drop (not used by OpenClaw)
+const CURSOR_DROP_PARAMS = new Set(['explanation', 'is_background', 'blocking']);
+
+/**
+ * Convert an intercepted native Cursor tool call to OpenClaw format.
+ * Returns { name, arguments } or null if rawArgs is invalid JSON (truncated).
+ */
+function convertNativeToolCall(tc) {
+  // 1. Validate rawArgs as JSON — truncated payloads (from abort) are skipped
+  let args;
+  try {
+    args = JSON.parse(tc.rawArgs);
+  } catch (_) {
+    console.warn(`[convertNativeToolCall] Skipping tool call with truncated/invalid JSON: ${tc.name || 'unknown'} (rawArgs=${tc.rawArgs.substring(0, 120)}...)`);
+    return null;
+  }
+
+  // 2. Resolve tool name: prefer the model's own name field (field 9),
+  //    then fall back to the Cursor enum name
+  const cursorName = tc.name || CURSOR_TOOL_NAMES[tc.tool] || `cursor_tool_${tc.tool}`;
+  const openclawName = CURSOR_TO_OPENCLAW_TOOLS[cursorName] || cursorName;
+
+  // 3. Map parameter names and drop Cursor-specific params
+  const mappedArgs = {};
+  for (const [key, value] of Object.entries(args)) {
+    if (CURSOR_DROP_PARAMS.has(key)) continue;
+    const mappedKey = CURSOR_TO_OPENCLAW_PARAMS[key] || key;
+    mappedArgs[mappedKey] = value;
+  }
+
+  console.log(`[convertNativeToolCall] ${cursorName} → ${openclawName} (params: ${Object.keys(args).join(',')} → ${Object.keys(mappedArgs).join(',')})`);
+  return { name: openclawName, arguments: mappedArgs };
+}
 
 /**
  * Parses Cursor's binary-framed streaming response into text.
@@ -344,20 +401,19 @@ function chunkToUtf8String(chunk) {
           textOutput.push(content);
         }
 
-        // Fallback: scan raw protobuf for native tool calls that our proto
-        // definition doesn't cover (e.g. tool_call_v2 at field 36 inside Message).
-        // If Cursor dispatches a native tool call, we intercept it here and
-        // convert it to a <tool_call> XML block so the existing pipeline
-        // (parseToolCalls in toolEmulation.js) handles it transparently.
+        // Scan raw protobuf for native tool calls (e.g. tool_call_v2 at field 36
+        // inside Message) that our proto definition doesn't cover.
+        // If Cursor dispatches a native tool call, we intercept it, map the
+        // tool name and parameters to OpenClaw format, and inject it as a
+        // <tool_call> XML block so the existing pipeline handles it.
         const nativeCalls = findNativeToolCalls(gunzipData);
         for (const tc of nativeCalls) {
-          const cursorName = CURSOR_TOOL_NAMES[tc.tool] || `cursor_tool_${tc.tool}`;
-          // Use the model's own name/rawArgs if present (field 9 & 10),
-          // otherwise fall back to the Cursor enum name.
-          const toolName = tc.name || cursorName;
-          console.log(`[chunkToUtf8String] Intercepted native tool call: ${toolName} (enum=${tc.tool}, id=${tc.toolCallId}, rawArgs=${tc.rawArgs.substring(0, 200)})`);
-          // Inject as <tool_call> so the text-based pipeline picks it up
-          textOutput.push(`\n<tool_call>\n{"name": ${JSON.stringify(toolName)}, "arguments": ${tc.rawArgs}}\n</tool_call>\n`);
+          const cursorName = tc.name || CURSOR_TOOL_NAMES[tc.tool] || `cursor_tool_${tc.tool}`;
+          console.log(`[chunkToUtf8String] Intercepted native tool call: ${cursorName} (enum=${tc.tool}, id=${tc.toolCallId}, rawArgs=${tc.rawArgs.substring(0, 200)})`);
+          const mapped = convertNativeToolCall(tc);
+          if (mapped) {
+            textOutput.push(`\n<tool_call>\n${JSON.stringify(mapped)}\n</tool_call>\n`);
+          }
         }
       } else if (magicNumber === 2 || magicNumber === 3) {
         const gunzipData = magicNumber === 2 ? data : zlib.gunzipSync(data);
