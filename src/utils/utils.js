@@ -94,14 +94,21 @@ function generateCursorBody(messages, modelName, tools, toolChoice) {
       // The proxy intercepts native tool calls from the response (see
       // findNativeToolCalls) and converts them to <tool_call> XML so the
       // existing OpenAI-compatible pipeline handles them.
+      // NOTE: DO NOT include EDIT_FILE (7) or EDIT_FILE_V2 (38) here.
+      // Those tools send file content in rawArgs, which is always truncated
+      // by Cursor's abort (the proxy is unidirectional — it can't respond to
+      // the bidirectional native tool protocol). This causes an infinite loop:
+      //   model emits write → abort truncates content → hint injected →
+      //   model tries write again → repeat 50+ times.
+      // Without these in supportedTools, the model naturally falls back to
+      // run_terminal_cmd with heredoc (cat << EOF > file), which works
+      // because the command string itself is small.
       supportedTools: [
         5,  // READ_FILE
         6,  // LIST_DIR
-        7,  // EDIT_FILE
         8,  // FILE_SEARCH
         15, // RUN_TERMINAL_COMMAND_V2
         18, // WEB_SEARCH
-        38, // EDIT_FILE_V2
         39, // LIST_DIR_V2
         40, // READ_FILE_V2
         41, // RIPGREP_RAW_SEARCH
