@@ -120,12 +120,7 @@ function generateCursorBody(messages, modelName, tools, toolChoice) {
       unknown38: 0,
       chatModeEnum: 2,
       unknown47: "",
-      // unknown48 was previously set to 1, speculated to be "should_disable_tools".
-      // However, testing shows it causes Cursor's backend to generate an Ask-mode
-      // system prompt where the model says "I have no tools." Removing it (0)
-      // allows native tool dispatch, which the proxy intercepts via
-      // findNativeToolCalls + convertNativeToolCall → <tool_call> XML.
-      unknown48: 0,
+      unknown48: 1, // field 48 — purpose unconfirmed, kept at 1 (matching known working state)
       unknown49: 0,
       unknown51: 0,
       unknown53: 1,
