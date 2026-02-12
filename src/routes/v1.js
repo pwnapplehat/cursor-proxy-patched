@@ -4,7 +4,7 @@ const { fetch, ProxyAgent, Agent } = require('undici');
 const { v4: uuidv4, v5: uuidv5 } = require('uuid');
 const config = require('../config/config');
 const $root = require('../proto/message.js');
-const { generateCursorBody, chunkToUtf8String, generateHashed64Hex, generateCursorChecksum, IncrementalFrameParser, processSingleFrame, StreamingToolCallDetector, convertNativeToolCall, CURSOR_TOOL_NAMES } = require('../utils/utils.js');
+const { generateCursorBody, chunkToUtf8String, generateHashed64Hex, generateCursorChecksum, IncrementalFrameParser, processSingleFrame, StreamingToolCallDetector, convertNativeToolCall, CURSOR_TOOL_NAMES, expandOcExecCalls } = require('../utils/utils.js');
 const { parseToolCalls, hasToolCallTags, normalizeNearMissToolCalls, tryParseToolCallContent } = require('../utils/toolEmulation');
 
 router.get("/models", async (req, res) => {
@@ -324,12 +324,15 @@ router.post('/chat/completions', async (req, res) => {
           }
         }
 
-        // ─── Emit tool calls or stop ─────────────────────────────────────
-        if (allToolCalls.length > 0) {
-          console.log(`[streaming] Emitting ${allToolCalls.length} tool call(s): ${allToolCalls.map(tc => tc.function.name).join(', ')}`);
+        // ─── Expand __oc exec calls into real OpenClaw tool calls ───────
+        const finalToolCalls = expandOcExecCalls(allToolCalls);
 
-          for (let i = 0; i < allToolCalls.length; i++) {
-            const tc = allToolCalls[i];
+        // ─── Emit tool calls or stop ─────────────────────────────────────
+        if (finalToolCalls.length > 0) {
+          console.log(`[streaming] Emitting ${finalToolCalls.length} tool call(s): ${finalToolCalls.map(tc => tc.function.name).join(', ')}`);
+
+          for (let i = 0; i < finalToolCalls.length; i++) {
+            const tc = finalToolCalls[i];
             res.write(`data: ${JSON.stringify({
               id: responseId,
               object: 'chat.completion.chunk',
@@ -428,15 +431,17 @@ router.post('/chat/completions', async (req, res) => {
         // Check for tool calls (regardless of whether tools was in the request)
         if (hasToolCallTags(content)) {
           const { textContent, toolCalls } = parseToolCalls(content, tools);
-          console.log(`[chat/completions] Non-stream response contains ${toolCalls.length} tool call(s), hasTools=${hasTools}`);
+          // Expand __oc exec calls into real OpenClaw tool calls
+          const expandedToolCalls = expandOcExecCalls(toolCalls);
+          console.log(`[chat/completions] Non-stream response contains ${expandedToolCalls.length} tool call(s), hasTools=${hasTools}`);
 
           const message = {
             role: 'assistant',
             content: textContent || null,
           };
 
-          if (toolCalls.length > 0) {
-            message.tool_calls = toolCalls;
+          if (expandedToolCalls.length > 0) {
+            message.tool_calls = expandedToolCalls;
           }
 
           return res.json({
@@ -447,7 +452,7 @@ router.post('/chat/completions', async (req, res) => {
             choices: [{
               index: 0,
               message: message,
-              finish_reason: toolCalls.length > 0 ? 'tool_calls' : 'stop',
+              finish_reason: expandedToolCalls.length > 0 ? 'tool_calls' : 'stop',
             }],
             usage: {
               prompt_tokens: 0,

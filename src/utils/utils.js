@@ -853,6 +853,95 @@ class StreamingToolCallDetector {
   }
 }
 
+// ─── OpenClaw Tool Gateway via exec ──────────────────────────────────
+// The Cursor model only trusts its native tools (run_terminal_cmd, read_file, etc.).
+// OpenClaw-specific tools like sessions_spawn, memory_search, agents_list, etc.
+// have NO native Cursor equivalent, so the model won't call them via <tool_call> tags.
+//
+// Solution: teach the model to invoke them via exec with the __oc prefix:
+//   exec command: __oc sessions_spawn {"task": "build CSS", "model": "cursor/gpt-4o"}
+//
+// This function intercepts those exec calls and converts them to real OpenClaw tool calls
+// BEFORE they are sent back to OpenClaw via SSE.
+//
+// The set of tools that NEED this gateway (no Cursor native equivalent):
+const OC_ONLY_TOOLS = new Set([
+  'sessions_spawn', 'session_status', 'sessions_send', 'sessions_list',
+  'sessions_history', 'agents_list', 'memory_search', 'memory_get',
+  'image', 'tts', 'browser', 'message', 'canvas', 'nodes', 'cron',
+  'gateway', 'process',
+]);
+
+/**
+ * Transforms exec tool calls that use the __oc prefix into real OpenClaw tool calls.
+ * Input:  { name: "exec", arguments: '{"command":"__oc sessions_spawn {\\"task\\":\\"build CSS\\"}"}' }
+ * Output: { name: "sessions_spawn", arguments: '{"task":"build CSS"}' }
+ *
+ * Tool calls that don't match the __oc pattern pass through unchanged.
+ */
+function expandOcExecCalls(toolCalls) {
+  if (!Array.isArray(toolCalls) || toolCalls.length === 0) return toolCalls;
+
+  return toolCalls.map(tc => {
+    if (!tc.function || tc.function.name !== 'exec') return tc;
+
+    let args;
+    try {
+      args = typeof tc.function.arguments === 'string'
+        ? JSON.parse(tc.function.arguments)
+        : tc.function.arguments;
+    } catch (_) {
+      return tc; // Invalid JSON — pass through
+    }
+
+    const command = args && typeof args.command === 'string' ? args.command.trim() : '';
+    if (!command.startsWith('__oc ')) return tc; // Not an __oc call — pass through
+
+    // Parse: __oc <toolName> [jsonArgs]
+    const rest = command.substring(5).trim(); // Remove "__oc "
+    const spaceIdx = rest.indexOf(' ');
+
+    let toolName, toolArgsStr;
+    if (spaceIdx > 0) {
+      toolName = rest.substring(0, spaceIdx).trim();
+      toolArgsStr = rest.substring(spaceIdx + 1).trim();
+    } else {
+      toolName = rest.trim();
+      toolArgsStr = '{}';
+    }
+
+    // Validate the tool name is a known OpenClaw-only tool
+    if (!OC_ONLY_TOOLS.has(toolName)) {
+      console.warn(`[expandOcExecCalls] Unknown __oc tool: ${toolName} — passing through as exec`);
+      return tc;
+    }
+
+    // Parse the JSON arguments
+    let parsedArgs;
+    try {
+      parsedArgs = JSON.parse(toolArgsStr);
+    } catch (e) {
+      // Try to fix common issues: unquoted values, single quotes
+      try {
+        parsedArgs = JSON.parse(toolArgsStr.replace(/'/g, '"'));
+      } catch (_) {
+        console.warn(`[expandOcExecCalls] Failed to parse args for __oc ${toolName}: ${toolArgsStr.substring(0, 100)}`);
+        return tc; // Can't parse — pass through as exec (will fail, but at least it's visible)
+      }
+    }
+
+    console.log(`[expandOcExecCalls] __oc ${toolName} → ${toolName} (args: ${JSON.stringify(parsedArgs).substring(0, 200)})`);
+
+    return {
+      ...tc,
+      function: {
+        name: toolName,
+        arguments: JSON.stringify(parsedArgs),
+      }
+    };
+  });
+}
+
 module.exports = {
   generateCursorBody,
   chunkToUtf8String,
@@ -865,4 +954,6 @@ module.exports = {
   // Tool call mapping (used by v1.js to convert native → OpenClaw format)
   convertNativeToolCall,
   CURSOR_TOOL_NAMES,
+  // OpenClaw tool gateway (used by v1.js to convert __oc exec calls → real tool calls)
+  expandOcExecCalls,
 };
