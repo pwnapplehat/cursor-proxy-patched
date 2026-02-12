@@ -630,9 +630,237 @@ function generateCursorChecksum(token) {
   return `${encodedChecksum}${machineId}/${macMachineId}`;
 }
 
+// ─── Streaming Utilities ────────────────────────────────────────────────
+// These classes enable real-time SSE streaming to OpenClaw while still
+// detecting tool calls (both native protobuf and text-based <tool_call> tags).
+// Without these, the proxy buffers the ENTIRE response (~5-70 seconds)
+// before sending anything, blocking OpenClaw's Telegram draft streaming.
+// ────────────────────────────────────────────────────────────────────────
+
+/**
+ * Incremental parser for Cursor's binary-framed streaming protocol.
+ * Handles frames split across TCP packets (the root cause of Z_BUF_ERROR).
+ * Frame format: [1 byte magic] [4 bytes BE length] [N bytes data]
+ */
+class IncrementalFrameParser {
+  constructor() {
+    this.pending = Buffer.alloc(0);
+  }
+
+  /**
+   * Feed a new data chunk from the HTTP response body.
+   * Returns an array of complete frames: [{ magic, data }]
+   */
+  addChunk(chunk) {
+    this.pending = Buffer.concat([this.pending, Buffer.from(chunk)]);
+    const frames = [];
+
+    while (this.pending.length >= 5) {
+      const magic = this.pending[0];
+      const dataLength = this.pending.readUInt32BE(1);
+
+      if (dataLength === 0) {
+        this.pending = this.pending.subarray(5);
+        continue;
+      }
+
+      if (this.pending.length < 5 + dataLength) {
+        break; // Incomplete frame — wait for more data
+      }
+
+      // Copy frame data (subarray refs get invalidated on next concat)
+      const data = Buffer.from(this.pending.subarray(5, 5 + dataLength));
+      this.pending = this.pending.subarray(5 + dataLength);
+      frames.push({ magic, data });
+    }
+
+    return frames;
+  }
+}
+
+/**
+ * Process a single protobuf frame. Returns text, thinking, and native tool calls
+ * as SEPARATE outputs (unlike chunkToUtf8String which merges tool calls into text).
+ *
+ * @param {number} magic - Frame magic byte (0=raw protobuf, 1=gzipped, 2/3=JSON metadata)
+ * @param {Buffer} data - Frame payload (after 5-byte header)
+ * @param {Set} seenToolCallIds - Already-processed tool call IDs (for cross-frame dedup)
+ * @returns {{ text: string, thinking: string, nativeToolCalls: Array }}
+ */
+function processSingleFrame(magic, data, seenToolCallIds) {
+  const result = { text: '', thinking: '', nativeToolCalls: [] };
+
+  try {
+    if (magic === 0 || magic === 1) {
+      const gunzipData = magic === 0 ? data : zlib.gunzipSync(data);
+      const response = $root.StreamUnifiedChatWithToolsResponse.decode(gunzipData);
+
+      const thinking = response?.message?.thinking?.content;
+      if (thinking !== undefined) result.thinking = thinking;
+
+      const content = response?.message?.content;
+      if (content !== undefined) result.text = content;
+
+      // Scan raw protobuf for native tool calls (separate from text content)
+      const nativeCalls = findNativeToolCalls(gunzipData);
+      for (const tc of nativeCalls) {
+        if (!seenToolCallIds.has(tc.toolCallId)) {
+          seenToolCallIds.add(tc.toolCallId);
+          result.nativeToolCalls.push(tc);
+        }
+      }
+    } else if (magic === 2 || magic === 3) {
+      const gunzipData = magic === 2 ? data : zlib.gunzipSync(data);
+      const utf8 = gunzipData.toString('utf-8');
+      try {
+        const message = JSON.parse(utf8);
+        if (message != null && (typeof message !== 'object' ||
+          (Array.isArray(message) ? message.length > 0 : Object.keys(message).length > 0))) {
+          console.error(utf8);
+        }
+      } catch (_) {}
+    }
+  } catch (err) {
+    console.warn(`[processSingleFrame] Frame error (magic=${magic}): ${err.code || err.message}`);
+  }
+
+  return result;
+}
+
+/**
+ * Streaming detector for <tool_call> XML tags in incremental text.
+ * Holds back tool call blocks while streaming plain text immediately.
+ *
+ * Design: As text tokens arrive from protobuf frames, this detector:
+ *   - Streams text that is NOT part of a <tool_call> block immediately
+ *   - Detects <tool_call>...</tool_call> boundaries and holds them back
+ *   - Handles partial tags at chunk boundaries (e.g. "<tool" at end of frame)
+ *   - Normalizes common near-miss formats ([tool_call], <function_call>, <tool-call>)
+ *   - Handles unclosed <tool_call> blocks (model output cut off)
+ */
+class StreamingToolCallDetector {
+  constructor() {
+    this.buffer = '';
+    this.toolCallBlocks = [];
+    this.insideTag = false;
+  }
+
+  /**
+   * Feed new text from a protobuf frame.
+   * Returns safe text that can be streamed to the client immediately.
+   * Any text that is part of a <tool_call> block is held back.
+   */
+  addText(newText) {
+    // Normalize common near-miss formats on the fly
+    let normalized = newText;
+    if (/\[tool_call\]/i.test(normalized)) {
+      normalized = normalized.replace(/\[tool_call\]/gi, '<tool_call>').replace(/\[\/tool_call\]/gi, '</tool_call>');
+    }
+    if (/<function_call>/i.test(normalized)) {
+      normalized = normalized.replace(/<function_call>/gi, '<tool_call>').replace(/<\/function_call>/gi, '</tool_call>');
+    }
+    if (/<tool-call>/i.test(normalized)) {
+      normalized = normalized.replace(/<tool-call>/gi, '<tool_call>').replace(/<\/tool-call>/gi, '</tool_call>');
+    }
+
+    this.buffer += normalized;
+    return this._extractSafe();
+  }
+
+  _extractSafe() {
+    let safe = '';
+
+    while (true) {
+      if (this.insideTag) {
+        // We're inside a <tool_call>...</tool_call> block
+        const closeIdx = this.buffer.indexOf('</tool_call>');
+        if (closeIdx !== -1) {
+          // Found closing tag — collect the block content
+          this.toolCallBlocks.push(this.buffer.substring(0, closeIdx).trim());
+          this.buffer = this.buffer.substring(closeIdx + '</tool_call>'.length);
+          this.insideTag = false;
+          continue;
+        }
+        break; // Still inside tag, wait for more data
+      }
+
+      // Not inside a tag — look for <tool_call> opening
+      const openIdx = this.buffer.indexOf('<tool_call>');
+      if (openIdx !== -1) {
+        // Everything before the tag is safe to stream
+        if (openIdx > 0) safe += this.buffer.substring(0, openIdx);
+        this.buffer = this.buffer.substring(openIdx + '<tool_call>'.length);
+        this.insideTag = true;
+        continue;
+      }
+
+      // Check for partial tag at end of buffer
+      // (e.g. "<tool_ca" could be the start of "<tool_call>")
+      const holdBack = this._partialTagLength();
+      if (holdBack > 0) {
+        const safeEnd = this.buffer.length - holdBack;
+        if (safeEnd > 0) {
+          safe += this.buffer.substring(0, safeEnd);
+          this.buffer = this.buffer.substring(safeEnd);
+        }
+        break;
+      }
+
+      // Everything is safe to stream
+      safe += this.buffer;
+      this.buffer = '';
+      break;
+    }
+
+    return safe;
+  }
+
+  _partialTagLength() {
+    const tags = ['<tool_call>', '</tool_call>'];
+    let maxLen = 0;
+    for (const tag of tags) {
+      for (let len = Math.min(tag.length - 1, this.buffer.length); len > 0; len--) {
+        if (this.buffer.endsWith(tag.substring(0, len))) {
+          maxLen = Math.max(maxLen, len);
+          break;
+        }
+      }
+    }
+    return maxLen;
+  }
+
+  /**
+   * Call when the stream ends. Returns any remaining text and collected tool call blocks.
+   */
+  finish() {
+    let remainingText = '';
+
+    if (this.insideTag) {
+      // Unclosed <tool_call> — model was cut off, try to parse it anyway
+      if (this.buffer.trim()) {
+        console.warn('[StreamingToolCallDetector] Unclosed <tool_call> block at end of stream');
+        this.toolCallBlocks.push(this.buffer.trim());
+      }
+    } else {
+      // Any remaining buffer text is safe to stream
+      remainingText = this.buffer;
+    }
+
+    this.buffer = '';
+    return { remainingText, toolCallBlocks: this.toolCallBlocks };
+  }
+}
+
 module.exports = {
   generateCursorBody,
   chunkToUtf8String,
   generateHashed64Hex,
-  generateCursorChecksum
+  generateCursorChecksum,
+  // Streaming utilities (used by v1.js real-time streaming path)
+  IncrementalFrameParser,
+  processSingleFrame,
+  StreamingToolCallDetector,
+  // Tool call mapping (used by v1.js to convert native → OpenClaw format)
+  convertNativeToolCall,
+  CURSOR_TOOL_NAMES,
 };

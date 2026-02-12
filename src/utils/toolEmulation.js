@@ -633,5 +633,6 @@ module.exports = {
   convertToolResultMessages,
   parseToolCalls,
   hasToolCallTags,
-  normalizeNearMissToolCalls
+  normalizeNearMissToolCalls,
+  tryParseToolCallContent
 };
