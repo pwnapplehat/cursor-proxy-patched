@@ -447,6 +447,8 @@ function validateAndFixToolArgs(toolName, args, tools) {
   const COMMON_ALIASES = {
     // read / write / edit → path
     'file_path': 'path',
+    'target_file': 'path',      // Cursor's read_file / read_file_v2 native name
+    'target_directory': 'path', // Cursor's list_dir_v2 native name
     'filepath': 'path',
     'file': 'path',
     'filename': 'path',

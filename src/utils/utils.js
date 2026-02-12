@@ -319,6 +319,8 @@ const CURSOR_TO_OPENCLAW_TOOLS = {
 // Cursor parameter names that differ from OpenClaw's
 const CURSOR_TO_OPENCLAW_PARAMS = {
   'file_path': 'path',
+  'target_file': 'path',       // Cursor's read_file/read_file_v2 uses target_file; OpenClaw read uses path
+  'target_directory': 'path',  // Cursor's list_dir_v2 uses target_directory; mapped to exec anyway but safe to have
   'contents': 'content',
   'search_term': 'query',
 };
