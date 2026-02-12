@@ -112,16 +112,31 @@ Note: Sub-agents cannot spawn their own sub-agents (one level deep). Use session
 - **memory_get** — Read a specific memory file or section. Params: \`path\` (required), \`from\` (optional line), \`lines\` (optional count)
 
 **Media & Communication:**
-- **image** — Image generation or understanding. Params: \`image\` (required — description or URL), \`prompt\` (optional), \`model\` (optional)
+- **image** — Image understanding (describe/analyze an image). **IMPORTANT**: The \`image\` param must be a file path, URL, or data: URL — NOT a text description.
+  Params: \`image\` (required — file path like \`/path/to/img.png\`, or \`http(s)://...\` URL, or \`data:image/png;base64,...\`), \`prompt\` (optional — text question about the image, default: "Describe the image."), \`model\` (optional)
 - **tts** — Text-to-speech audio generation. Params: \`text\` (required), \`channel\` (optional — e.g. "telegram" for format selection)
-- **browser** — Headless browser automation. Params: \`action\` (required — e.g. "navigate", "click", "type", "screenshot"), plus action-specific params (\`targetUrl\`, \`selector\`, \`ref\`, \`element\`, etc.)
+- **browser** — Browser automation (uses Chrome extension relay or managed browser).
+  Params: \`action\` (required), plus action-specific params.
+  Valid actions: \`"status"\`, \`"start"\`, \`"stop"\`, \`"profiles"\`, \`"tabs"\`, \`"open"\`, \`"focus"\`, \`"close"\`, \`"snapshot"\`, \`"screenshot"\`, \`"navigate"\`, \`"console"\`, \`"pdf"\`, \`"upload"\`, \`"dialog"\`, \`"act"\`
+  Key params: \`targetUrl\` (for open/navigate), \`targetId\` (tab ID), \`ref\` (element ref for act/screenshot), \`selector\` (CSS selector), \`profile\` ("chrome"|"openclaw"), \`snapshotFormat\` ("ai"|"aria")
+  For \`act\`: pass \`request\` object with \`kind\` ("click"|"type"|"press"|"hover"|"drag"|"select"|"fill"|"wait"|"evaluate") plus action-specific fields
+  Note: \`profile: "chrome"\` requires Chrome extension attached to a tab. Use \`profile: "openclaw"\` for the managed headless browser.
 - **message** — Send a message to a channel. Params: \`action\` (required), \`channel\` (optional), \`target\` (required — recipient), \`message\` (the text to send)
 
 **System & Scheduling:**
-- **canvas** — Create and manipulate visual canvases
-- **nodes** — Manage workflow nodes
+- **canvas** — Display and interact with visual canvases.
+  Params: \`action\` (required), plus action-specific params.
+  Valid actions: \`"present"\`, \`"hide"\`, \`"navigate"\`, \`"eval"\`, \`"snapshot"\`, \`"a2ui_push"\`, \`"a2ui_reset"\`
+  Key params: \`target\` (URL for present), \`url\` (for navigate), \`javaScript\` (for eval), \`jsonl\`/\`jsonlPath\` (for a2ui_push), \`x\`/\`y\`/\`width\`/\`height\` (placement)
+- **nodes** — Manage paired companion nodes (devices connected to the gateway).
+  Params: \`action\` (required), plus action-specific params.
+  Valid actions: \`"status"\`, \`"describe"\`, \`"pending"\`, \`"approve"\`, \`"reject"\`, \`"notify"\`, \`"camera_snap"\`, \`"camera_list"\`, \`"camera_clip"\`, \`"screen_record"\`, \`"location_get"\`, \`"run"\`, \`"invoke"\`
+  Key params: \`node\` (node ID), \`requestId\` (for approve/reject), \`title\`/\`body\` (for notify), \`command\` (string array for run), \`facing\` ("front"|"back"|"both" for camera), \`invokeCommand\`/\`invokeParamsJson\` (for invoke)
 - **cron** — Schedule recurring tasks (exact timing, isolated sessions). Params: \`action\` (required — e.g. "create", "list", "delete"), \`job\` (optional object), \`jobId\` (optional), \`text\` (optional)
-- **gateway** — API gateway operations
+- **gateway** — Gateway management and config operations.
+  Params: \`action\` (required), plus action-specific params.
+  Valid actions: \`"restart"\`, \`"config.get"\`, \`"config.schema"\`, \`"config.apply"\`, \`"config.patch"\`, \`"update.run"\`
+  Key params: \`raw\` (JSON string for config.apply/config.patch), \`delayMs\`/\`reason\` (for restart), \`sessionKey\`/\`note\` (for audit)
 - **process** — List and manage background/running processes. Use \`__oc process {}\` to list.
 
 ### Writing Large Files

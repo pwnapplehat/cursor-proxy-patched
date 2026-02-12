@@ -401,25 +401,25 @@ The `__oc` gateway solves this by leveraging `exec` (which the model trusts):
 
 ### Supported __oc Tools
 
-| Tool | Purpose |
-|------|---------|
-| `sessions_spawn` | Spawn a background sub-agent |
-| `session_status` | Check if a spawned session finished |
-| `sessions_send` | Send a message to another session |
-| `sessions_list` | List active sessions |
-| `sessions_history` | Get session conversation history |
-| `agents_list` | List available agents |
-| `memory_search` | Semantic search over memory files |
-| `memory_get` | Read a specific memory file/section |
-| `image` | Image generation or understanding |
-| `tts` | Text-to-speech audio generation |
-| `browser` | Headless browser automation |
-| `message` | Send a message to a channel |
-| `canvas` | Visual canvas operations |
-| `nodes` | Workflow node management |
-| `cron` | Schedule recurring tasks |
-| `gateway` | API gateway operations |
-| `process` | List/manage background processes |
+| Tool | Purpose | Key Params |
+|------|---------|------------|
+| `sessions_spawn` | Spawn a background sub-agent | `task` (required), `model`, `label` |
+| `session_status` | Check if a spawned session finished | `sessionKey` |
+| `sessions_send` | Send a message to another session | `message` (required), `sessionKey` |
+| `sessions_list` | List active sessions | `kinds`, `limit` |
+| `sessions_history` | Get session conversation history | `sessionKey` (required), `limit` |
+| `agents_list` | List available agents | `{}` (no params) |
+| `memory_search` | Semantic search over memory files | `query` (required), `maxResults` |
+| `memory_get` | Read a specific memory file/section | `path` (required), `from`, `lines` |
+| `image` | Image understanding (NOT generation) | `image` (required — file path or URL, NOT text), `prompt` |
+| `tts` | Text-to-speech audio generation | `text` (required), `channel` |
+| `browser` | Browser automation | `action` (required — status/open/snapshot/screenshot/navigate/act/tabs/etc.), `targetUrl`, `ref` |
+| `message` | Send a message to a channel | `action` (required), `target`, `message` |
+| `canvas` | Visual canvas display/interaction | `action` (required — present/hide/navigate/eval/snapshot/a2ui_push/a2ui_reset) |
+| `nodes` | Companion node management | `action` (required — status/describe/notify/camera_snap/run/invoke/etc.), `node` |
+| `cron` | Schedule recurring tasks | `action` (required — create/list/delete), `job`, `jobId` |
+| `gateway` | Gateway config and management | `action` (required — restart/config.get/config.patch/config.apply/update.run) |
+| `process` | List/manage background processes | `{}` to list |
 
 ---
 
