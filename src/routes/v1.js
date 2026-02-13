@@ -75,7 +75,20 @@ async function streamBidiResponse(bidiState, res, model, responseId, hasTools, t
     // Handles a fully-assembled tool call (after streaming accumulation)
     function handleCompletedToolCall(tc) {
       const cursorName = tc.name || CURSOR_TOOL_NAMES[tc.tool] || `cursor_tool_${tc.tool}`;
-      console.log(`[h2-bidi] Completed native tool call: ${cursorName} (enum=${tc.tool}, id=${tc.toolCallId}, rawArgs=${tc.rawArgs.length} chars)`);
+      console.log(`[h2-bidi] Completed native tool call: ${cursorName} (enum=${tc.tool}, id=${tc.toolCallId}, rawArgs=${tc.rawArgs.length} chars)` +
+        (tc.isDuplicate ? ' [DUPLICATE — auto-acking]' : ''));
+
+      // DUPLICATE HANDLING: This tool call was already force-flushed and sent to
+      // OpenClaw in a previous turn. Cursor continued streaming the remaining
+      // frames on the bidi stream. We MUST send a tool result back to Cursor so
+      // it can proceed, but we do NOT forward it to OpenClaw (that would cause
+      // the agent to execute the same tool call twice).
+      if (tc.isDuplicate) {
+        console.log(`[h2-bidi] Auto-acking duplicate tool call: ${cursorName} (enum=${tc.tool}, id=${tc.toolCallId})`);
+        bidiState.sendToolResult(tc.tool, tc.toolCallId, 'OK');
+        return;
+      }
+
       const mapped = convertNativeToolCall(tc);
       if (mapped) {
         nativeToolCalls.push({ mapped, original: tc });

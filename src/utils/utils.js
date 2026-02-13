@@ -338,7 +338,7 @@ class StreamingToolCallAccumulator {
   /**
    * Feed a tool call extracted from a frame.
    * @param {Object} tc - { tool, toolCallId, name, rawArgs, isStreaming, isLastMessage }
-   * @returns {Object|null} Completed tool call { tool, toolCallId, name, rawArgs } or null if still accumulating
+   * @returns {Object|null} Completed tool call { tool, toolCallId, name, rawArgs, isDuplicate? } or null if still accumulating
    */
   feed(tc) {
     const rawLen = tc.rawArgs ? tc.rawArgs.length : 0;
@@ -346,23 +346,25 @@ class StreamingToolCallAccumulator {
     const endsWithBrace = tc.rawArgs ? tc.rawArgs.endsWith('}') : false;
     const preview = rawLen > 200 ? tc.rawArgs.substring(0, 100) + '...' + tc.rawArgs.substring(rawLen - 80) : (tc.rawArgs || '');
 
-    // DUPLICATE GUARD: If this tool call was already flushed (by flushIfComplete
-    // or flush), ignore all subsequent frames for it. This prevents the
-    // isLastMessage=true frame from re-creating the same tool call as a duplicate.
-    // Root cause: Cursor sends isLastMessage=true AFTER we've already flushed and
-    // executed the tool call via flushIfComplete (the JSON was already complete).
-    if (this.flushedIds.has(tc.toolCallId)) {
-      console.log(`[DIAG:Accum] IGNORING duplicate frame for already-flushed id=${tc.toolCallId.substring(0, 20)} ` +
-        `isStreaming=${tc.isStreaming} isLastMessage=${tc.isLastMessage} rawArgs.len=${rawLen}`);
-      return null;
+    // DUPLICATE TRACKING: If this tool call was already flushed (by force-flush,
+    // flushIfComplete, or isLastMessage=true), we still need to accumulate
+    // continuation frames and let them complete. Cursor's server expects a tool
+    // result for EVERY completed tool call. If we silently ignore frames, the
+    // bidi stream hangs forever. Instead, we mark completed duplicates with
+    // isDuplicate=true so the caller can auto-ack them to Cursor without
+    // forwarding to OpenClaw.
+    const isDuplicate = this.flushedIds.has(tc.toolCallId);
+    if (isDuplicate) {
+      console.log(`[DIAG:Accum] DUPLICATE frame for already-flushed id=${tc.toolCallId.substring(0, 20)} ` +
+        `isStreaming=${tc.isStreaming} isLastMessage=${tc.isLastMessage} rawArgs.len=${rawLen} — still accumulating for auto-ack`);
     }
 
     // Non-streaming tool call — complete in one frame
     if (!tc.isStreaming && !tc.isLastMessage) {
       console.log(`[DIAG:Accum] NON-STREAMING tool call: id=${tc.toolCallId.substring(0, 20)} ` +
-        `rawArgs.len=${rawLen} startsWithBrace=${startsWithBrace} endsWithBrace=${endsWithBrace}`);
-      // Ensure rawArgs has a default for backward compat
-      return { tool: tc.tool, toolCallId: tc.toolCallId, name: tc.name, rawArgs: tc.rawArgs || '{}' };
+        `rawArgs.len=${rawLen} startsWithBrace=${startsWithBrace} endsWithBrace=${endsWithBrace}` +
+        (isDuplicate ? ' (DUPLICATE)' : ''));
+      return { tool: tc.tool, toolCallId: tc.toolCallId, name: tc.name, rawArgs: tc.rawArgs || '{}', isDuplicate };
     }
 
     const existing = this.pending.get(tc.toolCallId);
@@ -403,41 +405,22 @@ class StreamingToolCallAccumulator {
       if (tc.isLastMessage) {
         // Streaming complete — emit the full tool call
         this.pending.delete(tc.toolCallId);
-        this.flushedIds.add(tc.toolCallId); // Prevent re-processing if more frames arrive
+        if (!isDuplicate) this.flushedIds.add(tc.toolCallId);
         const finalLen = existing.rawArgs.length;
         const finalStartsBrace = existing.rawArgs.startsWith('{');
         const finalEndsBrace = existing.rawArgs.endsWith('}');
 
-        // DIAGNOSTIC: This is the CRITICAL log — shows final assembled rawArgs
         console.log(`[DIAG:Accum] ★ COMPLETED streaming tool call: id=${tc.toolCallId.substring(0, 20)} ` +
           `totalFrames=${existing.frameCount} frameSizes=[${existing.frameSizes.join(',')}] ` +
-          `finalRawArgs.len=${finalLen} validJSON.startsWithBrace=${finalStartsBrace} validJSON.endsWithBrace=${finalEndsBrace}`);
-
-        // Try JSON.parse to diagnose if the accumulated result is valid
-        try {
-          JSON.parse(existing.rawArgs);
-          console.log(`[DIAG:Accum] ★ JSON.parse SUCCEEDED on accumulated rawArgs (${finalLen} chars) — accumulation strategy WORKS`);
-        } catch (e) {
-          console.warn(`[DIAG:Accum] ★ JSON.parse FAILED on accumulated rawArgs (${finalLen} chars): ${e.message}`);
-          console.warn(`[DIAG:Accum] ★ first100: ${existing.rawArgs.substring(0, 100)}`);
-          console.warn(`[DIAG:Accum] ★ last100: ${existing.rawArgs.substring(finalLen - 100)}`);
-          // DIAGNOSTIC: Also try parsing just the LAST frame's rawArgs (tests "full replacement" theory)
-          if (rawLen > 0) {
-            try {
-              JSON.parse(tc.rawArgs);
-              console.warn(`[DIAG:Accum] ★★ BUT: JSON.parse of LAST FRAME ALONE succeeded — ` +
-                `FORMAT IS (b) FULL REPLACEMENTS, not deltas! Accumulation was wrong.`);
-            } catch (_) {
-              console.warn(`[DIAG:Accum] ★★ LAST FRAME ALONE also fails JSON.parse — FORMAT IS UNKNOWN (c)`);
-            }
-          }
-        }
+          `finalRawArgs.len=${finalLen} startsWithBrace=${finalStartsBrace} endsWithBrace=${finalEndsBrace}` +
+          (isDuplicate ? ' (DUPLICATE — will auto-ack)' : ''));
 
         return {
           tool: existing.tool,
           toolCallId: tc.toolCallId,
           name: existing.name,
           rawArgs: existing.rawArgs || '{}',
+          isDuplicate,
         };
       }
       return null; // Still accumulating
@@ -446,9 +429,10 @@ class StreamingToolCallAccumulator {
     // First frame for this toolCallId
     if (tc.isLastMessage && !tc.isStreaming) {
       console.log(`[DIAG:Accum] SINGLE-FRAME streaming tool call (isLastMessage=true, isStreaming=false): ` +
-        `id=${tc.toolCallId.substring(0, 20)} rawArgs.len=${rawLen}`);
-      // Single-frame with isLastMessage — complete
-      return { tool: tc.tool, toolCallId: tc.toolCallId, name: tc.name, rawArgs: tc.rawArgs || '{}' };
+        `id=${tc.toolCallId.substring(0, 20)} rawArgs.len=${rawLen}` +
+        (isDuplicate ? ' (DUPLICATE)' : ''));
+      if (!isDuplicate) this.flushedIds.add(tc.toolCallId);
+      return { tool: tc.tool, toolCallId: tc.toolCallId, name: tc.name, rawArgs: tc.rawArgs || '{}', isDuplicate };
     }
 
     // Start accumulating — this is FRAME #1
@@ -470,9 +454,10 @@ class StreamingToolCallAccumulator {
       // Edge case: first AND last in same frame
       const data = this.pending.get(tc.toolCallId);
       this.pending.delete(tc.toolCallId);
-      this.flushedIds.add(tc.toolCallId); // Prevent re-processing
-      console.log(`[DIAG:Accum] FIRST+LAST frame (single streamed frame): id=${tc.toolCallId.substring(0, 20)} rawArgs.len=${rawLen}`);
-      return { tool: data.tool, toolCallId: tc.toolCallId, name: data.name, rawArgs: data.rawArgs || '{}' };
+      if (!isDuplicate) this.flushedIds.add(tc.toolCallId);
+      console.log(`[DIAG:Accum] FIRST+LAST frame (single streamed frame): id=${tc.toolCallId.substring(0, 20)} rawArgs.len=${rawLen}` +
+        (isDuplicate ? ' (DUPLICATE)' : ''));
+      return { tool: data.tool, toolCallId: tc.toolCallId, name: data.name, rawArgs: data.rawArgs || '{}', isDuplicate };
     }
 
     return null; // Still accumulating
@@ -502,17 +487,19 @@ class StreamingToolCallAccumulator {
       const starts = data.rawArgs.startsWith('{');
       const ends = data.rawArgs.endsWith('}');
       if (starts && ends) {
-        // Looks like complete JSON — flush this one
+        const dup = this.flushedIds.has(toolCallId);
         console.log(`[DIAG:Accum] flushIfComplete: COMPLETE — id=${toolCallId.substring(0, 20)} ` +
-          `rawArgs.len=${data.rawArgs.length} frames=${data.frameCount}`);
+          `rawArgs.len=${data.rawArgs.length} frames=${data.frameCount}` +
+          (dup ? ' (DUPLICATE)' : ''));
         results.push({
           tool: data.tool,
           toolCallId,
           name: data.name,
           rawArgs: data.rawArgs,
+          isDuplicate: dup,
         });
         this.pending.delete(toolCallId);
-        this.flushedIds.add(toolCallId); // Prevent duplicate when isLastMessage=true arrives later
+        if (!dup) this.flushedIds.add(toolCallId);
       } else {
         console.log(`[DIAG:Accum] flushIfComplete: INCOMPLETE — id=${toolCallId.substring(0, 20)} ` +
           `rawArgs.len=${data.rawArgs.length} starts=${starts} ends=${ends} — keeping pending`);
@@ -532,15 +519,18 @@ class StreamingToolCallAccumulator {
   flush() {
     const results = [];
     for (const [toolCallId, data] of this.pending) {
+      const dup = this.flushedIds.has(toolCallId);
       console.warn(`[DIAG:Accum] FLUSHING incomplete streaming tool call: ${toolCallId} ` +
-        `(${data.rawArgs.length} chars, ${data.frameCount} frames, frameSizes=[${data.frameSizes.join(',')}])`);
+        `(${data.rawArgs.length} chars, ${data.frameCount} frames, frameSizes=[${data.frameSizes.join(',')}])` +
+        (dup ? ' (DUPLICATE)' : ''));
       results.push({
         tool: data.tool,
         toolCallId,
         name: data.name,
         rawArgs: data.rawArgs || '{}',
+        isDuplicate: dup,
       });
-      this.flushedIds.add(toolCallId); // Prevent duplicate when isLastMessage=true arrives later
+      if (!dup) this.flushedIds.add(toolCallId);
     }
     this.pending.clear();
     return results;
