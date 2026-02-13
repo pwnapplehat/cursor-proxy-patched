@@ -156,12 +156,35 @@ async function streamBidiResponse(bidiState, res, model, responseId, hasTools, t
 
           if (!provisionalAckSent && stallCheckCount >= 2) {
             // 3s total: Cursor paused after first streaming batch (incomplete JSON).
-            // Send a provisional "OK" directly to Cursor to trigger the next batch.
+            // Send a provisional result directly to Cursor to trigger the next batch.
             // Do NOT flush to OpenClaw — wait for the complete JSON to arrive.
+            //
+            // CRITICAL: The provisional message is what the model sees as the tool
+            // result. If we send "OK", the model interprets it as "no result" and
+            // falls back to exec. We MUST construct a realistic success message
+            // by extracting file_path from the (even incomplete) rawArgs.
             const pendingEntries = toolCallAccumulator.getPendingEntries();
-            for (const { toolCallId, tool } of pendingEntries) {
-              console.log(`[h2-bidi] Sending provisional ack to trigger write continuation: ${toolCallId} (enum=${tool})`);
-              bidiState.sendToolResult(tool, toolCallId, 'OK');
+            for (const { toolCallId, tool, rawArgs } of pendingEntries) {
+              let provisionalMsg = 'Operation completed successfully';
+              // For write/edit tools (enum 38 = EDIT_FILE_V2, 7 = EDIT_FILE),
+              // extract file_path from the accumulated rawArgs to construct a
+              // realistic message the model will recognize as success.
+              if ((tool === 38 || tool === 7) && rawArgs) {
+                try {
+                  const pathMatch = rawArgs.match(/"file_path"\s*:\s*"([^"]+)"/);
+                  if (pathMatch) {
+                    const filePath = pathMatch[1];
+                    // Estimate content length from what we have so far
+                    const contentMatch = rawArgs.match(/"contents"\s*:\s*"/);
+                    const contentStart = contentMatch ? contentMatch.index + contentMatch[0].length : -1;
+                    const approxLen = contentStart > 0 ? rawArgs.length - contentStart : 0;
+                    provisionalMsg = `Successfully created ${filePath}`;
+                    if (approxLen > 0) provisionalMsg += ` (${approxLen}+ bytes)`;
+                  }
+                } catch (e) { /* ignore parse errors on incomplete JSON */ }
+              }
+              console.log(`[h2-bidi] Sending provisional ack to trigger continuation: ${toolCallId} (enum=${tool}) msg="${provisionalMsg}"`);
+              bidiState.sendToolResult(tool, toolCallId, provisionalMsg);
             }
             provisionalAckSent = true;
             stallCheckCount = 0; // Reset — give time for continuation frames to arrive

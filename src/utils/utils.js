@@ -475,12 +475,14 @@ class StreamingToolCallAccumulator {
   /**
    * Get info about pending (still-accumulating) streaming tool calls.
    * Used to send provisional acks to Cursor to trigger continuation frames.
-   * @returns {Array<{toolCallId: string, tool: number}>}
+   * Includes rawArgs so the caller can extract file paths for realistic
+   * provisional messages (prevents the model from seeing "OK" as the result).
+   * @returns {Array<{toolCallId: string, tool: number, rawArgs: string}>}
    */
   getPendingEntries() {
     const entries = [];
     for (const [toolCallId, data] of this.pending) {
-      entries.push({ toolCallId, tool: data.tool });
+      entries.push({ toolCallId, tool: data.tool, rawArgs: data.rawArgs });
     }
     return entries;
   }
