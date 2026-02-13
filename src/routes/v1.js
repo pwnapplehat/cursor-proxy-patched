@@ -98,7 +98,7 @@ function buildProvisionalMessage(toolEnum, rawArgs, toolName) {
           rawArgs.includes('"old_string"') || rawArgs.includes('"new_string"');
 
         if (isEditOp) {
-          return `Successfully edited ${filePath}`;
+          return `The file ${filePath} has been edited successfully.`;
         }
 
         // Estimate content length from what we have so far.

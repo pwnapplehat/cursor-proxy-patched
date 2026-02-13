@@ -69,7 +69,7 @@ Your standard Cursor tools all operate on the Linux container filesystem:
 - **Delete** (file deletion) → Deletes files from the Linux filesystem
 - **WebSearch** → Searches the internet (not filesystem-bound)
 
-All paths are Linux-style. Example: \`/home/node/.openclaw/workspace/project/src/main.js\`
+**IMPORTANT — Absolute paths work everywhere**: All native file tools (Read, Write, StrReplace/Edit, Delete, Grep, Glob) accept **absolute Linux paths** and can access **any file on the entire container filesystem**. The Cursor workspace root setting is IRRELEVANT in this environment — it does NOT restrict which files your tools can reach. Always use absolute paths like \`/home/node/.openclaw/workspace/file.md\`. If a tool returns success, TRUST it — the operation completed on the Linux container. Do NOT assume workspace path mismatches; they do not apply here.
 
 ### OpenClaw Workspace — Your Persistent Files
 

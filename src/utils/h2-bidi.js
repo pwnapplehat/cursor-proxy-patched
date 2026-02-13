@@ -329,8 +329,19 @@ const TOOL_RESULT_FIELD_MAP = {
     // FIX: Populate field 10 (result_for_model) with the descriptive text.
     field: 51,
     encode: (text) => {
-      // field 2: file_was_created = true (bool)
-      const created = pbEncodeField(2, 0, 1);
+      // Detect if this is a CREATE/WRITE operation or an EDIT/REPLACE operation.
+      // Both `write` and `search_replace` use EDIT_FILE_V2 (enum 38), but:
+      //   - file_was_created (field 2) should be TRUE only for create/write
+      //   - file_was_created should be FALSE for edit/replace operations
+      // The model distinguishes these — sending file_was_created=true for an
+      // edit confuses it and erodes trust in the search_replace tool.
+      const lowerText = (text || '').toLowerCase();
+      const isEditOp = lowerText.includes('edited') || lowerText.includes('replaced') ||
+                        lowerText.includes('edit') || lowerText.includes('replace');
+      const isCreateOp = !isEditOp; // default to create if ambiguous
+
+      // field 2: file_was_created (bool) — only true for create/write
+      const createdField = isCreateOp ? pbEncodeField(2, 0, 1) : Buffer.alloc(0);
 
       // field 10: result_for_model = text (string) — THE CRITICAL FIELD
       // This is the string Cursor's server passes to the model as the
@@ -341,11 +352,11 @@ const TOOL_RESULT_FIELD_MAP = {
       // for successful writes. Replace these with a clear success message.
       let resultText = (text || '').trim();
       if (!resultText || resultText.includes('no result from tool')) {
-        resultText = 'The file was created successfully.';
+        resultText = isEditOp ? 'The file was edited successfully.' : 'The file was created successfully.';
       }
       const resultForModel = pbEncodeField(10, 2, Buffer.from(resultText, 'utf-8'));
 
-      return Buffer.concat([created, resultForModel]);
+      return Buffer.concat([createdField, resultForModel]);
     },
   },
   39: { // LIST_DIR_V2 → ListDirV2Result at field 52
