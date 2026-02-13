@@ -59,9 +59,10 @@ cp /opt/cursor-proxy-patched/src/utils/utils.js /opt/cursor-proxy-utils.js
 cp /opt/cursor-proxy-patched/src/routes/v1.js /opt/cursor-proxy-v1.js
 cp /opt/cursor-proxy-patched/src/utils/toolEmulation.js /opt/cursor-proxy-toolEmulation.js
 cp /opt/cursor-proxy-patched/src/proto/message.js /opt/cursor-proxy-message.js
+cp /opt/cursor-proxy-patched/src/utils/h2-bidi.js /opt/cursor-proxy-h2-bidi.js
 ```
 
-Run the proxy with all 4 patched files mounted:
+Run the proxy with all 5 patched files mounted:
 
 ```bash
 docker run -d \
@@ -72,6 +73,7 @@ docker run -d \
   -v /opt/cursor-proxy-v1.js:/app/src/routes/v1.js:ro \
   -v /opt/cursor-proxy-toolEmulation.js:/app/src/utils/toolEmulation.js:ro \
   -v /opt/cursor-proxy-message.js:/app/src/proto/message.js:ro \
+  -v /opt/cursor-proxy-h2-bidi.js:/app/src/utils/h2-bidi.js:ro \
   ghcr.io/jiuz-chn/cursor-to-openai:latest
 ```
 
@@ -341,10 +343,16 @@ Model availability depends on your Cursor plan. Use `cursor/<model-id>` format i
 When new fixes are pushed to the repo:
 
 ```bash
-cd /opt/cursor-proxy-patched && git pull origin master && docker restart cursor-proxy
+cd /opt/cursor-proxy-patched && git pull origin master
+cp src/utils/utils.js /opt/cursor-proxy-utils.js
+cp src/routes/v1.js /opt/cursor-proxy-v1.js
+cp src/utils/toolEmulation.js /opt/cursor-proxy-toolEmulation.js
+cp src/proto/message.js /opt/cursor-proxy-message.js
+cp src/utils/h2-bidi.js /opt/cursor-proxy-h2-bidi.js
+docker restart cursor-proxy
 ```
 
-That's it — one command. The proxy runs directly from `/opt/cursor-proxy-patched`, so `git pull` updates the files in-place and the container restart picks them up.
+The `git pull` fetches the latest code, the `cp` commands update the mounted files, and the container restart picks them up.
 
 After updating, send `/reset` in Telegram to start a fresh session with the new environment context.
 

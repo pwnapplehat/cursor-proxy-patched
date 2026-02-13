@@ -48,7 +48,9 @@ async function streamBidiResponse(bidiState, res, model, responseId, hasTools, t
   return new Promise((resolve, reject) => {
     const seenToolCallIds = new Set();
     const toolCallDetector = new StreamingToolCallDetector();
-    const toolCallAccumulator = new StreamingToolCallAccumulator();
+    // Share flushedIds across all streamBidiResponse calls on the same bidi stream
+    // to prevent duplicate tool calls when isLastMessage=true arrives after flushIfComplete
+    const toolCallAccumulator = new StreamingToolCallAccumulator(bidiState.flushedStreamingIds);
     const nativeToolCalls = [];
     let allTextAccumulated = '';
     let allThinking = '';
@@ -95,23 +97,27 @@ async function streamBidiResponse(bidiState, res, model, responseId, hasTools, t
     // This timer fires 1.5 seconds after the last frame. If we've detected
     // tool calls, that means Cursor is done with its turn → finalize now.
     let turnTimer = null;
-    let nudgeCount = 0;
+    let stallCheckCount = 0;
     const TURN_INACTIVITY_MS = 1500;
+
+    // CONFIRMED ROOT CAUSE (diagnostic logs 2026-02-13):
+    // Cursor's server sends streaming tool call frames ONLY in response to
+    // proper tool result messages. PING, empty ConnectRPC envelopes, and
+    // stream.resume() do NOT trigger more frames. When we get 1 streaming
+    // frame with incomplete JSON, the server has paused and will NOT send
+    // more until we send a tool result. No amount of waiting helps.
+    //
+    // Strategy: wait 1.5s for complete JSON (covers web_search etc. where
+    // the first frame IS complete). If still incomplete after 3s total,
+    // force-flush and let the truncation fallback handle it via exec/heredoc.
 
     function resetTurnTimer() {
       if (turnTimer) clearTimeout(turnTimer);
       turnTimer = setTimeout(() => {
         if (toolCallsEmitted) return; // Already finalized
 
-        // Check for pending streaming tool calls that never got isLastMessage=true.
-        // Cursor sends EDIT_FILE_V2 (write) as full-replacement streaming frames
-        // and never sends isLastMessage=true — the stream just goes quiet.
-        //
-        // IMPORTANT: Only flush streaming calls with COMPLETE JSON (ends with '}').
-        // The model may take >1.5s between streaming frames while still generating
-        // tokens. Flushing incomplete JSON causes truncation fallbacks.
-        const hasPendingStreaming = toolCallAccumulator.hasPending();
-        if (hasPendingStreaming) {
+        // Try to flush streaming calls with complete JSON (e.g., web_search)
+        if (toolCallAccumulator.hasPending()) {
           const completeFlushed = toolCallAccumulator.flushIfComplete();
           if (completeFlushed.length > 0) {
             console.log(`[h2-bidi] Turn inactivity (${TURN_INACTIVITY_MS}ms) — flushing ${completeFlushed.length} complete streaming tool call(s)`);
@@ -125,39 +131,12 @@ async function streamBidiResponse(bidiState, res, model, responseId, hasTools, t
           console.log(`[h2-bidi] Turn inactivity (${TURN_INACTIVITY_MS}ms) — ${nativeToolCalls.length} tool call(s) detected, finalizing turn`);
           finalize();
         } else if (toolCallAccumulator.hasPending()) {
-          // Streaming tool call(s) with incomplete JSON are pending.
-          //
-          // ROOT CAUSE INVESTIGATION: Cursor's server appears to pause sending
-          // streaming frames after the initial batch. It only resumes when the
-          // client sends something on the bidi stream. In the real Cursor IDE,
-          // this happens naturally. In our proxy, nothing is sent until the tool
-          // is executed and the result returned.
-          //
-          // DIAGNOSTIC: Nudge the H2 session with a PING + stream.resume() to
-          // test if that triggers Cursor to send more frames.
-          nudgeCount++;
-          console.log(`[h2-bidi] Turn inactivity — incomplete streaming call(s) pending, nudge #${nudgeCount}`);
-
-          if (nudgeCount <= 3) {
-            // Phase 1: H2-level nudge (PING + resume) — tests if flow control is the blocker
-            bidiState.nudgeStream();
-          } else if (nudgeCount === 4) {
-            // Phase 2: Application-level nudge — send an empty ConnectRPC envelope
-            // to test if Cursor's server needs a client-side message to resume streaming.
-            // An empty envelope (5 zero bytes) is a valid ConnectRPC frame with 0-length payload.
-            console.log(`[h2-bidi:NUDGE] Phase 2 — sending EMPTY ConnectRPC envelope to trigger server flush`);
-            try {
-              const emptyEnvelope = Buffer.alloc(5); // flags=0, length=0
-              bidiState.stream.write(emptyEnvelope);
-              console.log(`[h2-bidi:NUDGE] Empty envelope sent (5 bytes)`);
-            } catch (err) {
-              console.error(`[h2-bidi:NUDGE] Failed to send empty envelope: ${err.message}`);
-            }
-          } else if (nudgeCount >= 7) {
-            // Phase 3: After ~10.5s of waiting, Cursor is NOT going to send more frames.
-            // This confirms the server-side pause is not fixable via H2/ping nudges.
-            // Force-flush the incomplete streaming call so the agent can proceed.
-            console.warn(`[h2-bidi:NUDGE] Phase 3 — ${nudgeCount} nudges failed, force-flushing incomplete streaming call(s)`);
+          stallCheckCount++;
+          if (stallCheckCount >= 2) {
+            // 3s total (2 × 1.5s) with no new data — Cursor has paused.
+            // Force-flush incomplete streaming calls. The truncation fallback
+            // will instruct the agent to use exec/heredoc instead.
+            console.warn(`[h2-bidi] Streaming stall confirmed (${stallCheckCount * TURN_INACTIVITY_MS}ms, no new frames) — force-flushing`);
             const forceFlushed = toolCallAccumulator.flush();
             for (const tc of forceFlushed) {
               handleCompletedToolCall(tc);
@@ -166,6 +145,8 @@ async function streamBidiResponse(bidiState, res, model, responseId, hasTools, t
               finalize();
               return;
             }
+          } else {
+            console.log(`[h2-bidi] Turn inactivity — incomplete streaming call(s) pending, check #${stallCheckCount}`);
           }
           resetTurnTimer();
         }

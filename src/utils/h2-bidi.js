@@ -428,6 +428,7 @@ class BidiStreamState extends EventEmitter {
     this.bufferedFrames = []; // frames received while waiting for tool result
     this.pendingToolCalls = new Map(); // proxyCallId → { cursorToolCallId, toolEnum }
     this._waitingForToolResult = false;
+    this.flushedStreamingIds = new Set(); // Persists across streamBidiResponse calls to prevent duplicates
 
     // Wire up data events — log every raw chunk to diagnose streaming stalls
     this._lastDataTime = Date.now();

@@ -325,9 +325,14 @@ function findNativeToolCalls(data) {
 // ─────────────────────────────────────────────────────────────────────────
 
 class StreamingToolCallAccumulator {
-  constructor() {
+  /**
+   * @param {Set} [sharedFlushedIds] - Optional external Set for tracking flushed IDs
+   *   across multiple accumulator instances (persists across streamBidiResponse calls
+   *   on the same H2 bidi stream). If not provided, a local Set is used.
+   */
+  constructor(sharedFlushedIds) {
     this.pending = new Map(); // toolCallId → { tool, name, rawArgs, frameCount, frameSizes }
-    this.flushedIds = new Set(); // IDs already flushed by flushIfComplete/flush — ignore duplicates
+    this.flushedIds = sharedFlushedIds || new Set(); // IDs already flushed — ignore duplicates
   }
 
   /**
