@@ -4,8 +4,308 @@ const { fetch, ProxyAgent, Agent } = require('undici');
 const { v4: uuidv4, v5: uuidv5 } = require('uuid');
 const config = require('../config/config');
 const $root = require('../proto/message.js');
-const { generateCursorBody, chunkToUtf8String, generateHashed64Hex, generateCursorChecksum, IncrementalFrameParser, processSingleFrame, StreamingToolCallDetector, convertNativeToolCall, CURSOR_TOOL_NAMES, expandOcExecCalls } = require('../utils/utils.js');
+const { generateCursorBody, chunkToUtf8String, generateHashed64Hex, generateCursorChecksum, IncrementalFrameParser, processSingleFrame, StreamingToolCallDetector, StreamingToolCallAccumulator, convertNativeToolCall, CURSOR_TOOL_NAMES, expandOcExecCalls } = require('../utils/utils.js');
 const { parseToolCalls, hasToolCallTags, normalizeNearMissToolCalls, tryParseToolCallContent } = require('../utils/toolEmulation');
+const { createBidiStream, findPendingStream, removePendingStream } = require('../utils/h2-bidi');
+
+// ─── Tool Result Detection ───────────────────────────────────────────────
+// Detects if incoming messages contain tool results that should be routed
+// through an existing bidirectional H2 stream instead of creating a new one.
+// Returns ALL tool results (OpenClaw may batch multiple parallel tool results).
+
+function detectToolResults(messages) {
+  if (!messages || !Array.isArray(messages)) return [];
+
+  const results = [];
+  // Scan from the end — tool results are at the tail of the messages array.
+  // Stop when we hit a non-tool message (the assistant message with tool_calls
+  // sits right before the tool results).
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i];
+    if (msg.role === 'tool' && msg.tool_call_id) {
+      results.push({
+        toolCallId: msg.tool_call_id,
+        content: typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content || ''),
+        messageIndex: i,
+      });
+    } else if (msg.role !== 'tool') {
+      break; // Stop at the first non-tool message
+    }
+  }
+  return results; // may be empty
+}
+
+// ─── Bidirectional Stream Handler ──────────────────────────────────────────
+// Processes a streaming response from a BidiStreamState (h2-bidi), streaming
+// text to the Express response as SSE and collecting tool calls.
+//
+// When tool calls are found, they are registered as pending on the bidiState
+// so a continuation request can send the result on the same H2 stream.
+//
+// Returns: { toolCallsEmitted: boolean } so the caller knows whether to end SSE.
+
+async function streamBidiResponse(bidiState, res, model, responseId, hasTools, tools) {
+  return new Promise((resolve, reject) => {
+    const seenToolCallIds = new Set();
+    const toolCallDetector = new StreamingToolCallDetector();
+    const toolCallAccumulator = new StreamingToolCallAccumulator();
+    const nativeToolCalls = [];
+    let allTextAccumulated = '';
+    let allThinking = '';
+    let firstChunkSent = false;
+    let toolCallsEmitted = false;
+
+    function sendTextChunk(text) {
+      if (!text || res.writableEnded) return;
+      const delta = !firstChunkSent
+        ? { role: 'assistant', content: text }
+        : { content: text };
+      firstChunkSent = true;
+      res.write(`data: ${JSON.stringify({
+        id: responseId,
+        object: 'chat.completion.chunk',
+        created: Math.floor(Date.now() / 1000),
+        model: model,
+        choices: [{ index: 0, delta, finish_reason: null }]
+      })}\n\n`);
+    }
+
+    // Handles a fully-assembled tool call (after streaming accumulation)
+    function handleCompletedToolCall(tc) {
+      const cursorName = tc.name || CURSOR_TOOL_NAMES[tc.tool] || `cursor_tool_${tc.tool}`;
+      console.log(`[h2-bidi] Completed native tool call: ${cursorName} (enum=${tc.tool}, id=${tc.toolCallId}, rawArgs=${tc.rawArgs.length} chars)`);
+      const mapped = convertNativeToolCall(tc);
+      if (mapped) {
+        nativeToolCalls.push({ mapped, original: tc });
+      } else {
+        // Tool call that convertNativeToolCall couldn't map (e.g., APPLY_AGENT_DIFF).
+        // Cursor is WAITING for a result on the H2 stream. If we don't send one,
+        // the stream hangs forever. Auto-acknowledge with a minimal success result.
+        console.warn(`[h2-bidi] Auto-acking unsupported tool: ${cursorName} (enum=${tc.tool}, id=${tc.toolCallId})`);
+        bidiState.sendToolResult(tc.tool, tc.toolCallId, `Tool ${cursorName} acknowledged (proxied)`);
+      }
+    }
+
+    function onFrame({ magic, data }) {
+      const { text, thinking, nativeToolCalls: frameTCs } =
+        processSingleFrame(magic, data, seenToolCallIds);
+
+      // Feed each frame's tool calls through the streaming accumulator.
+      // Non-streaming calls pass through immediately. Streaming calls are
+      // accumulated until is_last_message=true, then emitted as complete.
+      if (frameTCs.length > 0) {
+        console.log(`[DIAG:bidi:onFrame] Processing ${frameTCs.length} tool call(s) from frame (magic=${magic})`);
+      }
+      for (const tc of frameTCs) {
+        if (tc.isStreaming || tc.isLastMessage) {
+          console.log(`[DIAG:bidi:onFrame] Feeding STREAMING tc to accumulator: id=${tc.toolCallId.substring(0, 20)} isStreaming=${tc.isStreaming} isLastMessage=${tc.isLastMessage}`);
+          const completed = toolCallAccumulator.feed(tc);
+          if (completed) {
+            console.log(`[DIAG:bidi:onFrame] Accumulator RETURNED completed tc: id=${completed.toolCallId.substring(0, 20)} rawArgs.len=${completed.rawArgs.length}`);
+            handleCompletedToolCall(completed);
+          } else {
+            console.log(`[DIAG:bidi:onFrame] Accumulator returned null — still accumulating`);
+          }
+        } else {
+          // Non-streaming — handle immediately
+          console.log(`[DIAG:bidi:onFrame] Non-streaming tc — handling immediately: id=${tc.toolCallId.substring(0, 20)}`);
+          handleCompletedToolCall(tc);
+        }
+      }
+
+      if (thinking) allThinking += thinking;
+
+      if (text) {
+        allTextAccumulated += text;
+        const safeText = toolCallDetector.addText(text);
+        if (safeText) {
+          if (allThinking && !firstChunkSent) {
+            sendTextChunk('<thinking> ' + allThinking + ' </thinking> ' + safeText);
+            allThinking = '';
+          } else {
+            sendTextChunk(safeText);
+          }
+        }
+      }
+    }
+
+    function finalize() {
+      // Start buffering BEFORE removing listeners to prevent frame loss.
+      // Any frames arriving between now and the next streamBidiResponse()
+      // call will be safely buffered rather than emitted to nobody.
+      bidiState._waitingForToolResult = true;
+
+      bidiState.removeListener('frame', onFrame);
+      bidiState.removeListener('end', onEnd);
+      bidiState.removeListener('error', onError);
+
+      const { remainingText, toolCallBlocks } = toolCallDetector.finish();
+
+      if (allThinking && !firstChunkSent) {
+        sendTextChunk('<thinking> ' + allThinking + ' </thinking> ');
+      }
+      if (remainingText) sendTextChunk(remainingText);
+
+      // Flush any streaming tool calls that were still accumulating when the
+      // stream ended. These are incomplete but we process them best-effort.
+      const flushed = toolCallAccumulator.flush();
+      for (const tc of flushed) {
+        handleCompletedToolCall(tc);
+      }
+
+      console.log(`[h2-bidi] Response: ${allTextAccumulated.length} chars, preview: ${allTextAccumulated.substring(0, 300).replace(/\n/g, '\\n')}`);
+
+      // ─── Collect all tool calls ─────────────────────────────────────
+      const allToolCalls = [];
+
+      for (const { mapped, original } of nativeToolCalls) {
+        if (mapped.truncated) {
+          sendTextChunk(`\n${mapped.hint}\n`);
+          const safeFilePath = (mapped.filePath || 'file').replace(/'/g, "'\\''");
+          const callId = `call_${uuidv4()}`;
+          allToolCalls.push({
+            id: callId,
+            type: 'function',
+            function: { name: 'exec', arguments: JSON.stringify({ command: `echo "Ready for chunked heredoc write to: ${safeFilePath}"` }) },
+            _cursorToolCallId: original.toolCallId,
+            _toolEnum: original.tool,
+          });
+        } else {
+          const callId = `call_${uuidv4()}`;
+          allToolCalls.push({
+            id: callId,
+            type: 'function',
+            function: { name: mapped.name, arguments: JSON.stringify(mapped.arguments) },
+            _cursorToolCallId: original.toolCallId,
+            _toolEnum: original.tool,
+          });
+        }
+      }
+
+      for (const block of toolCallBlocks) {
+        const parsed = tryParseToolCallContent(block, tools);
+        if (parsed) allToolCalls.push(parsed);
+      }
+
+      if (allToolCalls.length === 0 && allTextAccumulated.length > 0) {
+        const normalized = normalizeNearMissToolCalls(allTextAccumulated);
+        if (hasToolCallTags(normalized)) {
+          const { toolCalls: fallbackCalls } = parseToolCalls(normalized, tools);
+          for (const tc of fallbackCalls) allToolCalls.push(tc);
+        }
+      }
+
+      const finalToolCalls = expandOcExecCalls(allToolCalls);
+
+      // ─── Emit tool calls or stop ─────────────────────────────────────
+      if (finalToolCalls.length > 0) {
+        console.log(`[h2-bidi] Emitting ${finalToolCalls.length} tool call(s): ${finalToolCalls.map(tc => tc.function.name).join(', ')}`);
+
+        // Register pending tool calls on the bidiState for continuation
+        bidiState.startBuffering();
+        for (const tc of finalToolCalls) {
+          if (tc._cursorToolCallId) {
+            bidiState.registerPendingToolCall(tc.id, tc._cursorToolCallId, tc._toolEnum);
+          }
+        }
+
+        for (let i = 0; i < finalToolCalls.length; i++) {
+          const tc = finalToolCalls[i];
+          res.write(`data: ${JSON.stringify({
+            id: responseId,
+            object: 'chat.completion.chunk',
+            created: Math.floor(Date.now() / 1000),
+            model: model,
+            choices: [{
+              index: 0,
+              delta: {
+                tool_calls: [{
+                  index: i,
+                  id: tc.id,
+                  type: 'function',
+                  function: { name: tc.function.name, arguments: tc.function.arguments }
+                }]
+              },
+              finish_reason: null
+            }]
+          })}\n\n`);
+        }
+
+        res.write(`data: ${JSON.stringify({
+          id: responseId,
+          object: 'chat.completion.chunk',
+          created: Math.floor(Date.now() / 1000),
+          model: model,
+          choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }]
+        })}\n\n`);
+
+        toolCallsEmitted = true;
+      } else {
+        if (hasTools) {
+          console.warn('[h2-bidi] WARNING: Tools provided but model did not output any tool calls.');
+        }
+        res.write(`data: ${JSON.stringify({
+          id: responseId,
+          object: 'chat.completion.chunk',
+          created: Math.floor(Date.now() / 1000),
+          model: model,
+          choices: [{ index: 0, delta: {}, finish_reason: 'stop' }]
+        })}\n\n`);
+
+        // No tool calls — stream is done, close it
+        bidiState.close();
+      }
+
+      resolve({ toolCallsEmitted });
+    }
+
+    function onEnd() {
+      finalize();
+    }
+
+    function onError(err) {
+      console.error(`[h2-bidi] Stream error during response: ${err.message}`);
+      finalize();
+    }
+
+    // Attach listeners
+    bidiState.on('frame', onFrame);
+    bidiState.on('end', onEnd);
+    bidiState.on('error', onError);
+
+    // If the bidiState already has frames buffered (from continuation), process them
+    const buffered = bidiState.flushBufferedFrames();
+    for (const frame of buffered) {
+      onFrame(frame);
+    }
+
+    // CRITICAL: If the H2 stream already ended (e.g., Cursor responded while
+    // we were waiting for OpenClaw's tool result), the 'end' event was already
+    // emitted and won't re-fire. Detect this and finalize immediately.
+    if (bidiState.ended) {
+      console.log('[h2-bidi] Stream already ended — finalizing immediately');
+      finalize();
+      return; // Don't set up safety timeout — we're done
+    }
+
+    // Safety timeout: if no data for 5 minutes, finalize
+    const safetyTimeout = setTimeout(() => {
+      console.warn('[h2-bidi] Safety timeout — finalizing response');
+      finalize();
+    }, 5 * 60 * 1000);
+
+    // Override finalize to clear timeout
+    const originalFinalize = finalize;
+    let finalized = false;
+    // eslint-disable-next-line no-func-assign
+    finalize = function() {
+      if (finalized) return;
+      finalized = true;
+      clearTimeout(safetyTimeout);
+      originalFinalize();
+    };
+  });
+}
 
 router.get("/models", async (req, res) => {
   try{
@@ -126,6 +426,129 @@ router.post('/chat/completions', async (req, res) => {
     // Pass tools + tool_choice to generateCursorBody for injection
     const cursorBody = generateCursorBody(messages, model, tools, tool_choice);
 
+    // ─── BIDIRECTIONAL STREAMING PATH ─────────────────────────────────────
+    // Attempts to use HTTP/2 bidirectional streaming for tool call support.
+    // If this succeeds, the handler returns early — no fetch() needed.
+    // If it fails (or is inapplicable), execution falls through to the
+    // existing fetch-based path below.
+    if (stream) {
+      let bidiHandled = false;
+
+      // --- Case 1: Tool result continuation ---
+      // Check if the incoming messages contain tool results that map to
+      // an existing open H2 stream. If so, send ALL results on that stream
+      // and continue receiving the AI response.
+      const toolResults = detectToolResults(messages);
+      if (toolResults.length > 0) {
+        // Find the bidiState from ANY of the tool results
+        let bidiState = null;
+        for (const tr of toolResults) {
+          bidiState = findPendingStream(tr.toolCallId);
+          if (bidiState && !bidiState.ended) break;
+          bidiState = null;
+        }
+
+        if (bidiState) {
+          let allMapped = true;
+          const mappings = [];
+          for (const tr of toolResults) {
+            const mapping = bidiState.pendingToolCalls.get(tr.toolCallId);
+            if (mapping) {
+              mappings.push({ ...mapping, toolCallId: tr.toolCallId, content: tr.content });
+            } else {
+              // This tool result has no Cursor-side mapping (e.g., text-based tool call)
+              // — we can't route it through the H2 stream
+              allMapped = false;
+            }
+          }
+
+          if (mappings.length > 0) {
+            console.log(`[h2-bidi] ▸ Routing ${mappings.length} tool result(s) on existing H2 stream`);
+
+            // Send ALL tool results on the stream
+            for (const m of mappings) {
+              console.log(`[h2-bidi]   → ${m.toolCallId} → cursor:${m.cursorToolCallId} (enum=${m.toolEnum})`);
+              bidiState.sendToolResult(m.toolEnum, m.cursorToolCallId, m.content);
+              removePendingStream(m.toolCallId);
+            }
+
+            // Set up SSE response
+            res.setHeader('Content-Type', 'text/event-stream');
+            res.setHeader('Cache-Control', 'no-cache');
+            res.setHeader('Connection', 'keep-alive');
+            const responseId = `chatcmpl-${uuidv4()}`;
+
+            try {
+              await streamBidiResponse(bidiState, res, model, responseId, hasTools, tools);
+            } catch (contErr) {
+              console.error(`[h2-bidi] Continuation error: ${contErr.message}`);
+              if (!res.writableEnded) {
+                res.write(`data: ${JSON.stringify({ error: `Continuation error: ${contErr.message}` })}\n\n`);
+              }
+            } finally {
+              if (!res.writableEnded) {
+                res.write('data: [DONE]\n\n');
+                res.end();
+              }
+            }
+            return; // Handled — do not fall through
+          }
+        }
+        console.log(`[h2-bidi] No pending stream for tool results [${toolResults.map(r => r.toolCallId).join(', ')}] — falling back to fetch`);
+      }
+
+      // --- Case 2: Fresh request — try H2 bidirectional stream ---
+      // Only when streaming is requested and no HTTP proxy is configured
+      // (HTTP proxies cannot relay H2 bidirectional streams).
+      if (!config.proxy.enabled) {
+        try {
+          const bidiHeaders = {
+            'x-amzn-trace-id': `Root=${uuidv4()}`,
+            'x-client-key': clientKey,
+            'x-cursor-checksum': cursorChecksum,
+            'x-cursor-client-version': cursorClientVersion,
+            'x-cursor-config-version': cursorConfigVersion,
+            'x-cursor-timezone': 'Asia/Shanghai',
+            'x-request-id': uuidv4(),
+            'x-session-id': sessionid,
+          };
+
+          const bidiState = await createBidiStream(authToken, bidiHeaders, cursorBody);
+          console.log(`[h2-bidi] ▸ Bidirectional stream opened for fresh request`);
+
+          // Set up SSE response
+          res.setHeader('Content-Type', 'text/event-stream');
+          res.setHeader('Cache-Control', 'no-cache');
+          res.setHeader('Connection', 'keep-alive');
+          const responseId = `chatcmpl-${uuidv4()}`;
+
+          try {
+            await streamBidiResponse(bidiState, res, model, responseId, hasTools, tools);
+            bidiHandled = true;
+          } catch (bidiStreamErr) {
+            console.error(`[h2-bidi] Stream processing error: ${bidiStreamErr.message}`);
+            if (!res.writableEnded) {
+              res.write(`data: ${JSON.stringify({ error: `Stream error: ${bidiStreamErr.message}` })}\n\n`);
+            }
+            bidiHandled = true; // Still handled — error was sent
+          } finally {
+            if (!res.writableEnded) {
+              res.write('data: [DONE]\n\n');
+              res.end();
+            }
+          }
+
+          if (bidiHandled) return; // Success — skip fetch path
+        } catch (bidiConnectErr) {
+          console.warn(`[h2-bidi] Failed to create bidirectional stream: ${bidiConnectErr.message} — falling back to fetch`);
+          // Fall through to fetch path
+        }
+      }
+    }
+    // ─── END BIDIRECTIONAL STREAMING PATH ─────────────────────────────────
+
+    // ─── FETCH-BASED FALLBACK PATH ───────────────────────────────────────
+    // Used when: (1) H2 bidi fails, (2) HTTP proxy is configured, (3) non-streaming.
     // Disable all undici-level timeouts on the dispatcher so large-context
     // requests to Cursor are never killed.  bodyTimeout=0 and headersTimeout=0
     // mean "wait forever" — the connection stays open until Cursor responds.
@@ -197,6 +620,7 @@ router.post('/chat/completions', async (req, res) => {
       // before sending ANY SSE chunks, blocking all real-time feedback.
       const frameParser = new IncrementalFrameParser();
       const toolCallDetector = new StreamingToolCallDetector();
+      const toolCallAccumulator = new StreamingToolCallAccumulator();
       const nativeToolCalls = [];
       const seenToolCallIds = new Set();
       let allTextAccumulated = '';
@@ -232,12 +656,32 @@ router.post('/chat/completions', async (req, res) => {
               const { text, thinking, nativeToolCalls: frameTCs } =
                 processSingleFrame(frame.magic, frame.data, seenToolCallIds);
 
-              // Collect native tool calls (kept separate from text stream)
+              // Feed tool calls through the streaming accumulator.
+              // Streaming calls (e.g., EDIT_FILE_V2 with large rawArgs) are
+              // accumulated across frames until is_last_message=true.
+              if (frameTCs.length > 0) {
+                console.log(`[DIAG:fetch:onFrame] Processing ${frameTCs.length} tool call(s) from frame`);
+              }
               for (const tc of frameTCs) {
-                const cursorName = tc.name || CURSOR_TOOL_NAMES[tc.tool] || `cursor_tool_${tc.tool}`;
-                console.log(`[streaming] Intercepted native tool call: ${cursorName} (enum=${tc.tool}, id=${tc.toolCallId}, rawArgs=${tc.rawArgs.substring(0, 200)})`);
-                const mapped = convertNativeToolCall(tc);
-                if (mapped) nativeToolCalls.push(mapped);
+                let completed;
+                if (tc.isStreaming || tc.isLastMessage) {
+                  console.log(`[DIAG:fetch:onFrame] Feeding STREAMING tc to accumulator: id=${tc.toolCallId.substring(0, 20)} isStreaming=${tc.isStreaming} isLastMessage=${tc.isLastMessage}`);
+                  completed = toolCallAccumulator.feed(tc);
+                  if (completed) {
+                    console.log(`[DIAG:fetch:onFrame] Accumulator RETURNED completed: id=${completed.toolCallId.substring(0, 20)} rawArgs.len=${completed.rawArgs.length}`);
+                  } else {
+                    console.log(`[DIAG:fetch:onFrame] Accumulator returned null — still accumulating`);
+                  }
+                } else {
+                  console.log(`[DIAG:fetch:onFrame] Non-streaming tc — using directly: id=${tc.toolCallId.substring(0, 20)}`);
+                  completed = tc; // Non-streaming — already complete
+                }
+                if (completed) {
+                  const cursorName = completed.name || CURSOR_TOOL_NAMES[completed.tool] || `cursor_tool_${completed.tool}`;
+                  console.log(`[streaming] Completed native tool call: ${cursorName} (enum=${completed.tool}, id=${completed.toolCallId}, rawArgs=${completed.rawArgs.length} chars)`);
+                  const mapped = convertNativeToolCall(completed);
+                  if (mapped) nativeToolCalls.push(mapped);
+                }
               }
 
               // Accumulate thinking content
@@ -275,6 +719,15 @@ router.post('/chat/completions', async (req, res) => {
 
         // ─── Finalize: flush remaining text + collect all tool calls ──────
         const { remainingText, toolCallBlocks } = toolCallDetector.finish();
+
+        // Flush any streaming tool calls still accumulating when stream ended
+        const flushedTCs = toolCallAccumulator.flush();
+        for (const tc of flushedTCs) {
+          const cursorName = tc.name || CURSOR_TOOL_NAMES[tc.tool] || `cursor_tool_${tc.tool}`;
+          console.log(`[streaming] Flushed incomplete streaming tool call: ${cursorName} (enum=${tc.tool}, id=${tc.toolCallId}, rawArgs=${tc.rawArgs.length} chars)`);
+          const mapped = convertNativeToolCall(tc);
+          if (mapped) nativeToolCalls.push(mapped);
+        }
 
         // Send any unsent thinking content
         if (allThinking && !firstChunkSent) {

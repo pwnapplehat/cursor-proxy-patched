@@ -92,21 +92,24 @@ function generateCursorBody(messages, modelName, tools, toolChoice) {
       // REQUIRED for Agent mode system prompt. Without these, Cursor's backend
       // generates an "Ask mode" system prompt regardless of other fields.
       // The proxy intercepts native tool calls from the response (see
-      // findNativeToolCalls) and converts them to <tool_call> XML so the
+      // findNativeToolCalls) and converts them to OpenClaw format so the
       // existing OpenAI-compatible pipeline handles them.
-      // EDIT_FILE (7) and EDIT_FILE_V2 (38) are intentionally excluded.
-      // They send file content in rawArgs which always gets truncated
-      // (proxy is unidirectional), causing 50+ request loops.
-      // Without them, the model uses run_terminal_cmd with heredoc for
-      // file writes, which works because the command string is small.
-      // If this causes "read-only mode", add them back — it means
-      // Cursor requires them for full agent mode activation.
+      //
+      // EDIT_FILE (7) and EDIT_FILE_V2 (38) are now INCLUDED.
+      // Cursor streams large tool calls across multiple frames using
+      // is_streaming (field 14) and is_last_message (field 15). The
+      // StreamingToolCallAccumulator concatenates rawArgs deltas across
+      // frames, so full file content is captured before JSON.parse.
+      // If accumulation fails, the truncation fallback (heredoc hint)
+      // remains as a safety net.
       supportedTools: [
         5,  // READ_FILE
         6,  // LIST_DIR
+        7,  // EDIT_FILE — now enabled: streaming rawArgs accumulation handles large payloads
         8,  // FILE_SEARCH
         15, // RUN_TERMINAL_COMMAND_V2
         18, // WEB_SEARCH
+        38, // EDIT_FILE_V2 — now enabled: streaming rawArgs accumulation handles large payloads
         39, // LIST_DIR_V2
         40, // READ_FILE_V2
         41, // RIPGREP_RAW_SEARCH
@@ -234,18 +237,45 @@ function pbGetInt(fields, num) {
 
 /**
  * Extract a ClientSideToolV2Call from decoded protobuf fields.
- * Returns { tool, toolCallId, name, rawArgs } or null.
+ * Returns { tool, toolCallId, name, rawArgs, isStreaming, isLastMessage } or null.
+ *
+ * Cursor streams large tool calls (e.g., EDIT_FILE_V2 with full file content)
+ * across multiple frames using is_streaming (field 14) and is_last_message (field 15).
+ * Each frame contains a DELTA of rawArgs — callers must accumulate them.
  */
 function extractToolCallFromFields(fields) {
   const tool = pbGetInt(fields, 1);          // field 1: tool enum
   const toolCallId = pbGetString(fields, 3); // field 3: tool_call_id
   const name = pbGetString(fields, 9);       // field 9: name
   const rawArgs = pbGetString(fields, 10);   // field 10: raw_args
+  const isStreaming = pbGetInt(fields, 14);   // field 14: is_streaming (bool as varint)
+  const isLastMessage = pbGetInt(fields, 15); // field 15: is_last_message (bool as varint)
 
-  // A valid tool call needs the tool enum > 0, a tool_call_id,
-  // AND at least one of name or rawArgs to reduce false positives
-  if (tool != null && tool > 0 && toolCallId && (name || rawArgs)) {
-    return { tool, toolCallId, name: name || '', rawArgs: rawArgs || '{}' };
+  // A valid tool call needs the tool enum > 0 and a tool_call_id.
+  // For streaming chunks, rawArgs may be empty (just a delta piece),
+  // so we allow toolCallId + tool as minimum for streaming calls.
+  if (tool != null && tool > 0 && toolCallId && (name || rawArgs || isStreaming || isLastMessage)) {
+    const rawLen = rawArgs ? rawArgs.length : 0;
+    const startsWithBrace = rawArgs ? rawArgs.startsWith('{') : false;
+    const endsWithBrace = rawArgs ? rawArgs.endsWith('}') : false;
+    const preview = rawLen > 200 ? rawArgs.substring(0, 100) + '...[' + rawLen + ' chars]...' + rawArgs.substring(rawLen - 80) : (rawArgs || '');
+
+    // DIAGNOSTIC: Log every tool call extraction with streaming flags and rawArgs shape
+    console.log(`[DIAG:extractTC] enum=${tool} id=${toolCallId.substring(0, 20)} name="${name || ''}" ` +
+      `isStreaming=${!!isStreaming} isLastMessage=${!!isLastMessage} ` +
+      `rawArgs.len=${rawLen} startsWithBrace=${startsWithBrace} endsWithBrace=${endsWithBrace}`);
+    if (rawLen > 0) {
+      console.log(`[DIAG:extractTC]   rawArgs.preview: ${preview.replace(/\n/g, '\\n').substring(0, 400)}`);
+    }
+
+    return {
+      tool,
+      toolCallId,
+      name: name || '',
+      rawArgs: rawArgs || '',
+      isStreaming: !!isStreaming,
+      isLastMessage: !!isLastMessage,
+    };
   }
   return null;
 }
@@ -284,9 +314,164 @@ function findNativeToolCalls(data) {
   return toolCalls;
 }
 
+// ─── Streaming Tool Call Accumulator ──────────────────────────────────────
+// Cursor streams large tool calls (e.g., EDIT_FILE_V2 writing an entire file)
+// across multiple protobuf frames. Each frame has is_streaming=true and the
+// final frame has is_last_message=true. The rawArgs in each frame is a DELTA
+// that must be concatenated to get the full JSON.
+//
+// This accumulator collects streaming chunks and emits complete tool calls.
+// Reference: TASK-26-tool-schemas.md ClientSideToolV2Call fields 14, 15.
+// ─────────────────────────────────────────────────────────────────────────
+
+class StreamingToolCallAccumulator {
+  constructor() {
+    this.pending = new Map(); // toolCallId → { tool, name, rawArgs, frameCount, frameSizes }
+  }
+
+  /**
+   * Feed a tool call extracted from a frame.
+   * @param {Object} tc - { tool, toolCallId, name, rawArgs, isStreaming, isLastMessage }
+   * @returns {Object|null} Completed tool call { tool, toolCallId, name, rawArgs } or null if still accumulating
+   */
+  feed(tc) {
+    const rawLen = tc.rawArgs ? tc.rawArgs.length : 0;
+    const startsWithBrace = tc.rawArgs ? tc.rawArgs.startsWith('{') : false;
+    const endsWithBrace = tc.rawArgs ? tc.rawArgs.endsWith('}') : false;
+    const preview = rawLen > 200 ? tc.rawArgs.substring(0, 100) + '...' + tc.rawArgs.substring(rawLen - 80) : (tc.rawArgs || '');
+
+    // Non-streaming tool call — complete in one frame
+    if (!tc.isStreaming && !tc.isLastMessage) {
+      console.log(`[DIAG:Accum] NON-STREAMING tool call: id=${tc.toolCallId.substring(0, 20)} ` +
+        `rawArgs.len=${rawLen} startsWithBrace=${startsWithBrace} endsWithBrace=${endsWithBrace}`);
+      // Ensure rawArgs has a default for backward compat
+      return { tool: tc.tool, toolCallId: tc.toolCallId, name: tc.name, rawArgs: tc.rawArgs || '{}' };
+    }
+
+    const existing = this.pending.get(tc.toolCallId);
+
+    if (existing) {
+      existing.frameCount++;
+      existing.frameSizes.push(rawLen);
+
+      // DIAGNOSTIC: Log every continuation frame — this is the KEY data for determining format
+      const prevLen = existing.rawArgs.length;
+      console.log(`[DIAG:Accum] CONTINUATION frame #${existing.frameCount} for id=${tc.toolCallId.substring(0, 20)}: ` +
+        `isStreaming=${tc.isStreaming} isLastMessage=${tc.isLastMessage} ` +
+        `thisFrame.rawArgs.len=${rawLen} accumulated.len=${prevLen} ` +
+        `thisStartsWithBrace=${startsWithBrace} thisEndsWithBrace=${endsWithBrace}`);
+      if (rawLen > 0) {
+        console.log(`[DIAG:Accum]   thisFrame.preview: ${preview.replace(/\n/g, '\\n').substring(0, 400)}`);
+      }
+
+      // Append rawArgs delta to accumulated string
+      existing.rawArgs += tc.rawArgs;
+      // Use name from later frames if earlier ones were empty
+      if (tc.name && !existing.name) existing.name = tc.name;
+
+      if (tc.isLastMessage) {
+        // Streaming complete — emit the full tool call
+        this.pending.delete(tc.toolCallId);
+        const finalLen = existing.rawArgs.length;
+        const finalStartsBrace = existing.rawArgs.startsWith('{');
+        const finalEndsBrace = existing.rawArgs.endsWith('}');
+
+        // DIAGNOSTIC: This is the CRITICAL log — shows final assembled rawArgs
+        console.log(`[DIAG:Accum] ★ COMPLETED streaming tool call: id=${tc.toolCallId.substring(0, 20)} ` +
+          `totalFrames=${existing.frameCount} frameSizes=[${existing.frameSizes.join(',')}] ` +
+          `finalRawArgs.len=${finalLen} validJSON.startsWithBrace=${finalStartsBrace} validJSON.endsWithBrace=${finalEndsBrace}`);
+
+        // Try JSON.parse to diagnose if the accumulated result is valid
+        try {
+          JSON.parse(existing.rawArgs);
+          console.log(`[DIAG:Accum] ★ JSON.parse SUCCEEDED on accumulated rawArgs (${finalLen} chars) — accumulation strategy WORKS`);
+        } catch (e) {
+          console.warn(`[DIAG:Accum] ★ JSON.parse FAILED on accumulated rawArgs (${finalLen} chars): ${e.message}`);
+          console.warn(`[DIAG:Accum] ★ first100: ${existing.rawArgs.substring(0, 100)}`);
+          console.warn(`[DIAG:Accum] ★ last100: ${existing.rawArgs.substring(finalLen - 100)}`);
+          // DIAGNOSTIC: Also try parsing just the LAST frame's rawArgs (tests "full replacement" theory)
+          if (rawLen > 0) {
+            try {
+              JSON.parse(tc.rawArgs);
+              console.warn(`[DIAG:Accum] ★★ BUT: JSON.parse of LAST FRAME ALONE succeeded — ` +
+                `FORMAT IS (b) FULL REPLACEMENTS, not deltas! Accumulation was wrong.`);
+            } catch (_) {
+              console.warn(`[DIAG:Accum] ★★ LAST FRAME ALONE also fails JSON.parse — FORMAT IS UNKNOWN (c)`);
+            }
+          }
+        }
+
+        return {
+          tool: existing.tool,
+          toolCallId: tc.toolCallId,
+          name: existing.name,
+          rawArgs: existing.rawArgs || '{}',
+        };
+      }
+      return null; // Still accumulating
+    }
+
+    // First frame for this toolCallId
+    if (tc.isLastMessage && !tc.isStreaming) {
+      console.log(`[DIAG:Accum] SINGLE-FRAME streaming tool call (isLastMessage=true, isStreaming=false): ` +
+        `id=${tc.toolCallId.substring(0, 20)} rawArgs.len=${rawLen}`);
+      // Single-frame with isLastMessage — complete
+      return { tool: tc.tool, toolCallId: tc.toolCallId, name: tc.name, rawArgs: tc.rawArgs || '{}' };
+    }
+
+    // Start accumulating — this is FRAME #1
+    this.pending.set(tc.toolCallId, {
+      tool: tc.tool,
+      name: tc.name,
+      rawArgs: tc.rawArgs,
+      frameCount: 1,
+      frameSizes: [rawLen],
+    });
+    console.log(`[DIAG:Accum] FIRST FRAME for streaming tool call: id=${tc.toolCallId.substring(0, 20)} ` +
+      `isStreaming=${tc.isStreaming} isLastMessage=${tc.isLastMessage} ` +
+      `rawArgs.len=${rawLen} startsWithBrace=${startsWithBrace} endsWithBrace=${endsWithBrace}`);
+    if (rawLen > 0) {
+      console.log(`[DIAG:Accum]   firstFrame.preview: ${preview.replace(/\n/g, '\\n').substring(0, 400)}`);
+    }
+
+    if (tc.isLastMessage) {
+      // Edge case: first AND last in same frame
+      const data = this.pending.get(tc.toolCallId);
+      this.pending.delete(tc.toolCallId);
+      console.log(`[DIAG:Accum] FIRST+LAST frame (single streamed frame): id=${tc.toolCallId.substring(0, 20)} rawArgs.len=${rawLen}`);
+      return { tool: data.tool, toolCallId: tc.toolCallId, name: data.name, rawArgs: data.rawArgs || '{}' };
+    }
+
+    return null; // Still accumulating
+  }
+
+  /**
+   * Flush any pending (incomplete) streaming tool calls.
+   * Called at end of stream — these are tool calls where streaming started but never completed.
+   * @returns {Array<Object>} Array of partially accumulated tool calls
+   */
+  flush() {
+    const results = [];
+    for (const [toolCallId, data] of this.pending) {
+      console.warn(`[DIAG:Accum] FLUSHING incomplete streaming tool call: ${toolCallId} ` +
+        `(${data.rawArgs.length} chars, ${data.frameCount} frames, frameSizes=[${data.frameSizes.join(',')}])`);
+      results.push({
+        tool: data.tool,
+        toolCallId,
+        name: data.name,
+        rawArgs: data.rawArgs || '{}',
+      });
+    }
+    this.pending.clear();
+    return results;
+  }
+}
+
 // Cursor ClientSideToolV2 enum → human-readable name (for logging / fallback)
 // These should match what the model ACTUALLY sends in tc.name field.
+// Reference: cursor_agent_client.py ClientSideToolV2, TASK-126-toolv2-params.md
 const CURSOR_TOOL_NAMES = {
+  3:  'ripgrep_search',        // legacy ripgrep (RIPGREP_RAW_SEARCH=41 is V2)
   5:  'read_file',
   6:  'list_dir',
   7:  'edit_file',
@@ -298,6 +483,7 @@ const CURSOR_TOOL_NAMES = {
   40: 'read_file_v2',
   41: 'ripgrep_raw_search',    // model sends 'ripgrep_raw_search'
   42: 'glob_file_search',
+  50: 'apply_agent_diff',      // agent-generated diff apply (OpenClaw has no direct equivalent)
 };
 
 // ─── Cursor → OpenClaw Tool/Param Mapping ─────────────────────────────
@@ -319,9 +505,12 @@ const CURSOR_TO_OPENCLAW_TOOLS = {
 // Cursor parameter names that differ from OpenClaw's
 const CURSOR_TO_OPENCLAW_PARAMS = {
   'file_path': 'path',
-  'target_file': 'path',       // Cursor's read_file/read_file_v2 uses target_file; OpenClaw read uses path
-  'target_directory': 'path',  // Cursor's list_dir_v2 uses target_directory; mapped to exec anyway but safe to have
+  'target_file': 'path',               // Cursor's read_file/read_file_v2 uses target_file; OpenClaw read uses path
+  'target_directory': 'path',           // Cursor's list_dir_v2 uses target_directory; mapped to exec anyway but safe to have
+  'directory_path': 'path',             // Cursor's list_dir uses directory_path (ListDirParams)
+  'relative_workspace_path': 'path',    // Cursor's edit_file, edit_file_v2, delete_file use this
   'contents': 'content',
+  'contents_after_edit': 'content',     // EditFileV2Params full-file replace
   'search_term': 'query',
 };
 
@@ -334,11 +523,11 @@ const SPECIAL_TOOL_CONVERSIONS = {
   // ─── Directory listing ──────────────────────────────────────────────
   'list_dir': (args) => ({
     name: 'exec',
-    arguments: { command: `ls -la ${shellEscape(args.target_directory || args.path || '.')}` },
+    arguments: { command: `ls -la ${shellEscape(args.target_directory || args.directory_path || args.path || '.')}` },
   }),
   'list_dir_v2': (args) => ({
     name: 'exec',
-    arguments: { command: `ls -la ${shellEscape(args.target_directory || args.path || '.')}` },
+    arguments: { command: `ls -la ${shellEscape(args.target_directory || args.directory_path || args.path || '.')}` },
   }),
 
   // ─── Search tools ──────────────────────────────────────────────────
@@ -367,44 +556,91 @@ const SPECIAL_TOOL_CONVERSIONS = {
   // Cursor's EDIT_FILE_V2 (enum 38) is used for BOTH write (create/overwrite)
   // and edit (old_string/new_string) operations. The model's tc.name is usually
   // 'write' for creation, but the enum fallback is 'edit_file_v2'.
-  // We detect based on which arguments are present.
+  // EditFileV2Params uses contents_after_edit for full-file replace (TASK-126).
+  // EditFileParams/EditFileV2Params use relative_workspace_path for path.
   'edit_file': (args) => {
-    if ('contents' in args || 'content' in args) {
+    const pathVal = args.file_path || args.path || args.relative_workspace_path || '';
+    if ('contents' in args || 'content' in args || 'contents_after_edit' in args) {
       return {
         name: 'write',
         arguments: {
-          path: args.file_path || args.path || '',
-          content: args.contents || args.content || '',
+          path: pathVal,
+          content: args.contents || args.content || args.contents_after_edit || '',
         },
       };
     }
     return {
       name: 'edit',
       arguments: {
-        path: args.file_path || args.path || '',
+        path: pathVal,
         oldText: args.old_string || args.oldText || args.old_text || '',
         newText: args.new_string || args.newText || args.new_text || '',
       },
     };
   },
   'edit_file_v2': (args) => {
-    if ('contents' in args || 'content' in args) {
+    const pathVal = args.file_path || args.path || args.relative_workspace_path || '';
+    if ('contents' in args || 'content' in args || 'contents_after_edit' in args) {
       return {
         name: 'write',
         arguments: {
-          path: args.file_path || args.path || '',
-          content: args.contents || args.content || '',
+          path: pathVal,
+          content: args.contents || args.content || args.contents_after_edit || '',
         },
       };
     }
     return {
       name: 'edit',
       arguments: {
-        path: args.file_path || args.path || '',
+        path: pathVal,
         oldText: args.old_string || args.oldText || args.old_text || '',
         newText: args.new_string || args.newText || args.new_text || '',
       },
     };
+  },
+  // CURSOR_TOOL_NAMES[38] = 'write', so the model often sends tc.name = 'write'
+  // for EDIT_FILE_V2 file creation. Without this entry, 'write' falls through to
+  // the standard param rename path — which works for creation (contents_after_edit → content),
+  // but would mishandle an edit (old_string/new_string wouldn't be remapped).
+  // This defensive handler ensures correct routing regardless of tc.name.
+  'write': (args) => {
+    const pathVal = args.file_path || args.path || args.relative_workspace_path || '';
+    if ('contents' in args || 'content' in args || 'contents_after_edit' in args) {
+      return {
+        name: 'write',
+        arguments: {
+          path: pathVal,
+          content: args.contents || args.content || args.contents_after_edit || '',
+        },
+      };
+    }
+    // Edge case: model sent "write" but with old_string/new_string
+    if ('old_string' in args || 'new_string' in args) {
+      return {
+        name: 'edit',
+        arguments: {
+          path: pathVal,
+          oldText: args.old_string || args.oldText || args.old_text || '',
+          newText: args.new_string || args.newText || args.new_text || '',
+        },
+      };
+    }
+    // Pure write with just path + content via standard params
+    return {
+      name: 'write',
+      arguments: {
+        path: pathVal,
+        content: args.content || args.contents || '',
+      },
+    };
+  },
+
+  // ─── Unsupported tools (no OpenClaw equivalent) ─────────────────────
+  // APPLY_AGENT_DIFF (50) applies agent-generated diffs. OpenClaw has no
+  // direct equivalent — skip and log so we don't forward unknown tool.
+  'apply_agent_diff': (args) => {
+    console.warn('[convertNativeToolCall] Skipping apply_agent_diff (enum 50) — OpenClaw has no equivalent. Use edit/write tools for file changes.');
+    return null;
   },
 };
 
@@ -428,12 +664,32 @@ const FILE_WRITE_TOOLS = new Set(['write', 'edit', 'edit_file', 'edit_file_v2', 
  */
 function convertNativeToolCall(tc) {
   const cursorName = tc.name || CURSOR_TOOL_NAMES[tc.tool] || `cursor_tool_${tc.tool}`;
+  const rawLen = tc.rawArgs ? tc.rawArgs.length : 0;
+
+  // DIAGNOSTIC: Log every call to convertNativeToolCall with rawArgs analysis
+  console.log(`[DIAG:convert] Converting tool call: cursorName="${cursorName}" enum=${tc.tool} ` +
+    `id=${tc.toolCallId ? tc.toolCallId.substring(0, 20) : 'N/A'} rawArgs.len=${rawLen} ` +
+    `startsWithBrace=${rawLen > 0 && tc.rawArgs.startsWith('{')} endsWithBrace=${rawLen > 0 && tc.rawArgs.endsWith('}')}`);
+  if (rawLen > 0 && rawLen <= 500) {
+    console.log(`[DIAG:convert]   rawArgs.full: ${tc.rawArgs.replace(/\n/g, '\\n')}`);
+  } else if (rawLen > 500) {
+    console.log(`[DIAG:convert]   rawArgs.first200: ${tc.rawArgs.substring(0, 200).replace(/\n/g, '\\n')}`);
+    console.log(`[DIAG:convert]   rawArgs.last150: ${tc.rawArgs.substring(rawLen - 150).replace(/\n/g, '\\n')}`);
+  }
 
   // 1. Validate rawArgs as JSON — truncated payloads need special handling
   let args;
   try {
     args = JSON.parse(tc.rawArgs);
-  } catch (_) {
+    console.log(`[DIAG:convert] JSON.parse SUCCEEDED — keys: [${Object.keys(args).join(', ')}]`);
+    // For file-write tools, log the payload sizes
+    if (FILE_WRITE_TOOLS.has(cursorName)) {
+      const contentLen = (args.contents_after_edit || args.content || args.contents || '').length;
+      const pathVal = args.relative_workspace_path || args.file_path || args.path || '';
+      console.log(`[DIAG:convert] FILE WRITE tool: path="${pathVal}" content.len=${contentLen}`);
+    }
+  } catch (parseErr) {
+    console.warn(`[DIAG:convert] JSON.parse FAILED: ${parseErr.message}`);
     // For file-write tools, return a hint so the model adapts quickly
     // instead of retrying the same large payload
     if (FILE_WRITE_TOOLS.has(cursorName)) {
@@ -462,7 +718,9 @@ function convertNativeToolCall(tc) {
   const specialConvert = SPECIAL_TOOL_CONVERSIONS[cursorName];
   if (specialConvert) {
     const result = specialConvert(args);
-    console.log(`[convertNativeToolCall] ${cursorName} →(special)→ ${result.name} (args: ${JSON.stringify(result.arguments).substring(0, 150)})`);
+    if (result) {
+      console.log(`[convertNativeToolCall] ${cursorName} →(special)→ ${result.name} (args: ${JSON.stringify(result.arguments).substring(0, 150)})`);
+    }
     return result;
   }
 
@@ -498,6 +756,9 @@ function chunkToUtf8String(chunk) {
   // Cross-frame deduplication: a tool call may appear in multiple protobuf
   // frames (e.g. repeated in a follow-up confirmation frame). Track by ID.
   const seenToolCallIds = new Set();
+  // Streaming tool call accumulator: Cursor may stream large tool calls
+  // (e.g., EDIT_FILE_V2 with full file content) across multiple frames.
+  const toolCallAccumulator = new StreamingToolCallAccumulator();
 
   let i = 0;
   while (i < buffer.length) {
@@ -546,12 +807,20 @@ function chunkToUtf8String(chunk) {
         // <tool_call> XML block so the existing pipeline handles it.
         const nativeCalls = findNativeToolCalls(gunzipData);
         for (const tc of nativeCalls) {
-          // Skip if we already processed this tool call in a previous frame
-          if (seenToolCallIds.has(tc.toolCallId)) continue;
-          seenToolCallIds.add(tc.toolCallId);
-          const cursorName = tc.name || CURSOR_TOOL_NAMES[tc.tool] || `cursor_tool_${tc.tool}`;
-          console.log(`[chunkToUtf8String] Intercepted native tool call: ${cursorName} (enum=${tc.tool}, id=${tc.toolCallId}, rawArgs=${tc.rawArgs.substring(0, 200)})`);
-          const mapped = convertNativeToolCall(tc);
+          // Streaming tool calls — feed through accumulator
+          let completedTc;
+          if (tc.isStreaming || tc.isLastMessage) {
+            completedTc = toolCallAccumulator.feed(tc);
+            if (!completedTc) continue; // Still accumulating
+          } else {
+            // Non-streaming — dedup and process immediately
+            if (seenToolCallIds.has(tc.toolCallId)) continue;
+            seenToolCallIds.add(tc.toolCallId);
+            completedTc = tc;
+          }
+          const cursorName = completedTc.name || CURSOR_TOOL_NAMES[completedTc.tool] || `cursor_tool_${completedTc.tool}`;
+          console.log(`[chunkToUtf8String] Intercepted native tool call: ${cursorName} (enum=${completedTc.tool}, id=${completedTc.toolCallId}, rawArgs=${(completedTc.rawArgs || '').substring(0, 200)})`);
+          const mapped = convertNativeToolCall(completedTc);
           if (mapped && mapped.truncated) {
             // Truncated file write — inject hint text AND a fallback exec tool call.
             // The exec triggers a tool result cycle through OpenClaw, giving the
@@ -592,6 +861,27 @@ function chunkToUtf8String(chunk) {
     }
 
     i += 5 + dataLength;
+  }
+
+  // Flush any incomplete streaming tool calls that were still accumulating
+  const flushedTCs = toolCallAccumulator.flush();
+  for (const tc of flushedTCs) {
+    const cursorName = tc.name || CURSOR_TOOL_NAMES[tc.tool] || `cursor_tool_${tc.tool}`;
+    console.log(`[chunkToUtf8String] Flushed incomplete streaming tool call: ${cursorName} (enum=${tc.tool}, id=${tc.toolCallId}, rawArgs=${(tc.rawArgs || '').substring(0, 200)})`);
+    const mapped = convertNativeToolCall(tc);
+    if (mapped && mapped.truncated) {
+      textOutput.push(`\n${mapped.hint}\n`);
+      const safeFilePath = (mapped.filePath || 'file').replace(/'/g, "'\\''");
+      const fallbackExec = {
+        name: 'exec',
+        arguments: {
+          command: `echo "Ready for chunked heredoc write to: ${safeFilePath}"`
+        }
+      };
+      textOutput.push(`\n<tool_call>\n${JSON.stringify(fallbackExec)}\n</tool_call>\n`);
+    } else if (mapped) {
+      textOutput.push(`\n<tool_call>\n${JSON.stringify(mapped)}\n</tool_call>\n`);
+    }
   }
 
   return {
@@ -703,12 +993,26 @@ function processSingleFrame(magic, data, seenToolCallIds) {
       const content = response?.message?.content;
       if (content !== undefined) result.text = content;
 
-      // Scan raw protobuf for native tool calls (separate from text content)
+      // Scan raw protobuf for native tool calls (separate from text content).
+      // Streaming tool calls (is_streaming=true) are NOT deduped here — they
+      // appear across multiple frames and must be accumulated by the caller
+      // using StreamingToolCallAccumulator. Only non-streaming calls are deduped.
       const nativeCalls = findNativeToolCalls(gunzipData);
+      if (nativeCalls.length > 0) {
+        console.log(`[DIAG:processFrame] Found ${nativeCalls.length} tool call(s) in frame (magic=${magic}, dataLen=${data.length})`);
+      }
       for (const tc of nativeCalls) {
-        if (!seenToolCallIds.has(tc.toolCallId)) {
+        if (tc.isStreaming || tc.isLastMessage) {
+          // Streaming chunk — always pass through for accumulation
+          console.log(`[DIAG:processFrame] STREAMING chunk passed through: id=${tc.toolCallId.substring(0, 20)} isStreaming=${tc.isStreaming} isLastMessage=${tc.isLastMessage}`);
+          result.nativeToolCalls.push(tc);
+        } else if (!seenToolCallIds.has(tc.toolCallId)) {
+          // Non-streaming complete tool call — dedup
+          console.log(`[DIAG:processFrame] NON-STREAMING tool call (new): id=${tc.toolCallId.substring(0, 20)}`);
           seenToolCallIds.add(tc.toolCallId);
           result.nativeToolCalls.push(tc);
+        } else {
+          console.log(`[DIAG:processFrame] NON-STREAMING tool call (dedup skip): id=${tc.toolCallId.substring(0, 20)}`);
         }
       }
     } else if (magic === 2 || magic === 3) {
@@ -951,6 +1255,7 @@ module.exports = {
   IncrementalFrameParser,
   processSingleFrame,
   StreamingToolCallDetector,
+  StreamingToolCallAccumulator,
   // Tool call mapping (used by v1.js to convert native → OpenClaw format)
   convertNativeToolCall,
   CURSOR_TOOL_NAMES,

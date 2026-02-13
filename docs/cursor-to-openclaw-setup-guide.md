@@ -341,17 +341,12 @@ Model availability depends on your Cursor plan. Use `cursor/<model-id>` format i
 When new fixes are pushed to the repo:
 
 ```bash
-cd /opt/cursor-proxy-patched && git pull origin master
-
-cp src/utils/utils.js /opt/cursor-proxy-utils.js
-cp src/routes/v1.js /opt/cursor-proxy-v1.js
-cp src/utils/toolEmulation.js /opt/cursor-proxy-toolEmulation.js
-cp src/proto/message.js /opt/cursor-proxy-message.js
-
-docker restart cursor-proxy
+cd /opt/cursor-proxy-patched && git pull origin master && docker restart cursor-proxy
 ```
 
-After updating the proxy, send `/reset` in Telegram to start a fresh session with the new environment context.
+That's it — one command. The proxy runs directly from `/opt/cursor-proxy-patched`, so `git pull` updates the files in-place and the container restart picks them up.
+
+After updating, send `/reset` in Telegram to start a fresh session with the new environment context.
 
 ---
 
@@ -423,6 +418,50 @@ The `__oc` gateway solves this by leveraging `exec` (which the model trusts):
 
 ---
 
+## Agent Timeout Configuration
+
+OpenClaw has a per-run timeout (`agents.defaults.timeoutSeconds`) that aborts agent runs after a specified duration. The default is **600 seconds (10 minutes)**.
+
+The proxy also has its own timeout settings (HTTP server timeouts, undici fetch timeouts) that can kill connections to Cursor's API before the response arrives.
+
+### Proxy Timeouts (already configured in the patched repo)
+
+The patched proxy disables all internal timeouts so overnight/long-running agent sessions are never interrupted:
+
+- **`v1.js`**: `undici` fetch timeouts set to `0` (unlimited) — `timeout.connect: 0`, `timeout.read: 0`, dispatcher `bodyTimeout: 0`, `headersTimeout: 0`
+- **`app.js`**: Node.js HTTP server timeouts set to `0` — `server.timeout`, `server.requestTimeout`, `server.headersTimeout`, `server.keepAliveTimeout` all disabled
+
+These are already baked into the patched repo. No action needed.
+
+### OpenClaw Agent Timeout
+
+To increase the agent run timeout (e.g., to 24 hours for long reverse engineering sessions):
+
+```bash
+docker exec openclaw bash -c '
+python3 -c "
+import json
+cfg_path = \"/home/node/.openclaw/openclaw.json\"
+with open(cfg_path) as f:
+    cfg = json.load(f)
+cfg[\"agents\"][\"defaults\"][\"timeoutSeconds\"] = 86400
+with open(cfg_path, \"w\") as f:
+    json.dump(cfg, f, indent=2)
+print(\"Done — agent timeout set to 86400s (24 hours)\")
+"'
+docker restart openclaw
+```
+
+Verify:
+
+```bash
+docker exec openclaw cat /home/node/.openclaw/openclaw.json | grep timeoutSeconds
+```
+
+> **Note:** The maximum allowed value is `86400` (24 hours) — OpenClaw's schema enforces this hard cap. Setting `0` is invalid (schema requires a positive integer). The CloudClaw dashboard default is 600 seconds (10 minutes) to prevent excessive API credit usage for other users.
+
+---
+
 ## Troubleshooting
 
 | Symptom | Fix |
@@ -434,6 +473,11 @@ The `__oc` gateway solves this by leveraging `exec` (which the model trusts):
 | `"Please update to the latest version"` | Update `cursorClientVersion` in `v1.js` to match your Cursor IDE version |
 | Tool calls truncated for large files | Expected — model retries with chunked heredoc via `exec` |
 | Agent loops on same command | Context bloat — send `/reset` in Telegram to start fresh |
+| Agent aborts after ~10 minutes | OpenClaw `timeoutSeconds` default is 600s — increase to 86400 (see Agent Timeout Configuration above) |
+| `Stream terminated early` in proxy logs | Proxy-side timeouts killing connection — ensure patched `v1.js` and `app.js` are deployed (all timeouts = 0) |
+| `ERROR_USER_ABORTED_REQUEST` in proxy logs | Expected Cursor API behavior — not an error. Cursor emits this when a tool call finishes before inline result is received. Does not break tool execution. |
+| Agent responds with "What can I help you with?" after long silence | Context bloat (400+ messages) causing model confusion — send `/reset` |
+| `scp: Connection closed` when transferring files | Use the Python HTTP server workaround (see Transferring Files section above) |
 | `sessions_spawn` returns "pairing required" | Run the device pairing steps (Step 4 above) |
 | `sessions_spawn` returns "gateway closed (1008)" | Gateway bind might be `"lan"` — change to `"loopback"` in config, restart |
 | Agent says "can't spawn sub-agents" / "tools not available" | Proxy update needed — run the Updating section, then `/reset` |
@@ -461,6 +505,9 @@ docker exec cursor-proxy ls -la /app/src/utils/utils.js /app/src/routes/v1.js /a
 # Check OpenClaw config
 docker exec openclaw cat /home/node/.openclaw/openclaw.json
 
+# Check agent timeout setting
+docker exec openclaw cat /home/node/.openclaw/openclaw.json | grep timeoutSeconds
+
 # Check device pairing status
 docker exec openclaw npx openclaw devices list
 
@@ -470,15 +517,114 @@ docker exec openclaw curl -s http://127.0.0.1:3010/v1/models | head -c 200
 
 ---
 
+## Transferring Files from Windows to the OpenClaw Container
+
+`scp` and `sftp` may fail with "Connection closed" on some DigitalOcean droplets. The workaround is to use a temporary Python HTTP server on the VM and `curl.exe` from Windows.
+
+### Step 1: Start a one-shot HTTP upload server on the VM
+
+SSH into the droplet and run:
+
+```bash
+python3 -c "
+import http.server, os
+class H(http.server.BaseHTTPRequestHandler):
+    def do_PUT(self):
+        length = int(self.headers['Content-Length'])
+        with open('/tmp/upload.bin', 'wb') as f:
+            remaining = length
+            while remaining > 0:
+                chunk = self.rfile.read(min(65536, remaining))
+                if not chunk: break
+                f.write(chunk)
+                remaining -= len(chunk)
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b'OK')
+        print(f'Received {length} bytes')
+http.server.HTTPServer(('0.0.0.0', 9999), H).handle_request()
+" &
+```
+
+This starts a one-shot HTTP PUT server on port `9999` that saves the uploaded file to `/tmp/upload.bin` and then exits automatically after receiving one file.
+
+### Step 2: Upload the file from Windows
+
+In PowerShell on your local machine:
+
+```powershell
+curl.exe -T C:\Users\csahi\Downloads\yourfile.apk http://<droplet-ip>:9999/yourfile.apk
+```
+
+You should see `OK` printed when the transfer completes. On the VM side, you'll see `Received <size> bytes`.
+
+### Step 3: Copy into the OpenClaw container
+
+Back on the VM:
+
+```bash
+# Create the target directory inside the container (if needed)
+docker exec openclaw mkdir -p /home/node/.openclaw/workspace/YourFolder/
+
+# Copy the file from VM into the container
+docker cp /tmp/upload.bin openclaw:/home/node/.openclaw/workspace/YourFolder/yourfile.apk
+
+# Verify
+docker exec openclaw ls -lh /home/node/.openclaw/workspace/YourFolder/yourfile.apk
+```
+
+### Real Example: Transferring snapchat.apk
+
+**VM (SSH session):**
+
+```bash
+python3 -c "
+import http.server, os
+class H(http.server.BaseHTTPRequestHandler):
+    def do_PUT(self):
+        length = int(self.headers['Content-Length'])
+        with open('/tmp/snapchat.apk', 'wb') as f:
+            remaining = length
+            while remaining > 0:
+                chunk = self.rfile.read(min(65536, remaining))
+                if not chunk: break
+                f.write(chunk)
+                remaining -= len(chunk)
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b'OK')
+        print(f'Received {length} bytes')
+http.server.HTTPServer(('0.0.0.0', 9999), H).handle_request()
+" &
+```
+
+**Windows (PowerShell):**
+
+```powershell
+curl.exe -T C:\Users\csahi\Downloads\snapchat.apk http://167.172.196.152:9999/snapchat.apk
+```
+
+**VM (copy into container):**
+
+```bash
+ls -lh /tmp/snapchat.apk && docker cp /tmp/snapchat.apk openclaw:/home/node/.openclaw/workspace/Snapchat/ && echo "Done"
+```
+
+> **Security note:** Port 9999 is open to the internet briefly while the server runs. The one-shot server (`handle_request()`) exits after receiving one file, so the window is small. For extra safety, restrict with `ufw allow from <your-ip> to any port 9999` beforehand and `ufw delete allow 9999` after.
+
+---
+
 ## Caveats
 
 1. **Cookie expiration** — needs periodic refresh from your PC
 2. **Rate limits** — each tool call round-trip is a separate API request; heavy use burns through limits fast
 3. **ToS violation** — your Cursor account could be banned
 4. **Tool emulation** — native Cursor tools (exec, read, write, edit, web_search) work reliably; extended OpenClaw tools work via the `__oc` gateway through `exec`
-5. **Context bloat** — long sessions with many tool calls accumulate context, increasing response times; use `/reset` periodically
+5. **Context bloat** — long sessions with many tool calls accumulate context, increasing response times (60–127s per request at 400+ messages); use `/reset` periodically
 6. **Sub-agent scope** — sub-agents spawned via `sessions_spawn` cannot spawn their own sub-agents (one level deep)
+7. **Agent timeout** — OpenClaw default is 10 minutes (600s); increase to 86400 (24h) for long-running tasks (see Agent Timeout Configuration)
+8. **File transfer** — `scp`/`sftp` may fail on some droplets; use the Python HTTP server method (see Transferring Files section)
 
 ---
 
-*Last updated: February 13, 2026. Patched repo: [github.com/pwnapplehat/cursor-proxy-patched](https://github.com/pwnapplehat/cursor-proxy-patched).*
+*Last updated: February 13, 2026 (added file transfer guide, agent timeout config, proxy timeout docs). Patched repo: [github.com/pwnapplehat/cursor-proxy-patched](https://github.com/pwnapplehat/cursor-proxy-patched).*
