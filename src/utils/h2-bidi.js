@@ -640,16 +640,24 @@ async function createBidiStream(authToken, headers, initialBody) {
       // Increase the initial window size to prevent HTTP/2 flow control stalls.
       // Default is 65535 (64KB). For bidi streaming, a larger window ensures the
       // server can send many frames without waiting for WINDOW_UPDATE from us.
+      // NOTE: This is a standard HTTP/2 SETTINGS parameter — works on all Node.js versions.
       settings: {
-        initialWindowSize: 4 * 1024 * 1024, // 4MB — generous for streaming tool calls
+        initialWindowSize: 1024 * 1024, // 1MB stream-level window
       },
-      // Also set the peer's max concurrent streams high
-      peerMaxConcurrentStreams: 100,
     });
 
-    // Increase the session-level flow control window too
-    // (initialWindowSize only sets the stream-level default)
-    session.setLocalWindowSize(16 * 1024 * 1024); // 16MB session window
+    // Try to increase the session-level flow control window if supported.
+    // setLocalWindowSize() was added in Node.js 15.3.0 — older versions don't have it.
+    if (typeof session.setLocalWindowSize === 'function') {
+      try {
+        session.setLocalWindowSize(4 * 1024 * 1024); // 4MB session window
+        console.log('[h2-bidi:FLOW] setLocalWindowSize(4MB) succeeded');
+      } catch (err) {
+        console.warn(`[h2-bidi:FLOW] setLocalWindowSize failed: ${err.message} — using defaults`);
+      }
+    } else {
+      console.log('[h2-bidi:FLOW] setLocalWindowSize not available (Node.js < 15.3) — using default session window');
+    }
 
     session.on('error', (err) => {
       console.error(`[h2-bidi] Session error: ${err.message}`);
