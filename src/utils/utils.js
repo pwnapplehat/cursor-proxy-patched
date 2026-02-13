@@ -327,6 +327,7 @@ function findNativeToolCalls(data) {
 class StreamingToolCallAccumulator {
   constructor() {
     this.pending = new Map(); // toolCallId → { tool, name, rawArgs, frameCount, frameSizes }
+    this.flushedIds = new Set(); // IDs already flushed by flushIfComplete/flush — ignore duplicates
   }
 
   /**
@@ -339,6 +340,17 @@ class StreamingToolCallAccumulator {
     const startsWithBrace = tc.rawArgs ? tc.rawArgs.startsWith('{') : false;
     const endsWithBrace = tc.rawArgs ? tc.rawArgs.endsWith('}') : false;
     const preview = rawLen > 200 ? tc.rawArgs.substring(0, 100) + '...' + tc.rawArgs.substring(rawLen - 80) : (tc.rawArgs || '');
+
+    // DUPLICATE GUARD: If this tool call was already flushed (by flushIfComplete
+    // or flush), ignore all subsequent frames for it. This prevents the
+    // isLastMessage=true frame from re-creating the same tool call as a duplicate.
+    // Root cause: Cursor sends isLastMessage=true AFTER we've already flushed and
+    // executed the tool call via flushIfComplete (the JSON was already complete).
+    if (this.flushedIds.has(tc.toolCallId)) {
+      console.log(`[DIAG:Accum] IGNORING duplicate frame for already-flushed id=${tc.toolCallId.substring(0, 20)} ` +
+        `isStreaming=${tc.isStreaming} isLastMessage=${tc.isLastMessage} rawArgs.len=${rawLen}`);
+      return null;
+    }
 
     // Non-streaming tool call — complete in one frame
     if (!tc.isStreaming && !tc.isLastMessage) {
@@ -386,6 +398,7 @@ class StreamingToolCallAccumulator {
       if (tc.isLastMessage) {
         // Streaming complete — emit the full tool call
         this.pending.delete(tc.toolCallId);
+        this.flushedIds.add(tc.toolCallId); // Prevent re-processing if more frames arrive
         const finalLen = existing.rawArgs.length;
         const finalStartsBrace = existing.rawArgs.startsWith('{');
         const finalEndsBrace = existing.rawArgs.endsWith('}');
@@ -452,6 +465,7 @@ class StreamingToolCallAccumulator {
       // Edge case: first AND last in same frame
       const data = this.pending.get(tc.toolCallId);
       this.pending.delete(tc.toolCallId);
+      this.flushedIds.add(tc.toolCallId); // Prevent re-processing
       console.log(`[DIAG:Accum] FIRST+LAST frame (single streamed frame): id=${tc.toolCallId.substring(0, 20)} rawArgs.len=${rawLen}`);
       return { tool: data.tool, toolCallId: tc.toolCallId, name: data.name, rawArgs: data.rawArgs || '{}' };
     }
@@ -493,6 +507,7 @@ class StreamingToolCallAccumulator {
           rawArgs: data.rawArgs,
         });
         this.pending.delete(toolCallId);
+        this.flushedIds.add(toolCallId); // Prevent duplicate when isLastMessage=true arrives later
       } else {
         console.log(`[DIAG:Accum] flushIfComplete: INCOMPLETE — id=${toolCallId.substring(0, 20)} ` +
           `rawArgs.len=${data.rawArgs.length} starts=${starts} ends=${ends} — keeping pending`);
@@ -520,6 +535,7 @@ class StreamingToolCallAccumulator {
         name: data.name,
         rawArgs: data.rawArgs || '{}',
       });
+      this.flushedIds.add(toolCallId); // Prevent duplicate when isLastMessage=true arrives later
     }
     this.pending.clear();
     return results;
