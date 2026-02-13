@@ -15,6 +15,7 @@ const { createBidiStream, findPendingStream, removePendingStream } = require('..
 const WRITE_TOOL_ENUMS = new Set([
   38, // EDIT_FILE_V2 (write/create file)
   7,  // EDIT_FILE (legacy edit)
+  11, // DELETE_FILE (file deletion — also a filesystem mutation)
 ]);
 
 // Filesystem error patterns that indicate a REAL write failure (not just
@@ -64,11 +65,12 @@ function detectToolResults(messages) {
 // All parsing is defensive — handles incomplete/malformed JSON gracefully.
 
 function buildProvisionalMessage(toolEnum, rawArgs) {
-  // For write-related tools, extract file_path and content size
+  // For write/delete tools, extract file_path and construct appropriate message
   if (WRITE_TOOL_ENUMS.has(toolEnum) && rawArgs) {
     try {
       // Try multiple patterns for file_path (handles both field names Cursor uses)
       const pathPatterns = [
+        /"relative_workspace_path"\s*:\s*"([^"]+)"/,
         /"file_path"\s*:\s*"([^"]+)"/,
         /"path"\s*:\s*"([^"]+)"/,
         /"filePath"\s*:\s*"([^"]+)"/,
@@ -83,12 +85,18 @@ function buildProvisionalMessage(toolEnum, rawArgs) {
       }
 
       if (filePath) {
+        // DELETE_FILE — no content to measure, just confirm deletion
+        if (toolEnum === 11) {
+          return `Successfully deleted ${filePath}`;
+        }
+
         // Estimate content length from what we have so far.
         // Try multiple content field names Cursor might use.
         const contentPatterns = [
           /"contents"\s*:\s*"/,
           /"content"\s*:\s*"/,
           /"new_contents"\s*:\s*"/,
+          /"contents_after_edit"\s*:\s*"/,
         ];
         let approxLen = 0;
         for (const pattern of contentPatterns) {

@@ -161,8 +161,19 @@ const TOOL_RESULT_FIELD_MAP = {
     //   bool file_deleted_successfully = 3;
     // BUG FIX: Was sending field 1 = true which means rejected=true (WRONG!)
     // Must send field 3 = true for file_deleted_successfully.
+    // ENHANCEMENT: Check result text for error indicators to set the right field.
     field: 20,
-    encode: (_text) => pbEncodeField(3, 0, 1), // file_deleted_successfully = true
+    encode: (text) => {
+      const t = (text || '').toLowerCase();
+      if (t.includes('no such file') || t.includes('enoent') || t.includes('not found')) {
+        return pbEncodeField(2, 0, 1); // file_non_existent = true
+      }
+      if (t.includes('permission denied') || t.includes('eacces') || t.includes('eperm') ||
+          t.includes('cannot remove') || t.includes('is a directory')) {
+        return pbEncodeField(1, 0, 1); // rejected = true
+      }
+      return pbEncodeField(3, 0, 1); // file_deleted_successfully = true
+    },
   },
   12: { // REAPPLY → ReapplyResult at field 21
     field: 21,
@@ -445,12 +456,19 @@ const TOOL_RESULT_FIELD_MAP = {
 /**
  * Encode a ToolResultError message.
  * ClientSideToolV2Result.error is field 8.
- * ToolResultError: message(1 string)
+ * ToolResultError proto (TASK-26):
+ *   string client_visible_error_message = 1;  // Shown to user
+ *   string model_visible_error_message = 2;   // Sent to LLM for context
+ * FIX: Must populate BOTH fields — field 2 is what the model sees.
+ * Previously only field 1 was set, so the model never received error details.
  * @param {string} errorMessage
  * @returns {Buffer}
  */
 function encodeToolResultError(errorMessage) {
-  const inner = pbEncodeField(1, 2, Buffer.from(errorMessage, 'utf-8'));
+  const errBuf = Buffer.from(errorMessage, 'utf-8');
+  const clientVisible = pbEncodeField(1, 2, errBuf); // field 1: user-visible
+  const modelVisible = pbEncodeField(2, 2, errBuf);  // field 2: model-visible
+  const inner = Buffer.concat([clientVisible, modelVisible]);
   return pbEncodeField(8, 2, inner); // field 8: ToolResultError
 }
 

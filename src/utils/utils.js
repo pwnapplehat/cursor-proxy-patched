@@ -31,14 +31,14 @@ function generateCursorBody(messages, modelName, tools, toolChoice) {
     .map(msg => normalizeContent(msg.content))
     .join('\n');
 
-  // Agent mode activation strategy (dual approach):
+  // Agent mode activation strategy:
   //   1. Protobuf fields: unknown27=1, supportedTools=[...], chatModeEnum=2, chatMode="Agent"
-  //      These make Cursor's backend generate an Agent-mode system prompt.
-  //   2. unknown48=1 (should_disable_tools) attempts to prevent native tool dispatch.
-  //      If it works, the model uses our text-based <tool_call> protocol.
-  //   3. Fallback: chunkToUtf8String scans response protobuf for native tool calls
-  //      (ClientSideToolV2Call) and converts them to <tool_call> XML so the
-  //      existing pipeline handles them transparently.
+  //      These make Cursor's backend generate an Agent-mode system prompt with native tools.
+  //   2. PRIMARY PATH: Bidirectional H2 streaming (h2-bidi.js) handles native tool calls
+  //      natively via protobuf. The model uses Cursor's native tools (Shell, Read, Write, etc.)
+  //      and we intercept them, convert to OpenClaw format, execute, and send results back.
+  //   3. FALLBACK: chunkToUtf8String scans response for native tool calls and converts them
+  //      to OpenClaw format. Text-based <tool_call> XML parsing also works as a second fallback.
 
   const formattedMessages = processedMessages
     .filter(msg => !isSystemRole(msg.role))
@@ -107,6 +107,7 @@ function generateCursorBody(messages, modelName, tools, toolChoice) {
         6,  // LIST_DIR
         7,  // EDIT_FILE — now enabled: streaming rawArgs accumulation handles large payloads
         8,  // FILE_SEARCH
+        11, // DELETE_FILE — maps to exec rm, common file operation
         15, // RUN_TERMINAL_COMMAND_V2
         18, // WEB_SEARCH
         38, // EDIT_FILE_V2 — now enabled: streaming rawArgs accumulation handles large payloads
@@ -561,6 +562,7 @@ const CURSOR_TOOL_NAMES = {
   6:  'list_dir',
   7:  'edit_file',
   8:  'file_search',
+  11: 'delete_file',           // DELETE_FILE — model sends 'delete_file'
   15: 'run_terminal_cmd',      // model sends 'run_terminal_cmd', not 'run_terminal_command'
   18: 'web_search',
   38: 'write',                 // model sends 'write', not 'edit_file_v2' (enum name is misleading)
@@ -636,6 +638,21 @@ const SPECIAL_TOOL_CONVERSIONS = {
     name: 'exec',
     arguments: { command: `find ${shellEscape(args.path || '.')} -name ${shellEscape(args.glob_pattern || args.pattern || '*')} 2>/dev/null` },
   }),
+
+  // ─── File delete ─────────────────────────────────────────────────────
+  // Cursor's DELETE_FILE (enum 11) uses DeleteFileParams: relative_workspace_path.
+  // Maps to exec rm since OpenClaw has no native delete_file tool.
+  'delete_file': (args) => {
+    const pathVal = args.relative_workspace_path || args.file_path || args.path || '';
+    if (!pathVal) {
+      console.warn('[convertNativeToolCall] delete_file called without a path — skipping');
+      return null;
+    }
+    return {
+      name: 'exec',
+      arguments: { command: `rm -f ${shellEscape(pathVal)}` },
+    };
+  },
 
   // ─── File edit/write (args-based detection) ─────────────────────────
   // Cursor's EDIT_FILE_V2 (enum 38) is used for BOTH write (create/overwrite)
@@ -1258,7 +1275,7 @@ const OC_ONLY_TOOLS = new Set([
   'sessions_spawn', 'session_status', 'sessions_send', 'sessions_list',
   'sessions_history', 'agents_list', 'memory_search', 'memory_get',
   'image', 'tts', 'browser', 'message', 'canvas', 'nodes', 'cron',
-  'gateway', 'process',
+  'gateway', 'process', 'web_fetch',
 ]);
 
 /**

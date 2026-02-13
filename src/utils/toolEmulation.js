@@ -1,43 +1,75 @@
 /**
- * Tool Call Emulation for Cursor-To-OpenAI Proxy
- * Converts OpenAI tool definitions into system prompt instructions,
- * and parses model text responses back into OpenAI tool_calls format.
+ * Tool Call Emulation & Environment Context for Cursor-To-OpenAI Proxy
  *
- * WHY THIS EXISTS:
- * Cursor's private API (protobuf) has NO fields for tool definitions or tool_calls.
- * The "WithTools" in StreamUnifiedChatWithToolsRequest refers to Cursor's built-in
- * web/wiki search tools, not OpenAI-style function calling.
- * This module bridges the gap by:
- *   1. Converting tool definitions → system prompt text instructions
- *   2. Parsing <tool_call> XML blocks from model text → OpenAI tool_calls format
- *   3. Converting role:"tool" messages → role:"user" with <tool_result> tags
+ * This module serves two purposes:
+ *
+ * 1. ENVIRONMENT CONTEXT (always active):
+ *    Injects runtime information into the system prompt so the model knows it's
+ *    running on Linux, has access to OpenClaw workspace/memory/skills, and can
+ *    use __oc extended tools via Shell. This complements Cursor's Agent-mode
+ *    system prompt (which describes native tools like Shell, Read, Write, etc.)
+ *    without conflicting with it.
+ *
+ * 2. TEXT-BASED TOOL CALL FALLBACK (when OpenClaw sends tool definitions):
+ *    Converts OpenAI tool definitions → system prompt text instructions, and
+ *    parses <tool_call> XML blocks from model text → OpenAI tool_calls format.
+ *    This is a fallback for when native Cursor tool calling isn't available.
+ *    The primary tool calling path uses Cursor's native bidirectional streaming
+ *    (h2-bidi.js), which handles tools natively via protobuf.
+ *
+ * Also handles:
+ *   - Converting role:"tool" messages → role:"user" with <tool_result> tags
+ *   - Auto-correcting model parameter name mistakes (validateAndFixToolArgs)
+ *   - Near-miss tool call format normalization
  */
 
 const { v4: uuidv4 } = require('uuid');
 
 // ─── Environment Context ──────────────────────────────────────────────
-// PREPENDED to the developer message so the model knows its actual runtime.
-// This overrides Cursor's Agent-mode system prompt assumptions (Windows, IDE, etc.)
-// and provides critical behavioral guidance for the proxy bridge architecture.
+// ALWAYS injected into the system/developer message so the model knows its
+// actual runtime. This complements (not conflicts with) Cursor's Agent-mode
+// system prompt. Cursor's prompt tells the model about its tools (Shell, Read,
+// Write, StrReplace, Grep, etc.). OUR context tells the model:
+//   1. Those tools execute on LINUX, not the user's local machine
+//   2. Extended OpenClaw tools exist via the __oc exec prefix
+//   3. Persistent workspace files, identity, memory, skills
+//   4. Multi-agent spawning, cron, browser automation, etc.
+// IMPORTANT: Do NOT redefine or rename native Cursor tool names here.
+// The model should use whatever tool names Cursor's system prompt provides.
 const ENVIRONMENT_CONTEXT = `
-## Your Extended Environment — OpenClaw + Cursor Proxy Bridge
-
-You are a Cursor AI assistant with an enhanced setup. Here is the complete picture of your environment so you can fully utilize everything available to you.
+## Runtime Environment — OpenClaw Proxy Bridge
 
 ### Architecture
 
-Your requests are routed through a **Cursor-to-OpenAI proxy bridge** into **OpenClaw**, an AI agent framework running on a Linux Docker container (Ubuntu 24.04). OpenClaw connects you to the user through **Telegram** (or Discord/other channels) and extends your capabilities with additional tools, persistent workspace, memory, skills, and multi-agent spawning.
+Your requests flow through a proxy bridge into **OpenClaw**, an AI agent framework running on a **Linux Docker container (Ubuntu 24.04)**. OpenClaw connects the user through **Telegram** (or Discord/other channels) and extends your capabilities with persistent workspace, memory, skills, and multi-agent spawning.
 
-Your standard tools (exec, read, write, edit, web_search) work as usual. In addition, the proxy bridge gives you access to **OpenClaw-extended tools** (sub-agent spawning, memory search, image gen, TTS, cron, browser automation, and more) by using the \`exec\` tool with a special \`__oc\` prefix. The proxy intercepts these and routes them to OpenClaw automatically — you get back real tool results, not shell output.
+**Your native tools work normally.** The proxy routes Shell, Read, Write, Delete, and all other native tools to OpenClaw, which executes them on the Linux container. Additionally, OpenClaw provides **extended tools** (sub-agent spawning, memory, image gen, TTS, cron, browser automation, and more) accessible via the Shell tool with a special \`__oc\` prefix.
 
-### Environment Details
+### CRITICAL: Your Tools Run on Linux
 
-- **OS**: Linux (Ubuntu 24.04 in Docker) — always use bash syntax, never PowerShell or Windows syntax
-- **Shell**: /bin/bash
-- **Home directory**: /home/node/.openclaw/
+All your tools execute inside a Linux Docker container, NOT on a local Windows/Mac machine:
+- **OS**: Linux (Ubuntu 24.04) — use bash syntax exclusively, NEVER PowerShell or Windows syntax
+- **Shell**: /bin/bash — all Shell/exec commands run bash
+- **Home**: /home/node/.openclaw/
 - **Workspace**: /home/node/.openclaw/workspace/
-- **Skills directory**: /home/node/.openclaw/skills/
+- **Skills**: /home/node/.openclaw/skills/
 - **Config**: /home/node/.openclaw/openclaw.json
+
+Use Linux paths (forward slashes), Linux commands (ls, rm, grep, cat, sed, etc.), and bash scripting. Do NOT use PowerShell cmdlets or Windows-style backslash paths.
+
+### Native Tool Behavior
+
+Your standard Cursor tools all operate on the Linux container filesystem:
+- **Shell** (terminal commands) → Runs bash commands on the Linux container
+- **Read** (file reading) → Reads files from the Linux filesystem
+- **Write** (file creation/overwrite) → Creates or overwrites files on the Linux filesystem
+- **StrReplace / Edit** (find-and-replace) → Edits files via string replacement on the Linux filesystem
+- **Grep** (content search) → Searches file contents via ripgrep on the Linux filesystem
+- **Glob** (file pattern search) → Finds files by glob pattern on the Linux filesystem
+- **Delete** (file deletion) → Deletes files from the Linux filesystem
+- **WebSearch** → Searches the internet (not filesystem-bound)
+
+All paths are Linux-style. Example: \`/home/node/.openclaw/workspace/project/src/main.js\`
 
 ### OpenClaw Workspace — Your Persistent Files
 
@@ -66,33 +98,26 @@ Skills are discoverable tool packages that extend your abilities:
 - To discover available skills: list the skills directories, then read SKILL.md for relevant ones
 - **ClawHub**: Skills marketplace CLI — \`clawhub search\`, \`clawhub install\`, \`clawhub update\`, \`clawhub list\`
 
-### Standard Tools (use normally)
+### OpenClaw Extended Tools (via Shell with __oc prefix)
 
-These tools map to your native tool calls and work directly:
-- **read** — Read a file. Params: \`path\` (required)
-- **write** — Write/create a file. Params: \`path\` (required), \`content\` (required)
-- **edit** — Find-and-replace edit. Params: \`path\`, \`old_string\`, \`new_string\`
-- **exec** — Run a shell command. Params: \`command\` (required), \`background\` (optional bool), \`yieldMs\` (optional int)
-- **web_search** — Search the internet. Params: \`query\` (required)
-- **web_fetch** — Fetch and read content from a URL. Params: \`url\` (required)
+These tools have no native Cursor equivalent. Invoke them through your **Shell** tool (run_terminal_cmd / exec) with a special command prefix. The proxy bridge intercepts these and routes them to OpenClaw as real tool calls — you get structured results back, not raw shell output.
 
-### OpenClaw Extended Tools (use via exec with __oc prefix)
-
-These tools have no native Cursor equivalent, so you invoke them through \`exec\` with a special command prefix. The proxy bridge intercepts these calls and converts them into real OpenClaw tool invocations — you get structured tool results back, not shell output.
-
-**Syntax**: Use exec with command: \`__oc <tool_name> <json_arguments>\`
+**Syntax**: Run a shell command with: \`__oc <tool_name> <json_arguments>\`
 
 **Example — spawn a sub-agent:**
-Use exec with command: \`__oc sessions_spawn {"task": "Build the CSS stylesheet for the landing page", "model": "cursor/gpt-4o"}\`
+Shell command: \`__oc sessions_spawn {"task": "Build the CSS stylesheet for the landing page", "model": "cursor/gpt-4o"}\`
 
 **Example — search memory:**
-Use exec with command: \`__oc memory_search {"query": "user preferences for dark mode"}\`
+Shell command: \`__oc memory_search {"query": "user preferences for dark mode"}\`
 
 **Example — list agents:**
-Use exec with command: \`__oc agents_list {}\`
+Shell command: \`__oc agents_list {}\`
+
+**Example — fetch a webpage:**
+Shell command: \`__oc web_fetch {"url": "https://example.com/docs"}\`
 
 **Example — schedule a cron job:**
-Use exec with command: \`__oc cron {"action": "create", "job": {"schedule": "0 9 * * 1", "task": "Weekly status report"}}\`
+Shell command: \`__oc cron {"action": "create", "job": {"schedule": "0 9 * * 1", "task": "Weekly status report"}}\`
 
 Here is every extended tool available via \`__oc\`:
 
@@ -106,6 +131,9 @@ Here is every extended tool available via \`__oc\`:
 - **agents_list** — List all available agents. No params (use \`{}\`).
 
 Note: Sub-agents cannot spawn their own sub-agents (one level deep). Use sessions_spawn for parallelizable work — e.g., have one sub-agent build HTML while another builds CSS.
+
+**Web:**
+- **web_fetch** — Fetch and read content from a URL. Params: \`url\` (required). Returns the page content in a readable format.
 
 **Memory (Persistent):**
 - **memory_search** — Semantic vector search over MEMORY.md and memory/*.md files. Params: \`query\` (required), \`maxResults\` (optional), \`minScore\` (optional)
@@ -137,41 +165,33 @@ Note: Sub-agents cannot spawn their own sub-agents (one level deep). Use session
   Params: \`action\` (required), plus action-specific params.
   Valid actions: \`"restart"\`, \`"config.get"\`, \`"config.schema"\`, \`"config.apply"\`, \`"config.patch"\`, \`"update.run"\`
   Key params: \`raw\` (JSON string for config.apply/config.patch), \`delayMs\`/\`reason\` (for restart), \`sessionKey\`/\`note\` (for audit)
-- **process** — List and manage background/running processes. Use \`__oc process {}\` to list.
+- **process** — List and manage background/running processes. Shell command: \`__oc process {}\`
 
 ### Writing Large Files
 
-The write tool silently truncates content larger than ~2KB due to streaming limits. For large files, use chunked heredoc via exec:
+The native Write tool handles most files reliably. For very large files (hundreds of lines), if the write gets truncated, use chunked heredoc via Shell:
 1. Compose the complete file mentally, split into fewest possible chunks
-2. First chunk (creates): exec \`cat << 'CHUNK1' > /path/file.ext\\n...content...\\nCHUNK1\`
-3. Next chunks (append): exec \`cat << 'CHUNK2' >> /path/file.ext\\n...content...\\nCHUNK2\`
+2. First chunk (creates): \`cat << 'CHUNK1' > /path/file.ext\` followed by content and \`CHUNK1\`
+3. Next chunks (append): \`cat << 'CHUNK2' >> /path/file.ext\` followed by content and \`CHUNK2\`
 4. If a chunk fails/truncates, retry with fewer lines automatically — do not stop or ask
 5. Each chunk = one tool call, wait for result before sending next
-
-Small files (<30 lines) work fine with the write tool directly.
 
 ### Heartbeats vs Cron
 
 - **Heartbeats**: Periodic check-ins from OpenClaw. Read HEARTBEAT.md, do useful background work (check emails, calendar, etc.), reply HEARTBEAT_OK if nothing needs attention.
-- **Cron**: Use for exact timing ("9 AM every Monday"), isolated tasks, or reminders. Cron jobs run in their own sessions. Use \`__oc cron {"action": "list"}\` to see existing jobs.
+- **Cron**: Use for exact timing ("9 AM every Monday"), isolated tasks, or reminders. Cron jobs run in their own sessions. Shell command: \`__oc cron {"action": "list"}\` to see existing jobs.
 
 `;
 
 const TOOL_CALL_INSTRUCTION = `
 
-## IMPORTANT: Tool Calling Override
+## Additional OpenClaw Tools
 
-You MUST use ONLY the <tool_call> XML protocol below for ALL tool invocations.
-Do NOT use Cursor's native tool calling mechanism. Do NOT use function calling.
-The ONLY way to execute a tool is by outputting a <tool_call> XML block as shown below.
-If you try any other method, it will silently fail. Use <tool_call> tags exclusively.
+In addition to your native Cursor tools (Shell, Read, Write, StrReplace, Grep, etc.), you also have access to the OpenClaw tools listed below. These are callable via the \`<tool_call>\` XML protocol.
 
-## Tool Calling Protocol
+**When to use this protocol**: If you need to call a tool listed below and it is NOT available as a native Cursor tool, use the \`<tool_call>\` format. For tools that ARE available natively (Shell, Read, Write, etc.), prefer using the native tool call mechanism — it is faster and more reliable.
 
-You have access to executable tools listed below. Use them whenever the user requests any action.
-Call tools directly using the XML protocol below — do NOT describe what you "would" do.
-
-### Format
+### <tool_call> Format
 
 <tool_call>
 {"name": "tool_name", "arguments": {"param1": "value1"}}
@@ -179,23 +199,14 @@ Call tools directly using the XML protocol below — do NOT describe what you "w
 
 ### Rules
 
-1. **Output the raw <tool_call> block.** Never describe, narrate, or explain what tool you "would" call. CALL IT.
-2. The JSON inside <tool_call> tags MUST be valid JSON with double-quoted keys and string values.
-3. "name" MUST exactly match an available tool name below. Case-sensitive.
-4. "arguments" MUST be a JSON object matching the tool's parameter schema. All required parameters must be present.
-5. String values containing special characters MUST be JSON-escaped: use \\" for quotes, \\\\ for backslashes, \\n for newlines.
-6. Do NOT wrap <tool_call> blocks inside markdown code fences. The tags ARE the delimiters.
-7. Do NOT prefix tool calls with explanatory text. If you need a tool, output the <tool_call> block first. Explain AFTER you receive the result.
-8. For multiple tool calls, output multiple separate <tool_call> blocks — one per tool invocation.
-9. When a <tool_result> comes back and you need another tool, call it immediately. Do not summarize intermediate results unless asked.
-10. If a tool call fails, retry or try an alternative approach.
-11. Before calling a tool, CHECK its parameter schema below. Use the EXACT parameter names listed.
-
-### Example
-
-<tool_call>
-{"name": "exec", "arguments": {"command": "ls -la"}}
-</tool_call>
+1. The JSON inside <tool_call> tags MUST be valid JSON with double-quoted keys and string values.
+2. "name" MUST exactly match an available tool name below. Case-sensitive.
+3. "arguments" MUST be a JSON object matching the tool's parameter schema. All required parameters must be present.
+4. String values containing special characters MUST be JSON-escaped: use \\" for quotes, \\\\ for backslashes, \\n for newlines.
+5. Do NOT wrap <tool_call> blocks inside markdown code fences. The tags ARE the delimiters.
+6. For multiple tool calls, output multiple separate <tool_call> blocks — one per tool invocation.
+7. When a <tool_result> comes back and you need another tool, call it immediately. Do not summarize intermediate results unless asked.
+8. If a tool call fails, retry or try an alternative approach.
 
 ### Available tools:
 `;
@@ -238,28 +249,31 @@ function formatToolDefinitions(tools, toolChoice) {
     }
   }
 
-  // Closing reinforcement — models pay extra attention to start and end of instructions
-  result += `\n---\nEND OF TOOL DEFINITIONS. Remember: output <tool_call> blocks directly, never describe what you would do.\n`;
+  // Closing reinforcement
+  result += `\n---\nEND OF ADDITIONAL TOOL DEFINITIONS. Use native Cursor tools when available; use <tool_call> for tools listed above that have no native equivalent.\n`;
 
   return result;
 }
 
 /**
- * Injects environment context and tool definitions into the system/developer message.
- * OpenClaw uses "developer" role (newer OpenAI API format) instead of "system".
- * If neither exists, creates a new system message.
+ * Injects environment context and (optionally) tool definitions into the
+ * system/developer message. OpenClaw uses "developer" role (newer OpenAI API
+ * format) instead of "system".
  *
  * Layout of the injected content:
- *   [ENVIRONMENT_CONTEXT]   ← prepended: runtime info, chunked write strategy, agent tools
+ *   [ENVIRONMENT_CONTEXT]   ← ALWAYS prepended: Linux env, workspace, __oc tools
  *   [original developer msg] ← OpenClaw's identity/persona instructions
- *   [TOOL_CALL_INSTRUCTION] ← appended: protocol + all 23 tool definitions
+ *   [TOOL_CALL_INSTRUCTION] ← ONLY if OpenClaw sent tool definitions (fallback protocol)
  *
- * The environment context appears FIRST so the model reads it before Cursor's
- * Agent-mode system prompt can override its understanding of the runtime.
+ * CRITICAL: ENVIRONMENT_CONTEXT is ALWAYS injected, even when no tools are
+ * provided. Without it, the model doesn't know it's running on Linux, has no
+ * awareness of the OpenClaw workspace, and can't use __oc extended tools.
+ * The tool call instruction is only needed when OpenClaw sends its own tool
+ * definitions (as a fallback protocol alongside Cursor's native tools).
  */
 function injectToolsIntoMessages(messages, tools, toolChoice) {
-  if (!tools || tools.length === 0) return messages;
-  const toolText = formatToolDefinitions(tools, toolChoice);
+  // Tool definitions are optional — environment context is always needed
+  const toolText = (tools && tools.length > 0) ? formatToolDefinitions(tools, toolChoice) : '';
   const newMessages = [...messages];
   // Look for "developer" first (OpenClaw's format), then "system" as fallback
   let targetIdx = newMessages.findIndex(m => m.role === 'developer');
@@ -273,9 +287,11 @@ function injectToolsIntoMessages(messages, tools, toolChoice) {
       content: ENVIRONMENT_CONTEXT + newMessages[targetIdx].content + toolText
     };
   } else {
+    // No system/developer message found — create one with environment context
+    const combined = (ENVIRONMENT_CONTEXT.trim() + (toolText ? '\n' + toolText.trim() : '')).trim();
     newMessages.unshift({
       role: 'system',
-      content: ENVIRONMENT_CONTEXT.trim() + '\n' + toolText.trim()
+      content: combined
     });
   }
   return newMessages;
