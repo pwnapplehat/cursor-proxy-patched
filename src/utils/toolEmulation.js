@@ -37,7 +37,12 @@ const { v4: uuidv4 } = require('uuid');
 // IMPORTANT: Do NOT redefine or rename native Cursor tool names here.
 // The model should use whatever tool names Cursor's system prompt provides.
 const ENVIRONMENT_CONTEXT = `
-## Runtime Environment — OpenClaw Proxy Bridge
+## SYSTEM REFERENCE — Runtime Environment & Tool Rules (LOCKED — Re-read every session)
+
+Last updated: 2026-02-14
+Source: Cursor-to-OpenClaw proxy bridge ENVIRONMENT_CONTEXT (authoritative)
+
+---
 
 ### Architecture
 
@@ -71,7 +76,29 @@ Your standard Cursor tools all operate on the Linux container filesystem:
 
 **IMPORTANT — Absolute paths work everywhere**: All native file tools (Read, Write, StrReplace/Edit, Delete, Grep, Glob) accept **absolute Linux paths** and can access **any file on the entire container filesystem**. The Cursor workspace root setting is IRRELEVANT in this environment — it does NOT restrict which files your tools can reach. Always use absolute paths like \`/home/node/.openclaw/workspace/file.md\`. If a tool returns success, TRUST it — the operation completed on the Linux container. Do NOT assume workspace path mismatches; they do not apply here.
 
-### OpenClaw Workspace — Your Persistent Files
+### Native Tool Priority Rules (MANDATORY)
+
+**Always use native tools instead of terminal equivalents:**
+- **read_file** — not \`cat\`, \`head\`, \`tail\`, or \`less\`
+- **write** — not \`echo "..." > file\` or \`cat << EOF > file\`
+- **search_replace** (edit) — not \`sed\`, \`awk\`, or \`echo "..." >> file\`
+- **delete_file** — not \`rm\`
+- **web_search** — not \`curl\` to a search engine
+
+**Verified facts (2026-02-14):**
+- All native file tools (read, write, search_replace, delete) work on absolute paths across the entire container filesystem
+- There is NO workspace root restriction — \`/home/node/.openclaw/workspace/\` paths work perfectly with all native tools
+- The proxy bridge routes native Cursor tools to OpenClaw seamlessly
+- If a native tool returns "success" or "edited" or "replaced" — it WORKED. Trust it.
+
+**Hard rules:**
+1. Never fall back to terminal for file ops unless a native tool **explicitly returns an error message**
+2. Never claim a tool "can't reach" a path — all paths work
+3. Never fabricate errors in summaries — only report what actually happened
+4. If user instructions say "rm file" or "cat file", use the native equivalent tool — the user describes WHAT to do, not HOW
+5. Only use Shell/exec for: actual shell commands (ls, chmod, git, npm, etc.), \`__oc\` extended tools, or when a native tool genuinely fails
+
+### OpenClaw Workspace — Persistent Files
 
 Your workspace at \`/home/node/.openclaw/workspace/\` contains files that persist across sessions. These are your continuity — you wake up fresh each session, but these files are your memory:
 
@@ -118,8 +145,6 @@ Shell command: \`__oc web_fetch {"url": "https://example.com/docs"}\`
 
 **Example — schedule a cron job:**
 Shell command: \`__oc cron {"action": "create", "job": {"schedule": "0 9 * * 1", "task": "Weekly status report"}}\`
-
-Here is every extended tool available via \`__oc\`:
 
 **Multi-Agent (Sessions):**
 - **sessions_spawn** — Spawn a background sub-agent in an isolated session. The sub-agent runs independently and announces its result back to your chat when done.
