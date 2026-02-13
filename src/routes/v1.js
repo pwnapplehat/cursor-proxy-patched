@@ -554,6 +554,41 @@ async function streamBidiResponse(bidiState, res, model, responseId, hasTools, t
       finalize();
     }
 
+    // DYNAMIC safety timeout: resets on every frame so large files that stream
+    // for minutes (or even hours) are never killed. Only fires after 5 minutes
+    // of ZERO activity (no frames at all), which means the stream is truly dead.
+    // This replaces the old fixed 5-minute timer that would kill long-running
+    // streaming responses regardless of whether data was still flowing.
+    //
+    // IMPORTANT: Must be declared BEFORE attaching listeners / processing
+    // buffered frames, because onFrame() calls resetSafetyTimeout().
+    const SAFETY_TIMEOUT_MS = 5 * 60 * 1000;
+    let safetyTimeout = setTimeout(() => {
+      console.warn('[h2-bidi] Safety timeout (5 min no frames) — finalizing response');
+      finalize();
+    }, SAFETY_TIMEOUT_MS);
+
+    function resetSafetyTimeout() {
+      clearTimeout(safetyTimeout);
+      safetyTimeout = setTimeout(() => {
+        console.warn('[h2-bidi] Safety timeout (5 min no frames) — finalizing response');
+        finalize();
+      }, SAFETY_TIMEOUT_MS);
+    }
+
+    // Override finalize to clear all timers (must be before any code that
+    // might call finalize, including buffered frame processing below).
+    const originalFinalize = finalize;
+    let finalized = false;
+    // eslint-disable-next-line no-func-assign
+    finalize = function() {
+      if (finalized) return;
+      finalized = true;
+      clearTimeout(safetyTimeout);
+      if (turnTimer) clearTimeout(turnTimer);
+      originalFinalize();
+    };
+
     // Attach listeners
     bidiState.on('frame', onFrame);
     bidiState.on('end', onEnd);
@@ -579,37 +614,6 @@ async function streamBidiResponse(bidiState, res, model, responseId, hasTools, t
     if (nativeToolCalls.length > 0) {
       resetTurnTimer();
     }
-
-    // DYNAMIC safety timeout: resets on every frame so large files that stream
-    // for minutes (or even hours) are never killed. Only fires after 5 minutes
-    // of ZERO activity (no frames at all), which means the stream is truly dead.
-    // This replaces the old fixed 5-minute timer that would kill long-running
-    // streaming responses regardless of whether data was still flowing.
-    const SAFETY_TIMEOUT_MS = 5 * 60 * 1000;
-    let safetyTimeout = setTimeout(() => {
-      console.warn('[h2-bidi] Safety timeout (5 min no frames) — finalizing response');
-      finalize();
-    }, SAFETY_TIMEOUT_MS);
-
-    function resetSafetyTimeout() {
-      clearTimeout(safetyTimeout);
-      safetyTimeout = setTimeout(() => {
-        console.warn('[h2-bidi] Safety timeout (5 min no frames) — finalizing response');
-        finalize();
-      }, SAFETY_TIMEOUT_MS);
-    }
-
-    // Override finalize to clear all timers
-    const originalFinalize = finalize;
-    let finalized = false;
-    // eslint-disable-next-line no-func-assign
-    finalize = function() {
-      if (finalized) return;
-      finalized = true;
-      clearTimeout(safetyTimeout);
-      if (turnTimer) clearTimeout(turnTimer);
-      originalFinalize();
-    };
   });
 }
 

@@ -660,7 +660,7 @@ const SPECIAL_TOOL_CONVERSIONS = {
   // Cursor's DELETE_FILE (enum 11) uses DeleteFileParams: relative_workspace_path.
   // Maps to exec rm since OpenClaw has no native delete_file tool.
   'delete_file': (args) => {
-    const pathVal = args.relative_workspace_path || args.file_path || args.path || '';
+    const pathVal = args.target_file || args.relative_workspace_path || args.file_path || args.path || '';
     if (!pathVal) {
       console.warn('[convertNativeToolCall] delete_file called without a path — skipping');
       return null;
