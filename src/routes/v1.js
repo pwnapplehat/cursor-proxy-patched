@@ -95,6 +95,7 @@ async function streamBidiResponse(bidiState, res, model, responseId, hasTools, t
     // This timer fires 1.5 seconds after the last frame. If we've detected
     // tool calls, that means Cursor is done with its turn → finalize now.
     let turnTimer = null;
+    let nudgeCount = 0;
     const TURN_INACTIVITY_MS = 1500;
 
     function resetTurnTimer() {
@@ -124,9 +125,48 @@ async function streamBidiResponse(bidiState, res, model, responseId, hasTools, t
           console.log(`[h2-bidi] Turn inactivity (${TURN_INACTIVITY_MS}ms) — ${nativeToolCalls.length} tool call(s) detected, finalizing turn`);
           finalize();
         } else if (toolCallAccumulator.hasPending()) {
-          // Still have incomplete streaming calls — model is probably still
-          // generating tokens. Re-check after another inactivity interval.
-          console.log(`[h2-bidi] Turn inactivity — incomplete streaming tool call(s) still pending, waiting for more frames...`);
+          // Streaming tool call(s) with incomplete JSON are pending.
+          //
+          // ROOT CAUSE INVESTIGATION: Cursor's server appears to pause sending
+          // streaming frames after the initial batch. It only resumes when the
+          // client sends something on the bidi stream. In the real Cursor IDE,
+          // this happens naturally. In our proxy, nothing is sent until the tool
+          // is executed and the result returned.
+          //
+          // DIAGNOSTIC: Nudge the H2 session with a PING + stream.resume() to
+          // test if that triggers Cursor to send more frames.
+          nudgeCount++;
+          console.log(`[h2-bidi] Turn inactivity — incomplete streaming call(s) pending, nudge #${nudgeCount}`);
+
+          if (nudgeCount <= 3) {
+            // Phase 1: H2-level nudge (PING + resume) — tests if flow control is the blocker
+            bidiState.nudgeStream();
+          } else if (nudgeCount === 4) {
+            // Phase 2: Application-level nudge — send an empty ConnectRPC envelope
+            // to test if Cursor's server needs a client-side message to resume streaming.
+            // An empty envelope (5 zero bytes) is a valid ConnectRPC frame with 0-length payload.
+            console.log(`[h2-bidi:NUDGE] Phase 2 — sending EMPTY ConnectRPC envelope to trigger server flush`);
+            try {
+              const emptyEnvelope = Buffer.alloc(5); // flags=0, length=0
+              bidiState.stream.write(emptyEnvelope);
+              console.log(`[h2-bidi:NUDGE] Empty envelope sent (5 bytes)`);
+            } catch (err) {
+              console.error(`[h2-bidi:NUDGE] Failed to send empty envelope: ${err.message}`);
+            }
+          } else if (nudgeCount >= 7) {
+            // Phase 3: After ~10.5s of waiting, Cursor is NOT going to send more frames.
+            // This confirms the server-side pause is not fixable via H2/ping nudges.
+            // Force-flush the incomplete streaming call so the agent can proceed.
+            console.warn(`[h2-bidi:NUDGE] Phase 3 — ${nudgeCount} nudges failed, force-flushing incomplete streaming call(s)`);
+            const forceFlushed = toolCallAccumulator.flush();
+            for (const tc of forceFlushed) {
+              handleCompletedToolCall(tc);
+            }
+            if (nativeToolCalls.length > 0) {
+              finalize();
+              return;
+            }
+          }
           resetTurnTimer();
         }
       }, TURN_INACTIVITY_MS);

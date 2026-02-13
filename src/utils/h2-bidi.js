@@ -429,13 +429,21 @@ class BidiStreamState extends EventEmitter {
     this.pendingToolCalls = new Map(); // proxyCallId → { cursorToolCallId, toolEnum }
     this._waitingForToolResult = false;
 
-    // Wire up data events
+    // Wire up data events — log every raw chunk to diagnose streaming stalls
+    this._lastDataTime = Date.now();
+    this._dataChunkCount = 0;
     this.stream.on('data', (chunk) => {
+      const now = Date.now();
+      const gap = now - this._lastDataTime;
+      this._dataChunkCount++;
+      console.log(`[h2-bidi:RAW] data chunk #${this._dataChunkCount}: ${chunk.length} bytes (gap=${gap}ms, buffer=${this.responseBuffer.length})`);
+      this._lastDataTime = now;
       this.responseBuffer = Buffer.concat([this.responseBuffer, chunk]);
       this._parseFrames();
     });
 
     this.stream.on('end', () => {
+      console.log(`[h2-bidi:RAW] stream END received (total data chunks: ${this._dataChunkCount})`);
       this.ended = true;
       this.emit('end');
     });
@@ -445,6 +453,17 @@ class BidiStreamState extends EventEmitter {
       this.ended = true;
       this.emit('error', err);
     });
+
+    // Diagnose HTTP/2 flow control issues
+    this.stream.on('pause', () => {
+      console.warn(`[h2-bidi:FLOW] ⚠ stream PAUSED — possible flow control stall!`);
+    });
+    this.stream.on('resume', () => {
+      console.log(`[h2-bidi:FLOW] stream RESUMED`);
+    });
+
+    // Check if the stream is flowing or paused
+    console.log(`[h2-bidi:FLOW] stream readableFlowing=${this.stream.readableFlowing} readableHighWaterMark=${this.stream.readableHighWaterMark}`);
   }
 
   /**
@@ -510,13 +529,19 @@ class BidiStreamState extends EventEmitter {
    * Emits 'frame' events for each complete frame.
    */
   _parseFrames() {
+    let framesInBatch = 0;
     while (this.responseBuffer.length >= 5) {
       const flags = this.responseBuffer[0];
       const length = this.responseBuffer.readUInt32BE(1);
-      if (this.responseBuffer.length < 5 + length) break;
+      if (this.responseBuffer.length < 5 + length) {
+        // Partial frame — we have the header but not enough payload
+        console.log(`[h2-bidi:PARSE] Partial frame in buffer: have ${this.responseBuffer.length} bytes, need ${5 + length} (header says ${length} byte payload)`);
+        break;
+      }
 
       const payload = this.responseBuffer.subarray(5, 5 + length);
       this.responseBuffer = this.responseBuffer.subarray(5 + length);
+      framesInBatch++;
 
       const magic = flags; // 0=raw protobuf, 1=gzipped, 2=json metadata, 3=gzipped json
 
@@ -526,6 +551,59 @@ class BidiStreamState extends EventEmitter {
       } else {
         this.emit('frame', { magic, data: Buffer.from(payload) });
       }
+    }
+    if (framesInBatch > 0) {
+      console.log(`[h2-bidi:PARSE] Parsed ${framesInBatch} frame(s), remaining buffer: ${this.responseBuffer.length} bytes`);
+    }
+  }
+
+  /**
+   * Nudge the H2 session to diagnose if Cursor's server resumes streaming
+   * after receiving client-side activity. This is NOT a workaround — it's
+   * a diagnostic mechanism to test the hypothesis that Cursor's server
+   * pauses sending streaming frames until the client sends something.
+   *
+   * Hypothesis: Cursor's server flushes its write buffer only in response
+   * to incoming client messages. This PING tests if H2-level activity
+   * (not application-level) is sufficient to trigger a resume.
+   *
+   * @returns {boolean} true if ping was sent successfully
+   */
+  nudgeStream() {
+    if (this.ended || !this.session || this.session.destroyed) {
+      console.log(`[h2-bidi:NUDGE] Cannot nudge — session already ended`);
+      return false;
+    }
+
+    const streamState = this.stream ? {
+      destroyed: this.stream.destroyed,
+      readable: this.stream.readable,
+      readableFlowing: this.stream.readableFlowing,
+      readableLength: this.stream.readableLength,
+    } : 'no stream';
+    console.log(`[h2-bidi:NUDGE] Stream state: ${JSON.stringify(streamState)}`);
+
+    // Force resume in case the stream was auto-paused
+    if (this.stream && !this.stream.destroyed && !this.stream.readableFlowing) {
+      console.warn(`[h2-bidi:NUDGE] ⚠ Stream was NOT flowing! Calling resume()...`);
+      this.stream.resume();
+    }
+
+    // Send an HTTP/2 PING to keep the connection alive and potentially
+    // trigger the server to flush any buffered outgoing data
+    try {
+      this.session.ping((err, duration) => {
+        if (err) {
+          console.error(`[h2-bidi:NUDGE] PING failed: ${err.message}`);
+        } else {
+          console.log(`[h2-bidi:NUDGE] PING response received in ${duration}ms — server is alive`);
+        }
+      });
+      console.log(`[h2-bidi:NUDGE] PING sent to keep H2 session active`);
+      return true;
+    } catch (err) {
+      console.error(`[h2-bidi:NUDGE] Failed to send PING: ${err.message}`);
+      return false;
     }
   }
 
@@ -559,8 +637,19 @@ class BidiStreamState extends EventEmitter {
 async function createBidiStream(authToken, headers, initialBody) {
   return new Promise((resolve, reject) => {
     const session = http2.connect('https://api2.cursor.sh', {
-      // Node.js http2 handles TLS and ALPN negotiation automatically
+      // Increase the initial window size to prevent HTTP/2 flow control stalls.
+      // Default is 65535 (64KB). For bidi streaming, a larger window ensures the
+      // server can send many frames without waiting for WINDOW_UPDATE from us.
+      settings: {
+        initialWindowSize: 4 * 1024 * 1024, // 4MB — generous for streaming tool calls
+      },
+      // Also set the peer's max concurrent streams high
+      peerMaxConcurrentStreams: 100,
     });
+
+    // Increase the session-level flow control window too
+    // (initialWindowSize only sets the stream-level default)
+    session.setLocalWindowSize(16 * 1024 * 1024); // 16MB session window
 
     session.on('error', (err) => {
       console.error(`[h2-bidi] Session error: ${err.message}`);
@@ -575,6 +664,11 @@ async function createBidiStream(authToken, headers, initialBody) {
 
     session.on('connect', () => {
       clearTimeout(connectTimeout);
+
+      // Log negotiated settings to diagnose flow control
+      const localSettings = session.localSettings;
+      const remoteSettings = session.remoteSettings;
+      console.log(`[h2-bidi:FLOW] H2 connected — local initialWindowSize=${localSettings.initialWindowSize} remote initialWindowSize=${remoteSettings.initialWindowSize}`);
 
       const stream = session.request({
         // Pseudo-headers (Node.js http2 auto-sets :authority and :scheme)
