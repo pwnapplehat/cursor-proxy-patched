@@ -469,8 +469,41 @@ class StreamingToolCallAccumulator {
   }
 
   /**
+   * Flush only pending streaming tool calls that have complete-looking JSON
+   * (rawArgs starts with '{' and ends with '}'). Incomplete entries stay
+   * pending so the turn timer can re-check after more frames arrive.
+   *
+   * This prevents premature flushing when the model is still generating
+   * tokens and there's a >1.5s gap between streaming frames.
+   * @returns {Array<Object>} Array of completed tool calls
+   */
+  flushIfComplete() {
+    const results = [];
+    for (const [toolCallId, data] of this.pending) {
+      const starts = data.rawArgs.startsWith('{');
+      const ends = data.rawArgs.endsWith('}');
+      if (starts && ends) {
+        // Looks like complete JSON — flush this one
+        console.log(`[DIAG:Accum] flushIfComplete: COMPLETE — id=${toolCallId.substring(0, 20)} ` +
+          `rawArgs.len=${data.rawArgs.length} frames=${data.frameCount}`);
+        results.push({
+          tool: data.tool,
+          toolCallId,
+          name: data.name,
+          rawArgs: data.rawArgs,
+        });
+        this.pending.delete(toolCallId);
+      } else {
+        console.log(`[DIAG:Accum] flushIfComplete: INCOMPLETE — id=${toolCallId.substring(0, 20)} ` +
+          `rawArgs.len=${data.rawArgs.length} starts=${starts} ends=${ends} — keeping pending`);
+      }
+    }
+    return results;
+  }
+
+  /**
    * Flush any pending (incomplete) streaming tool calls.
-   * Called at end of stream or on turn inactivity — these are tool calls
+   * Called at end of stream or safety timeout — these are tool calls
    * where streaming started but isLastMessage=true never arrived.
    * With full-replacement format, the stored rawArgs IS the latest
    * complete state, so this produces valid results.

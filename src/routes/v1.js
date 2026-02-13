@@ -105,19 +105,29 @@ async function streamBidiResponse(bidiState, res, model, responseId, hasTools, t
         // Check for pending streaming tool calls that never got isLastMessage=true.
         // Cursor sends EDIT_FILE_V2 (write) as full-replacement streaming frames
         // and never sends isLastMessage=true — the stream just goes quiet.
-        // When the turn timer fires, flush them as completed.
+        //
+        // IMPORTANT: Only flush streaming calls with COMPLETE JSON (ends with '}').
+        // The model may take >1.5s between streaming frames while still generating
+        // tokens. Flushing incomplete JSON causes truncation fallbacks.
         const hasPendingStreaming = toolCallAccumulator.hasPending();
         if (hasPendingStreaming) {
-          console.log(`[h2-bidi] Turn inactivity (${TURN_INACTIVITY_MS}ms) — flushing ${toolCallAccumulator.pending.size} pending streaming tool call(s)`);
-          const flushed = toolCallAccumulator.flush();
-          for (const tc of flushed) {
-            handleCompletedToolCall(tc);
+          const completeFlushed = toolCallAccumulator.flushIfComplete();
+          if (completeFlushed.length > 0) {
+            console.log(`[h2-bidi] Turn inactivity (${TURN_INACTIVITY_MS}ms) — flushing ${completeFlushed.length} complete streaming tool call(s)`);
+            for (const tc of completeFlushed) {
+              handleCompletedToolCall(tc);
+            }
           }
         }
 
         if (nativeToolCalls.length > 0) {
           console.log(`[h2-bidi] Turn inactivity (${TURN_INACTIVITY_MS}ms) — ${nativeToolCalls.length} tool call(s) detected, finalizing turn`);
           finalize();
+        } else if (toolCallAccumulator.hasPending()) {
+          // Still have incomplete streaming calls — model is probably still
+          // generating tokens. Re-check after another inactivity interval.
+          console.log(`[h2-bidi] Turn inactivity — incomplete streaming tool call(s) still pending, waiting for more frames...`);
+          resetTurnTimer();
         }
       }, TURN_INACTIVITY_MS);
     }
