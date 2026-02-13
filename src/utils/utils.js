@@ -520,6 +520,26 @@ class StreamingToolCallAccumulator {
           continue;
         }
 
+        // Safety: for write tools with only 1 frame, check if contents
+        // is actually present. GPT-4o streams write calls in stages:
+        // first frame = {"file_path":"..."} (valid JSON but NO contents),
+        // then continuation frames = {"file_path":"...","contents":"actual text"}.
+        // Without this check, the first frame flushes immediately and writes
+        // an empty (0-byte) file — the real content arrives as a duplicate
+        // and gets auto-acked without being sent to OpenClaw.
+        if (data.frameCount === 1 && data.name === 'write') {
+          try {
+            const parsed = JSON.parse(data.rawArgs);
+            if (!('contents' in parsed) && !('content' in parsed)) {
+              console.log(`[DIAG:Accum] flushIfComplete: DEFERRED — write tool with only file_path (no contents) ` +
+                `(id=${toolCallId.substring(0, 20)} rawArgs.len=${data.rawArgs.length} keys=[${Object.keys(parsed).join(',')}]) — waiting for content frame`);
+              continue;
+            }
+          } catch (e) {
+            // JSON parse failed — fall through to normal flush logic
+          }
+        }
+
         const dup = this.flushedIds.has(toolCallId);
         console.log(`[DIAG:Accum] flushIfComplete: COMPLETE — id=${toolCallId.substring(0, 20)} ` +
           `rawArgs.len=${data.rawArgs.length} frames=${data.frameCount}` +
