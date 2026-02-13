@@ -78,11 +78,12 @@ async function streamBidiResponse(bidiState, res, model, responseId, hasTools, t
       console.log(`[h2-bidi] Completed native tool call: ${cursorName} (enum=${tc.tool}, id=${tc.toolCallId}, rawArgs=${tc.rawArgs.length} chars)` +
         (tc.isDuplicate ? ' [DUPLICATE — auto-acking]' : ''));
 
-      // DUPLICATE HANDLING: This tool call was already force-flushed and sent to
-      // OpenClaw in a previous turn. Cursor continued streaming the remaining
-      // frames on the bidi stream. We MUST send a tool result back to Cursor so
-      // it can proceed, but we do NOT forward it to OpenClaw (that would cause
-      // the agent to execute the same tool call twice).
+      // DUPLICATE HANDLING: This tool call was already flushed (either by
+      // flushIfComplete after provisional ack, or by force-flush) and emitted
+      // to OpenClaw. Cursor continued streaming continuation/isLastMessage
+      // frames on the bidi stream. We MUST send a result back to Cursor so it
+      // can proceed, but we do NOT forward it to OpenClaw (would cause double
+      // execution).
       if (tc.isDuplicate) {
         console.log(`[h2-bidi] Auto-acking duplicate tool call: ${cursorName} (enum=${tc.tool}, id=${tc.toolCallId})`);
         bidiState.sendToolResult(tc.tool, tc.toolCallId, 'OK');
@@ -111,18 +112,25 @@ async function streamBidiResponse(bidiState, res, model, responseId, hasTools, t
     // tool calls, that means Cursor is done with its turn → finalize now.
     let turnTimer = null;
     let stallCheckCount = 0;
+    let provisionalAckSent = false;
     const TURN_INACTIVITY_MS = 1500;
 
     // CONFIRMED ROOT CAUSE (diagnostic logs 2026-02-13):
     // Cursor's server sends streaming tool call frames ONLY in response to
     // proper tool result messages. PING, empty ConnectRPC envelopes, and
-    // stream.resume() do NOT trigger more frames. When we get 1 streaming
-    // frame with incomplete JSON, the server has paused and will NOT send
-    // more until we send a tool result. No amount of waiting helps.
+    // stream.resume() do NOT trigger more frames.
     //
-    // Strategy: wait 1.5s for complete JSON (covers web_search etc. where
-    // the first frame IS complete). If still incomplete after 3s total,
-    // force-flush and let the truncation fallback handle it via exec/heredoc.
+    // SOLUTION: Instead of force-flushing incomplete JSON (which triggers a
+    // truncation fallback to exec/heredoc), we send a provisional "OK" result
+    // directly to Cursor to trigger the next batch of streaming frames. Those
+    // frames contain the COMPLETE JSON, which we then emit as a real tool call
+    // to OpenClaw. This lets the native write tool work end-to-end.
+    //
+    // Flow: 1.5s check → 3s provisional ack → continuation arrives → complete
+    // JSON detected by flushIfComplete → real tool call emitted → finalize.
+    // stallCheckCount resets to 0 on every streaming frame, so force-flush
+    // only triggers after 15s of CONSECUTIVE silence (no frames at all) —
+    // making it safe for files of any size, no matter how long streaming takes.
 
     function resetTurnTimer() {
       if (turnTimer) clearTimeout(turnTimer);
@@ -145,11 +153,24 @@ async function streamBidiResponse(bidiState, res, model, responseId, hasTools, t
           finalize();
         } else if (toolCallAccumulator.hasPending()) {
           stallCheckCount++;
-          if (stallCheckCount >= 2) {
-            // 3s total (2 × 1.5s) with no new data — Cursor has paused.
-            // Force-flush incomplete streaming calls. The truncation fallback
-            // will instruct the agent to use exec/heredoc instead.
-            console.warn(`[h2-bidi] Streaming stall confirmed (${stallCheckCount * TURN_INACTIVITY_MS}ms, no new frames) — force-flushing`);
+
+          if (!provisionalAckSent && stallCheckCount >= 2) {
+            // 3s total: Cursor paused after first streaming batch (incomplete JSON).
+            // Send a provisional "OK" directly to Cursor to trigger the next batch.
+            // Do NOT flush to OpenClaw — wait for the complete JSON to arrive.
+            const pendingEntries = toolCallAccumulator.getPendingEntries();
+            for (const { toolCallId, tool } of pendingEntries) {
+              console.log(`[h2-bidi] Sending provisional ack to trigger write continuation: ${toolCallId} (enum=${tool})`);
+              bidiState.sendToolResult(tool, toolCallId, 'OK');
+            }
+            provisionalAckSent = true;
+            stallCheckCount = 0; // Reset — give time for continuation frames to arrive
+          } else if (provisionalAckSent && stallCheckCount >= 10) {
+            // 15s of CONSECUTIVE silence (no streaming frames at all) after
+            // provisional ack — stream is genuinely dead. stallCheckCount resets
+            // to 0 on every streaming frame, so this only fires when data has
+            // truly stopped. Safe for large files that stream for minutes.
+            console.warn(`[h2-bidi] No streaming frames for ${stallCheckCount * TURN_INACTIVITY_MS}ms after provisional ack — force-flushing`);
             const forceFlushed = toolCallAccumulator.flush();
             for (const tc of forceFlushed) {
               handleCompletedToolCall(tc);
@@ -159,7 +180,8 @@ async function streamBidiResponse(bidiState, res, model, responseId, hasTools, t
               return;
             }
           } else {
-            console.log(`[h2-bidi] Turn inactivity — incomplete streaming call(s) pending, check #${stallCheckCount}`);
+            console.log(`[h2-bidi] Turn inactivity — incomplete streaming call(s) pending, check #${stallCheckCount}` +
+              (provisionalAckSent ? ' (waiting for continuation after provisional ack)' : ''));
           }
           resetTurnTimer();
         }
@@ -180,6 +202,12 @@ async function streamBidiResponse(bidiState, res, model, responseId, hasTools, t
       }
       for (const tc of frameTCs) {
         if (tc.isStreaming || tc.isLastMessage) {
+          // DYNAMIC STALL DETECTION: Any new streaming frame proves data is
+          // still flowing. Reset the stall counter so force-flush only triggers
+          // after consecutive silent periods with ZERO frames — not after a
+          // cumulative count that ignores active streaming. This makes the
+          // approach work for ANY file size, no matter how long streaming takes.
+          stallCheckCount = 0;
           console.log(`[DIAG:bidi:onFrame] Feeding STREAMING tc to accumulator: id=${tc.toolCallId.substring(0, 20)} isStreaming=${tc.isStreaming} isLastMessage=${tc.isLastMessage}`);
           const completed = toolCallAccumulator.feed(tc);
           if (completed) {
