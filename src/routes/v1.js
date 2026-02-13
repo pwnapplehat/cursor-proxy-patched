@@ -100,7 +100,22 @@ async function streamBidiResponse(bidiState, res, model, responseId, hasTools, t
     function resetTurnTimer() {
       if (turnTimer) clearTimeout(turnTimer);
       turnTimer = setTimeout(() => {
-        if (nativeToolCalls.length > 0 && !toolCallsEmitted) {
+        if (toolCallsEmitted) return; // Already finalized
+
+        // Check for pending streaming tool calls that never got isLastMessage=true.
+        // Cursor sends EDIT_FILE_V2 (write) as full-replacement streaming frames
+        // and never sends isLastMessage=true — the stream just goes quiet.
+        // When the turn timer fires, flush them as completed.
+        const hasPendingStreaming = toolCallAccumulator.hasPending();
+        if (hasPendingStreaming) {
+          console.log(`[h2-bidi] Turn inactivity (${TURN_INACTIVITY_MS}ms) — flushing ${toolCallAccumulator.pending.size} pending streaming tool call(s)`);
+          const flushed = toolCallAccumulator.flush();
+          for (const tc of flushed) {
+            handleCompletedToolCall(tc);
+          }
+        }
+
+        if (nativeToolCalls.length > 0) {
           console.log(`[h2-bidi] Turn inactivity (${TURN_INACTIVITY_MS}ms) — ${nativeToolCalls.length} tool call(s) detected, finalizing turn`);
           finalize();
         }

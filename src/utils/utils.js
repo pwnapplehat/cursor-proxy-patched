@@ -364,8 +364,22 @@ class StreamingToolCallAccumulator {
         console.log(`[DIAG:Accum]   thisFrame.preview: ${preview.replace(/\n/g, '\\n').substring(0, 400)}`);
       }
 
-      // Append rawArgs delta to accumulated string
-      existing.rawArgs += tc.rawArgs;
+      // Detect streaming format: FULL REPLACEMENTS vs DELTAS.
+      // In full-replacement mode, every frame contains the complete rawArgs
+      // rebuilt from scratch (always starts with '{'). In delta mode, only
+      // the first frame starts with '{' and subsequent frames are fragments.
+      //
+      // Confirmed by live diagnostic logs: Cursor sends full replacements
+      // for EDIT_FILE_V2 (write) — every frame starts with '{'.
+      if (startsWithBrace) {
+        // Full replacement — take this frame as the new complete state
+        console.log(`[DIAG:Accum] FULL REPLACEMENT detected (starts with '{') — replacing (was ${prevLen} chars, now ${rawLen} chars)`);
+        existing.rawArgs = tc.rawArgs;
+      } else {
+        // Delta — append fragment to accumulated string
+        console.log(`[DIAG:Accum] DELTA detected (no leading '{') — appending ${rawLen} chars to ${prevLen} chars`);
+        existing.rawArgs += tc.rawArgs;
+      }
       // Use name from later frames if earlier ones were empty
       if (tc.name && !existing.name) existing.name = tc.name;
 
@@ -446,8 +460,20 @@ class StreamingToolCallAccumulator {
   }
 
   /**
+   * Check if there are any pending (still-accumulating) streaming tool calls.
+   * Used by the turn inactivity timer to decide whether to flush.
+   * @returns {boolean}
+   */
+  hasPending() {
+    return this.pending.size > 0;
+  }
+
+  /**
    * Flush any pending (incomplete) streaming tool calls.
-   * Called at end of stream — these are tool calls where streaming started but never completed.
+   * Called at end of stream or on turn inactivity — these are tool calls
+   * where streaming started but isLastMessage=true never arrived.
+   * With full-replacement format, the stored rawArgs IS the latest
+   * complete state, so this produces valid results.
    * @returns {Array<Object>} Array of partially accumulated tool calls
    */
   flush() {
