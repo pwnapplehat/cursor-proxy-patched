@@ -126,9 +126,19 @@ router.post('/chat/completions', async (req, res) => {
     // Pass tools + tool_choice to generateCursorBody for injection
     const cursorBody = generateCursorBody(messages, model, tools, tool_choice);
 
+    // Disable all undici-level timeouts on the dispatcher so large-context
+    // requests to Cursor are never killed.  bodyTimeout=0 and headersTimeout=0
+    // mean "wait forever" — the connection stays open until Cursor responds.
+    const dispatcherOpts = {
+      allowH2: true,
+      bodyTimeout: 0,
+      headersTimeout: 0,
+      keepAliveTimeout: 600000,
+      keepAliveMaxTimeout: 600000,
+    };
     const dispatcher = config.proxy.enabled
-      ? new ProxyAgent(config.proxy.url, { allowH2: true })
-      : new Agent({ allowH2: true });
+      ? new ProxyAgent(config.proxy.url, dispatcherOpts)
+      : new Agent(dispatcherOpts);
 
     const response = await fetch('https://api2.cursor.sh/aiserver.v1.ChatService/StreamUnifiedChatWithTools', {
       method: 'POST',
@@ -152,9 +162,14 @@ router.post('/chat/completions', async (req, res) => {
       },
       body: cursorBody,
       dispatcher: dispatcher,
+      // Disable all fetch-level timeouts so overnight 24h agent runs
+      // are never killed by the proxy.  Cursor can take minutes to
+      // respond when context is large (400+ messages).  Setting 0
+      // means "no timeout" for undici — the connection stays open
+      // indefinitely until Cursor finishes or the TCP socket dies.
       timeout: {
-        connect: 5000,
-        read: 30000
+        connect: 0,
+        read: 0
       }
     });
 
