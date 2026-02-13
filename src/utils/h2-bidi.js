@@ -230,11 +230,55 @@ const TOOL_RESULT_FIELD_MAP = {
 
   // ─── V2 tools ──────────────────────────────────────────────────────
   38: { // EDIT_FILE_V2 → EditFileV2Result at field 51
-    // EditFileV2Result: file_was_created(2 bool), diff(3 FileDiff), rejected(4 bool)
-    // Setting file_was_created=true signals success (not rejected). Cursor's backend
-    // only checks that the result exists and rejected is absent/false.
+    //
+    // Full EditFileV2Result proto (from TASK-26-tool-schemas.md, verified against
+    // eisbaw/cursor_api_demo reveng_2.3.41 and everestmz/cursor-rpc):
+    //
+    //   message EditFileV2Result {
+    //     optional string contents_before_edit = 1;
+    //     bool file_was_created = 2;
+    //     optional FileDiff diff = 3;
+    //     optional bool rejected = 4;
+    //     repeated LinterError linter_errors = 5;
+    //     bool sent_back_linter_errors = 6;
+    //     optional HumanReview human_review_v2 = 7;
+    //     bool should_auto_fix_lints = 8;
+    //     optional string eol_sequence = 9;
+    //     string result_for_model = 10;        ← THE KEY FIELD
+    //     optional string detected_language = 11;
+    //     optional string contents_after_edit = 12;
+    //     optional string before_content_id = 13;
+    //     string after_content_id = 14;
+    //   }
+    //
+    // ROOT CAUSE: Previously we ONLY sent file_was_created=true (field 2).
+    // The model saw a bare boolean with ZERO text confirmation. In Cursor's
+    // native IDE, field 10 (result_for_model) contains a human-readable
+    // description like "The file was created successfully" which the model
+    // uses to confirm the write. Without it, the model doesn't trust the
+    // result and retries with exec/shell commands.
+    //
+    // FIX: Populate field 10 (result_for_model) with the descriptive text.
     field: 51,
-    encode: (_text) => pbEncodeField(2, 0, 1), // file_was_created = true
+    encode: (text) => {
+      // field 2: file_was_created = true (bool)
+      const created = pbEncodeField(2, 0, 1);
+
+      // field 10: result_for_model = text (string) — THE CRITICAL FIELD
+      // This is the string Cursor's server passes to the model as the
+      // human-readable result of the edit/write operation. Without this,
+      // the model has no text confirmation and falls back to exec.
+      //
+      // Normalize: OpenClaw may return empty string or "no result from tool"
+      // for successful writes. Replace these with a clear success message.
+      let resultText = (text || '').trim();
+      if (!resultText || resultText.includes('no result from tool')) {
+        resultText = 'The file was created successfully.';
+      }
+      const resultForModel = pbEncodeField(10, 2, Buffer.from(resultText, 'utf-8'));
+
+      return Buffer.concat([created, resultForModel]);
+    },
   },
   39: { // LIST_DIR_V2 → ListDirV2Result at field 52
     // ListDirV2Result: tree nodes with name(1)
