@@ -74,8 +74,17 @@ function encodeTextField(text) {
 const TOOL_RESULT_FIELD_MAP = {
   // ─── Core file operations ──────────────────────────────────────────
   1:  { // READ_SEMSEARCH_FILES → ReadSemsearchFilesResult at field 2
+    // ReadSemsearchFilesResult proto (cursor-rpc):
+    //   repeated CodeResult code_results = 1;
+    // CodeResult: code_block(1 CodeBlock), score(2 float)
+    // CodeBlock: contents(4 string)
+    // FIX: Field 1 is a repeated submessage. Wrap text as CodeBlock.contents.
     field: 2,
-    encode: encodeTextField, // contents
+    encode: (text) => {
+      const contents = pbEncodeField(4, 2, Buffer.from(text, 'utf-8')); // CodeBlock.contents
+      const codeBlock = pbEncodeField(1, 2, contents); // CodeResult.code_block
+      return pbEncodeField(1, 2, codeBlock); // code_results[0]
+    },
   },
   3:  { // RIPGREP_SEARCH → RipgrepSearchResult at field 4
     // RipgrepSearchResult.internal(1) → RipgrepSearchResultInternal
@@ -130,12 +139,30 @@ const TOOL_RESULT_FIELD_MAP = {
     },
   },
   9:  { // SEMANTIC_SEARCH_FULL → SemanticSearchFullResult at field 18
+    // SemanticSearchFullResult proto (TASK-26):
+    //   repeated CodeResult code_results = 1;
+    //   repeated FileInfo all_files = 2;
+    //   ...
+    // CodeResult: code_block(1 CodeBlock), score(2 float)
+    // CodeBlock: contents(4 string)
+    // FIX: Field 1 is a repeated submessage, NOT a string.
+    // Wrap text as CodeBlock.contents inside a CodeResult.
     field: 18,
-    encode: encodeTextField,
+    encode: (text) => {
+      const contents = pbEncodeField(4, 2, Buffer.from(text, 'utf-8')); // CodeBlock.contents
+      const codeBlock = pbEncodeField(1, 2, contents); // CodeResult.code_block
+      return pbEncodeField(1, 2, codeBlock); // code_results[0]
+    },
   },
   11: { // DELETE_FILE → DeleteFileResult at field 20
+    // DeleteFileResult proto (TASK-26):
+    //   bool rejected = 1;
+    //   bool file_non_existent = 2;
+    //   bool file_deleted_successfully = 3;
+    // BUG FIX: Was sending field 1 = true which means rejected=true (WRONG!)
+    // Must send field 3 = true for file_deleted_successfully.
     field: 20,
-    encode: (_text) => pbEncodeField(1, 0, 1), // success = true
+    encode: (_text) => pbEncodeField(3, 0, 1), // file_deleted_successfully = true
   },
   12: { // REAPPLY → ReapplyResult at field 21
     field: 21,
@@ -144,12 +171,21 @@ const TOOL_RESULT_FIELD_MAP = {
 
   // ─── Terminal and system tools ─────────────────────────────────────
   15: { // RUN_TERMINAL_COMMAND_V2 → RunTerminalCommandV2Result at field 24
-    // RunTerminalCommandV2Result: output(1 string), exit_code(2 int32)
+    // RunTerminalCommandV2Result proto (TASK-26):
+    //   string output = 1;
+    //   int32 exit_code = 2;
+    //   optional bool rejected = 3;
+    //   bool popped_out_into_background = 4;
+    //   bool is_running_in_background = 5;
+    //   bool not_interrupted = 6;
+    //   string resulting_working_directory = 7;
+    //   ...
     field: 24,
     encode: (text) => {
       const output = pbEncodeField(1, 2, Buffer.from(text, 'utf-8'));
       const exitCode = pbEncodeField(2, 0, 0); // exit_code = 0
-      return Buffer.concat([output, exitCode]);
+      const notInterrupted = pbEncodeField(6, 0, 1); // not_interrupted = true
+      return Buffer.concat([output, exitCode, notInterrupted]);
     },
   },
   16: { // FETCH_RULES → FetchRulesResult at field 25
@@ -168,14 +204,26 @@ const TOOL_RESULT_FIELD_MAP = {
     },
   },
   19: { // MCP → MCPResult at field 28
+    // MCPResult proto (TASK-26):
+    //   string selected_tool = 1;
+    //   string result = 2;
+    // FIX: Text should go in field 2 (result), not field 1 (selected_tool).
     field: 28,
-    encode: encodeTextField,
+    encode: (text) => pbEncodeField(2, 2, Buffer.from(text, 'utf-8')), // result
   },
 
   // ─── Code intelligence tools ───────────────────────────────────────
   23: { // SEARCH_SYMBOLS → SearchSymbolsResult at field 32
+    // SearchSymbolsResult proto (TASK-26):
+    //   repeated SymbolMatch matches = 1;
+    //   optional bool rejected = 2;
+    // SymbolMatch: name(1 string), uri(2 string), secondary_text(4 string)
+    // FIX: Field 1 is a repeated submessage. Wrap text as SymbolMatch.name.
     field: 32,
-    encode: encodeTextField,
+    encode: (text) => {
+      const name = pbEncodeField(1, 2, Buffer.from(text, 'utf-8')); // SymbolMatch.name
+      return pbEncodeField(1, 2, name); // matches[0]
+    },
   },
   24: { // BACKGROUND_COMPOSER_FOLLOWUP → at field 33
     field: 33,
@@ -224,8 +272,17 @@ const TOOL_RESULT_FIELD_MAP = {
     encode: encodeTextField,
   },
   35: { // TODO_WRITE → TodoWriteResult at field 45
+    // TodoWriteResult proto (TASK-26):
+    //   bool success = 1;
+    //   repeated string ready_task_ids = 2;
+    //   bool needs_in_progress_todos = 3;
+    //   repeated TodoItem final_todos = 4;
+    //   repeated TodoItem initial_todos = 5;
+    //   bool was_merge = 6;
+    // FIX: Field 1 is a bool (success), not a string. Sending text as field 1
+    // would cause a wire type mismatch. Send success=true instead.
     field: 45,
-    encode: encodeTextField,
+    encode: (_text) => pbEncodeField(1, 0, 1), // success = true
   },
 
   // ─── V2 tools ──────────────────────────────────────────────────────
@@ -281,11 +338,17 @@ const TOOL_RESULT_FIELD_MAP = {
     },
   },
   39: { // LIST_DIR_V2 → ListDirV2Result at field 52
-    // ListDirV2Result: tree nodes with name(1)
+    // ListDirV2Result proto (TASK-26):
+    //   repeated DirectoryTreeNode children = 1;
+    //   DirectoryTreeNode: name(1 string), children(2 repeated DirectoryTreeNode),
+    //                      file_info(3 File)
+    //   File: size(1 int64)
+    // Encoding: wrap text as the name of a single root tree node.
     field: 52,
     encode: (text) => {
+      // DirectoryTreeNode { name = text }
       const nameField = pbEncodeField(1, 2, Buffer.from(text, 'utf-8'));
-      return pbEncodeField(1, 2, nameField); // root node
+      return pbEncodeField(1, 2, nameField); // children[0] = root node
     },
   },
   40: { // READ_FILE_V2 → ReadFileV2Result at field 53
@@ -298,15 +361,21 @@ const TOOL_RESULT_FIELD_MAP = {
     encode: encodeTextField, // output
   },
   42: { // GLOB_FILE_SEARCH → GlobFileSearchResult at field 55
-    // GlobFileSearchResult: files(1 repeated File), limit_hit(2 bool), num_results(3 int32)
-    // File: uri(1 string)
-    // Same structure as FILE_SEARCH — wrap in proper File sub-message.
+    // GlobFileSearchResult proto (TASK-26):
+    //   repeated Directory directories = 1;
+    //   Directory: abs_path(1 string), files(2 repeated File),
+    //             total_files(3 int32), ripgrep_truncated(4 bool)
+    //   File: rel_path(1 string)
+    // BUG FIX: Was using FILE_SEARCH format (uri field). Real format uses
+    // Directory/File nesting with rel_path, not uri.
     field: 55,
     encode: (text) => {
-      const fileUri = pbEncodeField(1, 2, Buffer.from(text, 'utf-8')); // File { uri = text }
-      const fileEntry = pbEncodeField(1, 2, fileUri); // files[0]
-      const numResults = pbEncodeField(3, 0, 1); // num_results = 1
-      return Buffer.concat([fileEntry, numResults]);
+      // File { rel_path = text }
+      const relPath = pbEncodeField(1, 2, Buffer.from(text, 'utf-8'));
+      const file = pbEncodeField(2, 2, relPath); // Directory.files[0]
+      const totalFiles = pbEncodeField(3, 0, 1); // Directory.total_files
+      const directory = Buffer.concat([file, totalFiles]);
+      return pbEncodeField(1, 2, directory); // directories[0]
     },
   },
   43: { // CREATE_PLAN → CreatePlanResult at field 56
@@ -336,8 +405,12 @@ const TOOL_RESULT_FIELD_MAP = {
 
   // ─── Advanced agent tools ──────────────────────────────────────────
   48: { // TASK_V2 → TaskV2Result at field 61
+    // TaskV2Result proto (TASK-26):
+    //   optional string agent_id = 1;
+    //   bool is_background = 2;
+    // Field 1 is agent_id (string) — encodeTextField puts text there which works.
     field: 61,
-    encode: encodeTextField,
+    encode: encodeTextField, // text → agent_id (field 1)
   },
   49: { // CALL_MCP_TOOL → CallMcpToolResult at field 62
     field: 62,
