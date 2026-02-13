@@ -483,7 +483,7 @@ class StreamingToolCallAccumulator {
   getPendingEntries() {
     const entries = [];
     for (const [toolCallId, data] of this.pending) {
-      entries.push({ toolCallId, tool: data.tool, rawArgs: data.rawArgs });
+      entries.push({ toolCallId, tool: data.tool, name: data.name, rawArgs: data.rawArgs });
     }
     return entries;
   }
@@ -498,11 +498,28 @@ class StreamingToolCallAccumulator {
    * @returns {Array<Object>} Array of completed tool calls
    */
   flushIfComplete() {
+    // Known edit tools send multi-key JSON in stages: file_path first, then
+    // old_string/new_string in later streaming frames. The first frame
+    // {"file_path":"..."} looks like valid complete JSON but is NOT the full
+    // payload. Deferring these lets them reach the provisional-ack path,
+    // which triggers Cursor to send continuation frames with the full args.
+    const EDIT_LIKE_TOOL_NAMES = new Set(['search_replace', 'edit_file', 'edit_file_v2', 'str_replace']);
+
     const results = [];
     for (const [toolCallId, data] of this.pending) {
       const starts = data.rawArgs.startsWith('{');
       const ends = data.rawArgs.endsWith('}');
       if (starts && ends) {
+        // Safety: for edit-like tools with only 1 frame, do NOT flush yet.
+        // The first frame likely contains only file_path — the real payload
+        // (old_string/new_string) arrives in continuation frames triggered
+        // by the provisional ack. Flushing now would send incomplete args.
+        if (data.frameCount === 1 && EDIT_LIKE_TOOL_NAMES.has(data.name)) {
+          console.log(`[DIAG:Accum] flushIfComplete: DEFERRED — edit tool "${data.name}" with only 1 frame ` +
+            `(id=${toolCallId.substring(0, 20)} rawArgs.len=${data.rawArgs.length}) — waiting for continuation`);
+          continue;
+        }
+
         const dup = this.flushedIds.has(toolCallId);
         console.log(`[DIAG:Accum] flushIfComplete: COMPLETE — id=${toolCallId.substring(0, 20)} ` +
           `rawArgs.len=${data.rawArgs.length} frames=${data.frameCount}` +
@@ -733,6 +750,24 @@ const SPECIAL_TOOL_CONVERSIONS = {
       arguments: {
         path: pathVal,
         content: args.content || args.contents || '',
+      },
+    };
+  },
+
+  // ─── StrReplace / search_replace ────────────────────────────────────
+  // Cursor's Agent mode sends StrReplace as tc.name = "search_replace" (enum 38).
+  // This is DIFFERENT from "write" which is also enum 38 but for file creation.
+  // The model sends "search_replace" with file_path, old_string, new_string.
+  // Must map to OpenClaw's "edit" tool with path, oldText, newText.
+  // Without this entry, it falls through as "search_replace" which OpenClaw rejects.
+  'search_replace': (args) => {
+    const pathVal = args.file_path || args.path || args.relative_workspace_path || '';
+    return {
+      name: 'edit',
+      arguments: {
+        path: pathVal,
+        oldText: args.old_string || args.oldText || args.old_text || '',
+        newText: args.new_string || args.newText || args.new_text || '',
       },
     };
   },

@@ -64,8 +64,8 @@ function detectToolResults(messages) {
 // For other tools: returns a generic success message.
 // All parsing is defensive — handles incomplete/malformed JSON gracefully.
 
-function buildProvisionalMessage(toolEnum, rawArgs) {
-  // For write/delete tools, extract file_path and construct appropriate message
+function buildProvisionalMessage(toolEnum, rawArgs, toolName) {
+  // For write/delete/edit tools, extract file_path and construct appropriate message
   if (WRITE_TOOL_ENUMS.has(toolEnum) && rawArgs) {
     try {
       // Try multiple patterns for file_path (handles both field names Cursor uses)
@@ -90,6 +90,17 @@ function buildProvisionalMessage(toolEnum, rawArgs) {
           return `Successfully deleted ${filePath}`;
         }
 
+        // Determine operation type from tool name:
+        // - search_replace / edit_file / str_replace → edit (old_string → new_string)
+        // - write / edit_file_v2 with contents → create/write
+        const EDIT_NAMES = new Set(['search_replace', 'edit_file', 'str_replace']);
+        const isEditOp = EDIT_NAMES.has(toolName) ||
+          rawArgs.includes('"old_string"') || rawArgs.includes('"new_string"');
+
+        if (isEditOp) {
+          return `Successfully edited ${filePath}`;
+        }
+
         // Estimate content length from what we have so far.
         // Try multiple content field names Cursor might use.
         const contentPatterns = [
@@ -108,10 +119,7 @@ function buildProvisionalMessage(toolEnum, rawArgs) {
           }
         }
 
-        // Determine if this is a create (new file) or edit (existing file)
-        const isCreate = toolEnum === 38; // EDIT_FILE_V2 is used for creates
-        const verb = isCreate ? 'Successfully created' : 'Successfully wrote';
-        let msg = `${verb} ${filePath}`;
+        let msg = `Successfully created ${filePath}`;
         if (approxLen > 0) msg += ` (${approxLen}+ bytes written)`;
         return msg;
       }
@@ -325,9 +333,9 @@ async function streamBidiResponse(bidiState, res, model, responseId, hasTools, t
             // success message. This is an "optimistic acknowledgment" — the write
             // WILL execute via OpenClaw once continuation completes the JSON.
             const pendingEntries = toolCallAccumulator.getPendingEntries();
-            for (const { toolCallId, tool, rawArgs } of pendingEntries) {
-              const provisionalMsg = buildProvisionalMessage(tool, rawArgs);
-              console.log(`[h2-bidi] Sending provisional ack to trigger continuation: ${toolCallId} (enum=${tool}) msg="${provisionalMsg}"`);
+            for (const { toolCallId, tool, name: toolName, rawArgs } of pendingEntries) {
+              const provisionalMsg = buildProvisionalMessage(tool, rawArgs, toolName);
+              console.log(`[h2-bidi] Sending provisional ack to trigger continuation: ${toolCallId} (enum=${tool}, name=${toolName}) msg="${provisionalMsg}"`);
               bidiState.sendToolResult(tool, toolCallId, provisionalMsg);
             }
             provisionalAckSent = true;
