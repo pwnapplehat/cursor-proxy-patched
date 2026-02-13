@@ -583,10 +583,13 @@ async function createBidiStream(authToken, headers, initialBody) {
         // Auth
         'authorization': `Bearer ${authToken}`,
         // ConnectRPC protocol headers
-        // NOTE: connect-content-encoding is intentionally OMITTED.
-        // The reference (cursor_bidi_client.py) does NOT send it.
-        // Tool result frames are uncompressed (flag=0x00); the initial body
-        // may be gzipped (flag=0x01) and the per-frame flag is authoritative.
+        // connect-content-encoding MUST be 'gzip' — it tells the server we may
+        // send gzip-compressed frames (flag byte 0x01). Without it, the server
+        // returns "received compressed envelope, but do not know how to decompress"
+        // when generateCursorBody gzips the body (3+ messages).
+        // The per-frame flag byte (0x00 uncompressed / 0x01 gzipped) is still
+        // authoritative per-frame, so sending this header is always safe.
+        'connect-content-encoding': 'gzip',
         'connect-accept-encoding': 'gzip',
         'connect-protocol-version': '1',
         'content-type': 'application/connect+proto',
