@@ -8,6 +8,24 @@ const { generateCursorBody, chunkToUtf8String, generateHashed64Hex, generateCurs
 const { parseToolCalls, hasToolCallTags, normalizeNearMissToolCalls, tryParseToolCallContent } = require('../utils/toolEmulation');
 const { createBidiStream, findPendingStream, removePendingStream } = require('../utils/h2-bidi');
 
+// ─── Write-related tool enums ─────────────────────────────────────────────
+// Used for provisional ack construction, post-write verification, and error
+// injection. Maintained as a Set for O(1) lookup and easy extension if
+// Cursor adds new write-related tool types in the future.
+const WRITE_TOOL_ENUMS = new Set([
+  38, // EDIT_FILE_V2 (write/create file)
+  7,  // EDIT_FILE (legacy edit)
+]);
+
+// Filesystem error patterns that indicate a REAL write failure (not just
+// OpenClaw's "no result from tool" default). Used for post-write verification.
+const WRITE_FAILURE_PATTERNS = [
+  /ENOENT/i, /EACCES/i, /EPERM/i, /ENOSPC/i, /EROFS/i, /EISDIR/i,
+  /permission denied/i, /disk full/i, /read.only file system/i,
+  /no such file or directory/i, /is a directory/i,
+  /cannot create/i, /cannot write/i, /failed to write/i,
+];
+
 // ─── Tool Result Detection ───────────────────────────────────────────────
 // Detects if incoming messages contain tool results that should be routed
 // through an existing bidirectional H2 stream instead of creating a new one.
@@ -35,6 +53,102 @@ function detectToolResults(messages) {
   return results; // may be empty
 }
 
+// ─── Provisional Message Builder ──────────────────────────────────────────
+// Constructs the most accurate provisional acknowledgment message possible
+// from the available (potentially incomplete) rawArgs. This message is what
+// Cursor's model sees as the tool result (protocol constraint: Cursor only
+// processes the first result per toolCallId).
+//
+// For write tools: extracts file_path and estimates content length.
+// For other tools: returns a generic success message.
+// All parsing is defensive — handles incomplete/malformed JSON gracefully.
+
+function buildProvisionalMessage(toolEnum, rawArgs) {
+  // For write-related tools, extract file_path and content size
+  if (WRITE_TOOL_ENUMS.has(toolEnum) && rawArgs) {
+    try {
+      // Try multiple patterns for file_path (handles both field names Cursor uses)
+      const pathPatterns = [
+        /"file_path"\s*:\s*"([^"]+)"/,
+        /"path"\s*:\s*"([^"]+)"/,
+        /"filePath"\s*:\s*"([^"]+)"/,
+      ];
+      let filePath = null;
+      for (const pattern of pathPatterns) {
+        const match = rawArgs.match(pattern);
+        if (match) {
+          filePath = match[1];
+          break;
+        }
+      }
+
+      if (filePath) {
+        // Estimate content length from what we have so far.
+        // Try multiple content field names Cursor might use.
+        const contentPatterns = [
+          /"contents"\s*:\s*"/,
+          /"content"\s*:\s*"/,
+          /"new_contents"\s*:\s*"/,
+        ];
+        let approxLen = 0;
+        for (const pattern of contentPatterns) {
+          const contentMatch = rawArgs.match(pattern);
+          if (contentMatch) {
+            const contentStart = contentMatch.index + contentMatch[0].length;
+            approxLen = rawArgs.length - contentStart;
+            break;
+          }
+        }
+
+        // Determine if this is a create (new file) or edit (existing file)
+        const isCreate = toolEnum === 38; // EDIT_FILE_V2 is used for creates
+        const verb = isCreate ? 'Successfully created' : 'Successfully wrote';
+        let msg = `${verb} ${filePath}`;
+        if (approxLen > 0) msg += ` (${approxLen}+ bytes written)`;
+        return msg;
+      }
+    } catch (e) {
+      console.warn(`[h2-bidi] buildProvisionalMessage: parse error (non-fatal): ${e.message}`);
+    }
+  }
+
+  // Fallback for non-write tools or when file_path couldn't be extracted
+  return 'Operation completed successfully';
+}
+
+// ─── Write Verification ──────────────────────────────────────────────────
+// After OpenClaw returns a tool result for a write operation, verify it.
+// Returns { success: boolean, error?: string } so callers can decide
+// whether to store a failure for injection into the next turn.
+
+function verifyWriteResult(toolEnum, content) {
+  if (!WRITE_TOOL_ENUMS.has(toolEnum)) return { success: true };
+
+  // Empty or missing content — OpenClaw's framework returns "no result from
+  // tool" when the handler returns null. This is NORMAL for successful writes
+  // (OpenClaw's write handler doesn't return a string). NOT a failure.
+  if (!content || content.trim() === '') {
+    return { success: true };
+  }
+
+  // Check for the specific OpenClaw framework "no result" message.
+  // This is the EXPECTED response for a successful write — the handler
+  // returns null and the framework fills in this default. NOT a failure.
+  if (content.includes('no result from tool')) {
+    return { success: true };
+  }
+
+  // Check for REAL filesystem errors (ENOENT, EACCES, disk full, etc.)
+  for (const pattern of WRITE_FAILURE_PATTERNS) {
+    if (pattern.test(content)) {
+      return { success: false, error: content };
+    }
+  }
+
+  // No error patterns matched — treat as success
+  return { success: true };
+}
+
 // ─── Bidirectional Stream Handler ──────────────────────────────────────────
 // Processes a streaming response from a BidiStreamState (h2-bidi), streaming
 // text to the Express response as SSE and collecting tool calls.
@@ -57,8 +171,37 @@ async function streamBidiResponse(bidiState, res, model, responseId, hasTools, t
     let firstChunkSent = false;
     let toolCallsEmitted = false;
 
+    // ─── Write failure injection ──────────────────────────────────────
+    // If the PREVIOUS turn's write operation failed (detected by post-write
+    // verification), inject a warning into THIS turn's text output so the
+    // model discovers the error and can take corrective action (retry, use
+    // exec fallback, etc.). The provisional ack already told the model the
+    // write succeeded — this corrects that if it was wrong.
+    //
+    // We inject ONCE at the start, before any model text, so the warning
+    // appears at the beginning of the response.
+    let writeFailureWarning = null;
+    if (bidiState._writeFailures && bidiState._writeFailures.length > 0) {
+      const failures = bidiState._writeFailures;
+      const warnings = failures.map(f =>
+        `[System: Previous write operation (enum=${f.toolEnum}) FAILED. ` +
+        `Error: "${f.error.substring(0, 300)}". ` +
+        `The file may not have been created/modified. Please verify and retry.]`
+      );
+      writeFailureWarning = warnings.join('\n');
+      console.warn(`[h2-bidi] Injecting ${failures.length} write failure warning(s) into response`);
+      bidiState._writeFailures = []; // Clear after injection
+    }
+
     function sendTextChunk(text) {
       if (!text || res.writableEnded) return;
+
+      // Inject write failure warning before the first text chunk
+      if (writeFailureWarning && !firstChunkSent) {
+        text = writeFailureWarning + '\n\n' + text;
+        writeFailureWarning = null; // Only inject once
+      }
+
       const delta = !firstChunkSent
         ? { role: 'assistant', content: text }
         : { content: text };
@@ -159,30 +302,23 @@ async function streamBidiResponse(bidiState, res, model, responseId, hasTools, t
             // Send a provisional result directly to Cursor to trigger the next batch.
             // Do NOT flush to OpenClaw — wait for the complete JSON to arrive.
             //
-            // CRITICAL: The provisional message is what the model sees as the tool
-            // result. If we send "OK", the model interprets it as "no result" and
-            // falls back to exec. We MUST construct a realistic success message
-            // by extracting file_path from the (even incomplete) rawArgs.
+            // WHY THIS IS NECESSARY (protocol constraint, not a workaround):
+            // Cursor's server will NOT release continuation frames until it receives
+            // a ClientSideToolV2Result. This was verified with diagnostic logs —
+            // PINGs, empty envelopes, and stream.resume() do NOT trigger frames.
+            // Only a proper tool result does. Additionally, Cursor only processes
+            // the FIRST result for a given toolCallId — subsequent results satisfy
+            // the isLastMessage handshake but are NOT shown to the model. Therefore
+            // this provisional message IS the tool result the model sees.
+            //
+            // STRATEGY: Construct the most accurate message possible from the
+            // available (even incomplete) rawArgs. For write tools, extract the
+            // file_path and estimate content size. For other tools, use a generic
+            // success message. This is an "optimistic acknowledgment" — the write
+            // WILL execute via OpenClaw once continuation completes the JSON.
             const pendingEntries = toolCallAccumulator.getPendingEntries();
             for (const { toolCallId, tool, rawArgs } of pendingEntries) {
-              let provisionalMsg = 'Operation completed successfully';
-              // For write/edit tools (enum 38 = EDIT_FILE_V2, 7 = EDIT_FILE),
-              // extract file_path from the accumulated rawArgs to construct a
-              // realistic message the model will recognize as success.
-              if ((tool === 38 || tool === 7) && rawArgs) {
-                try {
-                  const pathMatch = rawArgs.match(/"file_path"\s*:\s*"([^"]+)"/);
-                  if (pathMatch) {
-                    const filePath = pathMatch[1];
-                    // Estimate content length from what we have so far
-                    const contentMatch = rawArgs.match(/"contents"\s*:\s*"/);
-                    const contentStart = contentMatch ? contentMatch.index + contentMatch[0].length : -1;
-                    const approxLen = contentStart > 0 ? rawArgs.length - contentStart : 0;
-                    provisionalMsg = `Successfully created ${filePath}`;
-                    if (approxLen > 0) provisionalMsg += ` (${approxLen}+ bytes)`;
-                  }
-                } catch (e) { /* ignore parse errors on incomplete JSON */ }
-              }
+              const provisionalMsg = buildProvisionalMessage(tool, rawArgs);
               console.log(`[h2-bidi] Sending provisional ack to trigger continuation: ${toolCallId} (enum=${tool}) msg="${provisionalMsg}"`);
               bidiState.sendToolResult(tool, toolCallId, provisionalMsg);
             }
@@ -213,6 +349,7 @@ async function streamBidiResponse(bidiState, res, model, responseId, hasTools, t
 
     function onFrame({ magic, data }) {
       resetTurnTimer(); // Reset on every frame — Cursor is still sending
+      resetSafetyTimeout(); // Keep safety timeout alive while data is flowing
 
       const { text, thinking, nativeToolCalls: frameTCs } =
         processSingleFrame(magic, data, seenToolCallIds);
@@ -427,11 +564,24 @@ async function streamBidiResponse(bidiState, res, model, responseId, hasTools, t
       resetTurnTimer();
     }
 
-    // Safety timeout: if no data for 5 minutes, finalize
-    const safetyTimeout = setTimeout(() => {
-      console.warn('[h2-bidi] Safety timeout — finalizing response');
+    // DYNAMIC safety timeout: resets on every frame so large files that stream
+    // for minutes (or even hours) are never killed. Only fires after 5 minutes
+    // of ZERO activity (no frames at all), which means the stream is truly dead.
+    // This replaces the old fixed 5-minute timer that would kill long-running
+    // streaming responses regardless of whether data was still flowing.
+    const SAFETY_TIMEOUT_MS = 5 * 60 * 1000;
+    let safetyTimeout = setTimeout(() => {
+      console.warn('[h2-bidi] Safety timeout (5 min no frames) — finalizing response');
       finalize();
-    }, 5 * 60 * 1000);
+    }, SAFETY_TIMEOUT_MS);
+
+    function resetSafetyTimeout() {
+      clearTimeout(safetyTimeout);
+      safetyTimeout = setTimeout(() => {
+        console.warn('[h2-bidi] Safety timeout (5 min no frames) — finalizing response');
+        finalize();
+      }, SAFETY_TIMEOUT_MS);
+    }
 
     // Override finalize to clear all timers
     const originalFinalize = finalize;
@@ -605,10 +755,36 @@ router.post('/chat/completions', async (req, res) => {
           if (mappings.length > 0) {
             console.log(`[h2-bidi] ▸ Routing ${mappings.length} tool result(s) on existing H2 stream`);
 
-            // Send ALL tool results on the stream
+            // Send ALL tool results on the stream + verify write operations
             for (const m of mappings) {
               console.log(`[h2-bidi]   → ${m.toolCallId} → cursor:${m.cursorToolCallId} (enum=${m.toolEnum})`);
               bidiState.sendToolResult(m.toolEnum, m.cursorToolCallId, m.content);
+
+              // POST-WRITE VERIFICATION: Check if OpenClaw's result indicates
+              // a real filesystem error. "no result from tool" is NORMAL (success).
+              // Only ENOENT, EACCES, ENOSPC, etc. are real failures.
+              if (WRITE_TOOL_ENUMS.has(m.toolEnum)) {
+                const verification = verifyWriteResult(m.toolEnum, m.content);
+                if (verification.success) {
+                  console.log(`[h2-bidi] ✓ WRITE VERIFIED OK: ${m.toolCallId} (enum=${m.toolEnum}) — ` +
+                    `OpenClaw result: "${(m.content || '').substring(0, 200)}"`);
+                } else {
+                  console.error(`[h2-bidi] ✗ WRITE VERIFICATION FAILED: ${m.toolCallId} (enum=${m.toolEnum}) — ` +
+                    `error: "${verification.error.substring(0, 300)}"`);
+                  // Store failure on bidiState for injection into the next turn.
+                  // The model was already told (via provisional ack) that the write
+                  // succeeded. If it actually failed, we MUST correct this by
+                  // injecting a warning into the next response the model generates.
+                  if (!bidiState._writeFailures) bidiState._writeFailures = [];
+                  bidiState._writeFailures.push({
+                    toolCallId: m.toolCallId,
+                    toolEnum: m.toolEnum,
+                    error: verification.error,
+                    timestamp: Date.now(),
+                  });
+                }
+              }
+
               removePendingStream(m.toolCallId);
             }
 
