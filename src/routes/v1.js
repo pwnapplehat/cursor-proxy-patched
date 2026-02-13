@@ -86,7 +86,30 @@ async function streamBidiResponse(bidiState, res, model, responseId, hasTools, t
       }
     }
 
+    // ─── Turn inactivity timer ───────────────────────────────────────
+    // In bidi mode, Cursor does NOT close the stream after sending a tool
+    // call — it keeps the stream open waiting for the result. Without this
+    // timer, finalize() only fires on the 5-minute safety timeout, making
+    // every tool call round-trip take 5 minutes of dead waiting.
+    //
+    // This timer fires 1.5 seconds after the last frame. If we've detected
+    // tool calls, that means Cursor is done with its turn → finalize now.
+    let turnTimer = null;
+    const TURN_INACTIVITY_MS = 1500;
+
+    function resetTurnTimer() {
+      if (turnTimer) clearTimeout(turnTimer);
+      turnTimer = setTimeout(() => {
+        if (nativeToolCalls.length > 0 && !toolCallsEmitted) {
+          console.log(`[h2-bidi] Turn inactivity (${TURN_INACTIVITY_MS}ms) — ${nativeToolCalls.length} tool call(s) detected, finalizing turn`);
+          finalize();
+        }
+      }, TURN_INACTIVITY_MS);
+    }
+
     function onFrame({ magic, data }) {
+      resetTurnTimer(); // Reset on every frame — Cursor is still sending
+
       const { text, thinking, nativeToolCalls: frameTCs } =
         processSingleFrame(magic, data, seenToolCallIds);
 
@@ -285,7 +308,13 @@ async function streamBidiResponse(bidiState, res, model, responseId, hasTools, t
     if (bidiState.ended) {
       console.log('[h2-bidi] Stream already ended — finalizing immediately');
       finalize();
-      return; // Don't set up safety timeout — we're done
+      return; // Don't set up safety/turn timers — we're done
+    }
+
+    // If buffered frames already contained tool calls, start the turn timer
+    // so we finalize quickly once Cursor stops sending more frames.
+    if (nativeToolCalls.length > 0) {
+      resetTurnTimer();
     }
 
     // Safety timeout: if no data for 5 minutes, finalize
@@ -294,7 +323,7 @@ async function streamBidiResponse(bidiState, res, model, responseId, hasTools, t
       finalize();
     }, 5 * 60 * 1000);
 
-    // Override finalize to clear timeout
+    // Override finalize to clear all timers
     const originalFinalize = finalize;
     let finalized = false;
     // eslint-disable-next-line no-func-assign
@@ -302,6 +331,7 @@ async function streamBidiResponse(bidiState, res, model, responseId, hasTools, t
       if (finalized) return;
       finalized = true;
       clearTimeout(safetyTimeout);
+      if (turnTimer) clearTimeout(turnTimer);
       originalFinalize();
     };
   });
