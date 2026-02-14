@@ -564,12 +564,35 @@ async function streamBidiResponse(bidiState, res, model, responseId, hasTools, t
 
           bidiState.close();
         } else if (cursorApiError && cursorApiError.type === 'user_aborted') {
-          // ERROR_USER_ABORTED_REQUEST — Cursor aborted the stream.
-          // This is expected behavior when tool results arrive after stream close.
-          // Send as a normal stop to avoid confusing OpenClaw.
-          if (hasTools) {
-            console.warn('[h2-bidi] WARNING: User aborted request — tools were provided but no tool calls emitted.');
+          // ERROR_USER_ABORTED_REQUEST — Cursor aborted the stream before the model
+          // generated a response. This happens when tool call results arrive after
+          // Cursor's backend times out waiting. If the model had already emitted text
+          // or tool calls, the response was already sent and this is harmless.
+          // But if the response is EMPTY (no text, no tool calls), sending an empty
+          // finish_reason:'stop' causes OpenClaw to think the agent finished and stop
+          // the entire run. Fix: inject a synthetic continuation message so the agent
+          // knows to keep going.
+          const responseIsEmpty = !fullResponse || fullResponse.trim().length === 0;
+
+          if (responseIsEmpty && hasTools) {
+            console.warn('[h2-bidi] User aborted with EMPTY response — injecting continuation to keep agent alive');
+
+            // Send a synthetic assistant text chunk that prompts the agent to continue.
+            // This makes OpenClaw process it as a normal turn with text content,
+            // and the agent will see the message and continue its work.
+            const continuationText = '[Note: The previous API request was interrupted before a response could be generated. This is a transient issue — please continue from where you left off.]';
+            res.write(`data: ${JSON.stringify({
+              id: responseId,
+              object: 'chat.completion.chunk',
+              created: Math.floor(Date.now() / 1000),
+              model: model,
+              choices: [{ index: 0, delta: { role: 'assistant', content: continuationText }, finish_reason: null }]
+            })}\n\n`);
+          } else if (hasTools) {
+            console.warn('[h2-bidi] WARNING: User aborted request — tools were provided but no tool calls emitted (response had content).');
           }
+
+          // Always send the stop signal after any content
           res.write(`data: ${JSON.stringify({
             id: responseId,
             object: 'chat.completion.chunk',
