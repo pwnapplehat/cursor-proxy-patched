@@ -1105,33 +1105,48 @@ router.post('/chat/completions', async (req, res) => {
           const bidiState = await createBidiStream(authToken, bidiHeaders, cursorBody);
           console.log(`[h2-bidi] ▸ Bidirectional stream opened for fresh request`);
 
-          // ─── Initialize text-only recovery counter from message history ──
-          // The _textOnlyRecoveryCount lives on the bidiState object, which is
-          // created fresh for each request. Without this initialization, the
-          // counter always starts at 0 and the MAX_TEXT_ONLY_RECOVERIES safety
-          // valve never triggers — causing an infinite loop when the model
-          // legitimately responds with text only (e.g., greeting after /start).
+          // ─── Text-only recovery: greeting detection + counter persistence ──
           //
-          // Fix: scan the incoming message history for consecutive [proxy-recovery]
-          // tool results at the tail. These are the synthetic tool calls we
-          // injected in previous iterations of this same conversation turn.
-          // Their count tells us how many recoveries have already been attempted.
-          let existingRecoveryCount = 0;
-          for (let i = messages.length - 1; i >= 0; i--) {
-            const msg = messages[i];
-            if (msg.role === 'tool' && typeof msg.content === 'string' &&
-                msg.content.includes('[proxy-recovery]')) {
-              existingRecoveryCount++;
-            } else if (msg.role === 'assistant') {
-              // Assistant text messages interleave with tool results — skip them
-              continue;
-            } else {
-              break; // Hit a user/system/developer message — stop counting
+          // Problem 1 (greeting loop): When there's only 1 user message (e.g.,
+          // /start or /reset), the model CORRECTLY responds with text only — it's
+          // a greeting, not a "lost context" scenario. The text-only recovery
+          // must be completely disabled here or it injects synthetic tool calls
+          // that cause duplicate greeting messages.
+          //
+          // Problem 2 (counter reset): The _textOnlyRecoveryCount lives on the
+          // bidiState, which is recreated for each request. Without persisting
+          // the count from message history, the MAX_TEXT_ONLY_RECOVERIES safety
+          // valve never triggers (counter always starts at 0 → infinite loop).
+          //
+          // Fix: Detect greetings by counting user messages. For multi-turn
+          // conversations, scan history for prior [proxy-recovery] tool results
+          // to persist the counter across bidiState recreations.
+          const userMsgCount = messages.filter(m => m.role === 'user').length;
+
+          if (userMsgCount <= 1) {
+            // Initial greeting — model correctly responds with text only.
+            // Disable text-only recovery entirely (set counter above max).
+            bidiState._textOnlyRecoveryCount = 999;
+            console.log(`[h2-bidi] Initial greeting (${userMsgCount} user message) — text-only recovery disabled`);
+          } else {
+            // Multi-turn conversation — count prior recovery attempts from
+            // message history to persist the safety counter across requests.
+            let existingRecoveryCount = 0;
+            for (let i = messages.length - 1; i >= 0; i--) {
+              const msg = messages[i];
+              if (msg.role === 'tool' && typeof msg.content === 'string' &&
+                  msg.content.includes('[proxy-recovery]')) {
+                existingRecoveryCount++;
+              } else if (msg.role === 'assistant') {
+                continue; // Assistant messages interleave with tool results
+              } else {
+                break; // Hit a user/system/developer message — stop counting
+              }
             }
-          }
-          if (existingRecoveryCount > 0) {
-            bidiState._textOnlyRecoveryCount = existingRecoveryCount;
-            console.log(`[h2-bidi] Initialized recovery counter from message history: ${existingRecoveryCount} prior recovery attempt(s)`);
+            if (existingRecoveryCount > 0) {
+              bidiState._textOnlyRecoveryCount = existingRecoveryCount;
+              console.log(`[h2-bidi] Initialized recovery counter from message history: ${existingRecoveryCount} prior recovery attempt(s)`);
+            }
           }
 
           // Set up SSE response
