@@ -268,12 +268,20 @@ async function streamBidiResponse(bidiState, res, model, responseId, hasTools, t
     // timer, finalize() only fires on the 5-minute safety timeout, making
     // every tool call round-trip take 5 minutes of dead waiting.
     //
-    // This timer fires 1.5 seconds after the last frame. If we've detected
-    // tool calls, that means Cursor is done with its turn → finalize now.
+    // This timer fires after the last frame. If we've detected tool calls,
+    // that means Cursor is done with its turn → finalize now.
+    //
+    // OPTIMIZATION (2026-02-06): Reduced from 1500ms to 800ms to cut proxy
+    // latency contribution to tool call round-trips. For non-streaming tool
+    // calls (ripgrep, web_search, read_file, etc.), FAST_FINALIZE_MS (250ms)
+    // is used instead — just enough to catch parallel tool calls in a burst.
+    // This reduces the proxy's latency overhead from ~1500ms to ~250ms for
+    // the common case, making ERROR_USER_ABORTED_REQUEST much less likely.
     let turnTimer = null;
     let stallCheckCount = 0;
     let provisionalAckSent = false;
-    const TURN_INACTIVITY_MS = 1500;
+    const TURN_INACTIVITY_MS = 800;
+    const FAST_FINALIZE_MS = 250;
 
     // CONFIRMED ROOT CAUSE (diagnostic logs 2026-02-13):
     // Cursor's server sends streaming tool call frames ONLY in response to
@@ -286,13 +294,13 @@ async function streamBidiResponse(bidiState, res, model, responseId, hasTools, t
     // frames contain the COMPLETE JSON, which we then emit as a real tool call
     // to OpenClaw. This lets the native write tool work end-to-end.
     //
-    // Flow: 1.5s check → 3s provisional ack → continuation arrives → complete
+    // Flow: 0.8s check → 1.6s provisional ack → continuation arrives → complete
     // JSON detected by flushIfComplete → real tool call emitted → finalize.
     // stallCheckCount resets to 0 on every streaming frame, so force-flush
     // only triggers after 15s of CONSECUTIVE silence (no frames at all) —
     // making it safe for files of any size, no matter how long streaming takes.
 
-    function resetTurnTimer() {
+    function resetTurnTimer(overrideMs) {
       if (turnTimer) clearTimeout(turnTimer);
       turnTimer = setTimeout(() => {
         if (toolCallsEmitted) return; // Already finalized
@@ -342,7 +350,7 @@ async function streamBidiResponse(bidiState, res, model, responseId, hasTools, t
             provisionalAckSent = true;
             stallCheckCount = 0; // Reset — give time for continuation frames to arrive
           } else if (provisionalAckSent && stallCheckCount >= 10) {
-            // 15s of CONSECUTIVE silence (no streaming frames at all) after
+            // ~8s of CONSECUTIVE silence (no streaming frames at all) after
             // provisional ack — stream is genuinely dead. stallCheckCount resets
             // to 0 on every streaming frame, so this only fires when data has
             // truly stopped. Safe for large files that stream for minutes.
@@ -361,11 +369,12 @@ async function streamBidiResponse(bidiState, res, model, responseId, hasTools, t
           }
           resetTurnTimer();
         }
-      }, TURN_INACTIVITY_MS);
+      }, overrideMs || TURN_INACTIVITY_MS);
     }
 
     function onFrame({ magic, data }) {
-      resetTurnTimer(); // Reset on every frame — Cursor is still sending
+      // NOTE: resetTurnTimer() is called at the END of onFrame (not here)
+      // with smart timeout selection — see bottom of this function.
       resetSafetyTimeout(); // Keep safety timeout alive while data is flowing
 
       const { text, thinking, nativeToolCalls: frameTCs, error: frameError } =
@@ -421,6 +430,19 @@ async function streamBidiResponse(bidiState, res, model, responseId, hasTools, t
             sendTextChunk(safeText);
           }
         }
+      }
+
+      // Smart turn timer: use FAST_FINALIZE_MS (250ms) when we have completed
+      // non-streaming tool calls and no streaming calls are still accumulating.
+      // This reduces latency for common tool calls (ripgrep, web_search, read)
+      // from 800ms to ~250ms. The 250ms buffer catches parallel tool calls
+      // in the same response burst. For streaming calls (edit_file_v2 writes),
+      // use the full 800ms timer which feeds into the provisional ack and
+      // force-flush logic.
+      if (nativeToolCalls.length > 0 && !toolCallAccumulator.hasPending()) {
+        resetTurnTimer(FAST_FINALIZE_MS);
+      } else {
+        resetTurnTimer();
       }
     }
 
@@ -572,7 +594,7 @@ async function streamBidiResponse(bidiState, res, model, responseId, hasTools, t
           // finish_reason:'stop' causes OpenClaw to think the agent finished and stop
           // the entire run. Fix: inject a synthetic continuation message so the agent
           // knows to keep going.
-          const responseIsEmpty = !fullResponse || fullResponse.trim().length === 0;
+          const responseIsEmpty = !allTextAccumulated || allTextAccumulated.trim().length === 0;
 
           if (responseIsEmpty && hasTools) {
             console.warn('[h2-bidi] User aborted with EMPTY response — injecting continuation to keep agent alive');
