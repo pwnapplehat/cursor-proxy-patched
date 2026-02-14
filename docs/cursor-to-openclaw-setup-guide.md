@@ -635,31 +635,45 @@ OpenClaw's context pruning (`cache-ttl` mode) is hard-coded to only work with An
 
 ```bash
 # Patch isCacheTtlEligibleProvider to accept "cursor" provider
-docker exec openclaw node -e "
+# The function is code-split across multiple bundle files — this patches all of them
+docker exec -i openclaw node << 'PATCH_EOF'
 const fs = require('fs');
-const candidates = ['/app/dist/entry.js', '/app/dist/entry.mjs'];
-let patched = false;
-for (const file of candidates) {
+const path = require('path');
+const distDir = '/app/dist';
+const files = fs.readdirSync(distDir).filter(f => f.endsWith('.js'));
+let patchCount = 0;
+for (const fname of files) {
+  const file = path.join(distDir, fname);
   let code;
   try { code = fs.readFileSync(file, 'utf8'); } catch { continue; }
-  const marker = 'isCacheTtlEligibleProvider';
-  const fnIdx = code.indexOf('function ' + marker);
+  const marker = 'function isCacheTtlEligibleProvider';
+  const fnIdx = code.indexOf(marker);
   if (fnIdx === -1) continue;
   const region = code.substring(fnIdx, fnIdx + 600);
+  if (region.includes('"cursor"')) {
+    console.log('Already patched: ' + fname);
+    patchCount++;
+    continue;
+  }
   const rfIdx = region.lastIndexOf('return false');
-  if (rfIdx === -1) { console.error('return false not found in ' + file); continue; }
-  if (region.includes('cursor')) { console.log('Already patched: ' + file); patched = true; break; }
+  if (rfIdx === -1) {
+    console.error('return false not found in ' + fname);
+    continue;
+  }
   const globalIdx = fnIdx + rfIdx;
-  const indent = '  ';
-  const cursorCheck = 'if (normalizedProvider === \"cursor\") {\n' + indent + indent + 'return true;\n' + indent + '}\n' + indent;
+  const cursorCheck = 'if (normalizedProvider === "cursor") {\n    return true;\n  }\n  ';
   code = code.substring(0, globalIdx) + cursorCheck + code.substring(globalIdx);
   fs.writeFileSync(file, code);
-  console.log('Patched in ' + file);
-  patched = true;
-  break;
+  console.log('Patched: ' + fname);
+  patchCount++;
 }
-if (!patched) { console.error('ERROR: Could not patch'); process.exit(1); }
-"
+if (patchCount === 0) {
+  console.error('ERROR: No files patched');
+  process.exit(1);
+} else {
+  console.log('Done — patched ' + patchCount + ' file(s)');
+}
+PATCH_EOF
 ```
 
 > **Note:** This patch does not persist across OpenClaw container rebuilds or updates. Re-run it after any `docker pull` / recreate of the OpenClaw container.
