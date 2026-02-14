@@ -1011,7 +1011,7 @@ function chunkToUtf8String(chunk) {
         }
       }
       // else: unknown magic number, skip frame
-    } catch (err) {
+  } catch (err) {
       // Per-frame error — log and continue parsing subsequent frames
       // instead of aborting the entire buffer
       console.warn(`[chunkToUtf8String] Frame parse error at offset ${i} (magic=${magicNumber}, len=${dataLength}): ${err.code || err.message}`);
@@ -1042,8 +1042,8 @@ function chunkToUtf8String(chunk) {
   }
 
   return {
-    thinking: thinkingOutput.join(''),
-    text: textOutput.join('')
+    thinking: thinkingOutput.join(''), 
+    text: textOutput.join('') 
   };
 }
 

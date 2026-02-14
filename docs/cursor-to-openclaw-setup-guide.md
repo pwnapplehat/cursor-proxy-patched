@@ -55,6 +55,7 @@ Clone the patched repo and copy files:
 apt install -y git
 cd /opt && git clone https://github.com/pwnapplehat/cursor-proxy-patched.git
 
+cp /opt/cursor-proxy-patched/src/app.js /opt/cursor-proxy-app.js
 cp /opt/cursor-proxy-patched/src/utils/utils.js /opt/cursor-proxy-utils.js
 cp /opt/cursor-proxy-patched/src/routes/v1.js /opt/cursor-proxy-v1.js
 cp /opt/cursor-proxy-patched/src/utils/toolEmulation.js /opt/cursor-proxy-toolEmulation.js
@@ -62,13 +63,14 @@ cp /opt/cursor-proxy-patched/src/proto/message.js /opt/cursor-proxy-message.js
 cp /opt/cursor-proxy-patched/src/utils/h2-bidi.js /opt/cursor-proxy-h2-bidi.js
 ```
 
-Run the proxy with all 5 patched files mounted:
+Run the proxy with all 6 patched files mounted:
 
 ```bash
 docker run -d \
   --name cursor-proxy \
   --restart unless-stopped \
   -p 127.0.0.1:3010:3010 \
+  -v /opt/cursor-proxy-app.js:/app/src/app.js:ro \
   -v /opt/cursor-proxy-utils.js:/app/src/utils/utils.js:ro \
   -v /opt/cursor-proxy-v1.js:/app/src/routes/v1.js:ro \
   -v /opt/cursor-proxy-toolEmulation.js:/app/src/utils/toolEmulation.js:ro \
@@ -344,6 +346,7 @@ When new fixes are pushed to the repo:
 
 ```bash
 cd /opt/cursor-proxy-patched && git pull origin master
+cp src/app.js /opt/cursor-proxy-app.js
 cp src/utils/utils.js /opt/cursor-proxy-utils.js
 cp src/routes/v1.js /opt/cursor-proxy-v1.js
 cp src/utils/toolEmulation.js /opt/cursor-proxy-toolEmulation.js
@@ -352,7 +355,7 @@ cp src/utils/h2-bidi.js /opt/cursor-proxy-h2-bidi.js
 docker restart cursor-proxy
 ```
 
-The `git pull` fetches the latest code, the `cp` commands update the mounted files, and the container restart picks them up.
+The `git pull` fetches the latest code, the `cp` commands update the 6 mounted files, and the container restart picks them up.
 
 After updating, send `/reset` in Telegram to start a fresh session with the new environment context.
 
@@ -475,8 +478,8 @@ docker exec openclaw cat /home/node/.openclaw/openclaw.json | grep timeoutSecond
 | Symptom | Fix |
 |---|---|
 | `401 Unauthorized` | Cookie expired — refresh it (see Cookie Refresh above) |
-| Agent says "switch to Agent mode" / "no tools" | `message.js` not mounted — recreate proxy container with all 4 volume mounts |
-| Agent says "I can only read files" | Verify all 4 files are mounted: `docker exec cursor-proxy ls -la /app/src/utils/utils.js /app/src/routes/v1.js /app/src/utils/toolEmulation.js /app/src/proto/message.js` |
+| Agent says "switch to Agent mode" / "no tools" | `message.js` not mounted — recreate proxy container with all 6 volume mounts |
+| Agent says "I can only read files" | Verify all 6 files are mounted: `docker exec cursor-proxy ls -la /app/src/app.js /app/src/utils/utils.js /app/src/routes/v1.js /app/src/utils/toolEmulation.js /app/src/proto/message.js /app/src/utils/h2-bidi.js` |
 | `resource_exhausted` / rate limit | Wait, or switch model to a lighter one |
 | `"Please update to the latest version"` | Update `cursorClientVersion` in `v1.js` to match your Cursor IDE version |
 | Tool calls truncated for large files | Expected — model retries with chunked heredoc via `exec` |
@@ -485,7 +488,7 @@ docker exec openclaw cat /home/node/.openclaw/openclaw.json | grep timeoutSecond
 | `Stream terminated early` in proxy logs | Proxy-side timeouts killing connection — ensure patched `v1.js` and `app.js` are deployed (all timeouts = 0) |
 | `ERROR_USER_ABORTED_REQUEST` in proxy logs | Expected Cursor API behavior — not an error. Cursor emits this when a tool call finishes before inline result is received. Does not break tool execution. |
 | Agent responds with "What can I help you with?" after long silence | Context bloat (400+ messages) causing model confusion — send `/reset` |
-| `scp: Connection closed` when transferring files | Use the Python HTTP server workaround (see Transferring Files section above) |
+| `scp: Connection closed` when transferring files | Use the Python HTTP server workaround (see Transferring Files section below) |
 | `sessions_spawn` returns "pairing required" | Run the device pairing steps (Step 4 above) |
 | `sessions_spawn` returns "gateway closed (1008)" | Gateway bind might be `"lan"` — change to `"loopback"` in config, restart |
 | Agent says "can't spawn sub-agents" / "tools not available" | Proxy update needed — run the Updating section, then `/reset` |
@@ -494,6 +497,7 @@ docker exec openclaw cat /home/node/.openclaw/openclaw.json | grep timeoutSecond
 | `session file locked (timeout 10000ms)` | Stale lock from OOM-killed process — see Stale Session Lock Fix below |
 | Agent OOM-killed during heavy tasks (jadx, baksmali) | VM needs swap space — see Add Swap Space below |
 | `rg: Permission denied` or `rg: command not found` | ripgrep not installed in container — see Install ripgrep below |
+| `ERR_HTTP2_STREAM_ERROR` / `NGHTTP2_INTERNAL_ERROR` crash | H2 session dropped between requests — ensure patched `app.js` (process-level error handlers) and `h2-bidi.js` (guarded error emit) are deployed |
 
 ### Debug Commands
 
@@ -510,8 +514,8 @@ docker logs cursor-proxy -f --tail 10
 # Check containers are running
 docker ps --format "table {{.Names}}\t{{.Status}}"
 
-# Verify proxy mounts
-docker exec cursor-proxy ls -la /app/src/utils/utils.js /app/src/routes/v1.js /app/src/utils/toolEmulation.js /app/src/proto/message.js
+# Verify proxy mounts (all 6 patched files)
+docker exec cursor-proxy ls -la /app/src/app.js /app/src/utils/utils.js /app/src/routes/v1.js /app/src/utils/toolEmulation.js /app/src/proto/message.js /app/src/utils/h2-bidi.js
 
 # Check OpenClaw config
 docker exec openclaw cat /home/node/.openclaw/openclaw.json
