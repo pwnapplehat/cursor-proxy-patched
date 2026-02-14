@@ -544,15 +544,23 @@ function frameMessage(data, compress = false) {
 const pendingStreams = new Map();
 
 /**
- * Clean up expired pending streams (older than 10 minutes).
- * Runs periodically to prevent memory leaks.
+ * Clean up expired pending streams based on LAST ACTIVITY time.
+ * Runs periodically to prevent memory leaks from abandoned streams.
+ *
+ * CRITICAL FIX (2026-02-14): Previously used createdAt which killed
+ * active long-running streams after 10 minutes. A single bidi session
+ * can run for hours with hundreds of tool calls. Now uses lastActivityAt
+ * (updated on every data chunk, tool result send, and tool call registration)
+ * so active streams are never killed. TTL increased to 60 minutes for
+ * 24-hour bot operation — only truly abandoned streams get cleaned up.
  */
-const STREAM_TTL_MS = 10 * 60 * 1000; // 10 minutes
+const STREAM_TTL_MS = 60 * 60 * 1000; // 60 minutes of INACTIVITY before cleanup
 setInterval(() => {
   const now = Date.now();
   for (const [id, state] of pendingStreams) {
-    if (now - state.createdAt > STREAM_TTL_MS) {
-      console.log(`[h2-bidi] Cleaning up expired pending stream: ${id}`);
+    const idleMs = now - state.lastActivityAt;
+    if (idleMs > STREAM_TTL_MS) {
+      console.log(`[h2-bidi] Cleaning up idle pending stream: ${id} (idle ${Math.round(idleMs / 1000)}s)`);
       state.close();
       pendingStreams.delete(id);
     }
@@ -569,6 +577,7 @@ class BidiStreamState extends EventEmitter {
     this.session = session;
     this.stream = stream;
     this.createdAt = Date.now();
+    this.lastActivityAt = Date.now(); // Updated on every data/send/register event
     this.ended = false;
     this.responseBuffer = Buffer.alloc(0);
     this.bufferedFrames = []; // frames received while waiting for tool result
@@ -585,6 +594,7 @@ class BidiStreamState extends EventEmitter {
       this._dataChunkCount++;
       console.log(`[h2-bidi:RAW] data chunk #${this._dataChunkCount}: ${chunk.length} bytes (gap=${gap}ms, buffer=${this.responseBuffer.length})`);
       this._lastDataTime = now;
+      this.lastActivityAt = now; // Keep stream alive while data flows
       this.responseBuffer = Buffer.concat([this.responseBuffer, chunk]);
       this._parseFrames();
     });
@@ -630,6 +640,7 @@ class BidiStreamState extends EventEmitter {
 
     try {
       this.stream.write(framed);
+      this.lastActivityAt = Date.now(); // Keep stream alive on outbound data
       console.log(`[h2-bidi] Sent tool result (${framed.length} bytes) for ${cursorToolCallId} (tool=${toolEnum})`);
       this._waitingForToolResult = false;
       return true;
@@ -648,6 +659,7 @@ class BidiStreamState extends EventEmitter {
   registerPendingToolCall(proxyCallId, cursorToolCallId, toolEnum) {
     this.pendingToolCalls.set(proxyCallId, { cursorToolCallId, toolEnum });
     this._waitingForToolResult = true;
+    this.lastActivityAt = Date.now(); // Keep stream alive on tool registration
     // Also register in global map
     pendingStreams.set(proxyCallId, this);
     console.log(`[h2-bidi] Registered pending tool call: ${proxyCallId} → ${cursorToolCallId} (enum=${toolEnum})`);
