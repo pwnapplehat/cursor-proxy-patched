@@ -524,9 +524,6 @@ async function streamBidiResponse(bidiState, res, model, responseId, hasTools, t
 
       // ─── Emit tool calls or stop ─────────────────────────────────────
       if (finalToolCalls.length > 0) {
-        // Model is actively using tools — reset the text-only recovery counter
-        // so that a future text-only response is treated as a fresh anomaly.
-        bidiState._textOnlyRecoveryCount = 0;
 
         console.log(`[h2-bidi] Emitting ${finalToolCalls.length} tool call(s): ${finalToolCalls.map(tc => tc.function.name).join(', ')}`);
 
@@ -623,9 +620,6 @@ async function streamBidiResponse(bidiState, res, model, responseId, hasTools, t
           if (responseIsEmpty && hasTools) {
             console.warn('[h2-bidi] User aborted with EMPTY response — injecting synthetic tool call to keep agent alive');
 
-            // Reset text-only recovery counter — abort recovery is a different path
-            bidiState._textOnlyRecoveryCount = 0;
-
             // Synthetic exec tool call — harmless echo that keeps the loop alive
             const syntheticCallId = `call_${uuidv4()}`;
             const syntheticArgs = JSON.stringify({
@@ -679,119 +673,24 @@ async function streamBidiResponse(bidiState, res, model, responseId, hasTools, t
             bidiState.close();
           }
         } else {
-          // ─── Text-only response with tools available ────────────────────
-          // In long-running agent sessions (24hr+), the model can "forget"
-          // its task after many recovery cycles and send a text-only response
-          // (e.g., "Could you clarify what you'd like me to do?") instead of
-          // continuing with tool calls. If we send finish_reason:'stop',
-          // OpenClaw delivers the text and the agent loop TERMINATES.
-          //
-          // FIX: When tools are available and the response looks like a
-          // "lost context" message (short, no substantive content), inject
-          // a synthetic tool call to force the agent to continue its loop.
-          // The synthetic memory_search call makes the agent re-read its
-          // task context, which helps it recover and resume work.
-          //
-          // Safety: We track consecutive text-only recoveries to prevent
-          // infinite loops. After MAX_TEXT_ONLY_RECOVERIES consecutive
-          // text-only responses, we allow the stop (the model genuinely
-          // has nothing more to do, or something else is wrong).
-          const MAX_TEXT_ONLY_RECOVERIES = 3;
+          // ─── Normal text-only response — pass through as stop ───────────
+          // When the model responds with text and no tool calls, this is
+          // normal behavior: greeting, answering a question, reporting
+          // results after tool use, or finishing a task. The Cursor IDE
+          // handles this identically — it displays the text and waits for
+          // the next user input. No recovery or injection needed.
           const textLen = allTextAccumulated.trim().length;
-          const textOnlyCount = bidiState._textOnlyRecoveryCount || 0;
+          console.log(`[h2-bidi] Text-only response (${textLen} chars) — sending finish_reason:stop`);
 
-          // Heuristic: inject recovery if:
-          // 1. Tools are available (this is an agent session, not a simple chat)
-          // 2. Response is short (< 2000 chars) — likely a "confused" response,
-          //    not a genuine lengthy analysis the agent wants to deliver
-          // 3. We haven't exceeded the consecutive recovery limit
-          // 4. The response doesn't contain obvious "task complete" signals
-          const TASK_COMPLETE_SIGNALS = [
-            /(?:task|work|analysis|reverse.?engineering|RE)\s+(?:is\s+)?(?:complete|done|finished)/i,
-            /(?:completed|finished)\s+(?:the\s+)?(?:task|work|analysis|RE)/i,
-            /(?:all\s+)?(?:tasks?\s+)?(?:are\s+)?(?:done|complete|finished)/i,
-            /here\s+(?:is|are)\s+(?:the|my)\s+(?:final|complete)\s+(?:report|summary|findings|results)/i,
-            /saved?\s+(?:the\s+)?(?:final\s+)?(?:report|results|findings)\s+to/i,
-          ];
-          const looksLikeTaskComplete = TASK_COMPLETE_SIGNALS.some(p => p.test(allTextAccumulated));
+          res.write(`data: ${JSON.stringify({
+            id: responseId,
+            object: 'chat.completion.chunk',
+            created: Math.floor(Date.now() / 1000),
+            model: model,
+            choices: [{ index: 0, delta: {}, finish_reason: 'stop' }]
+          })}\n\n`);
 
-          const shouldInjectRecovery = hasTools &&
-            textLen < 2000 &&
-            textLen > 0 &&
-            textOnlyCount < MAX_TEXT_ONLY_RECOVERIES &&
-            !looksLikeTaskComplete;
-
-          if (shouldInjectRecovery) {
-            bidiState._textOnlyRecoveryCount = textOnlyCount + 1;
-            console.warn(`[h2-bidi] Text-only response with tools available (${textLen} chars, recovery #${textOnlyCount + 1}/${MAX_TEXT_ONLY_RECOVERIES}) — injecting synthetic tool call to keep agent alive`);
-            console.warn(`[h2-bidi] Response preview: ${allTextAccumulated.substring(0, 200).replace(/\n/g, '\\n')}`);
-
-            // Inject a synthetic exec tool call that reminds the agent to continue
-            const syntheticCallId = `call_${uuidv4()}`;
-            const syntheticArgs = JSON.stringify({
-              command: 'echo "[proxy-recovery] The AI model sent a text-only response without using any tools. This usually means context was lost. The agent should re-read its task context and continue working. Recovery attempt ' + (textOnlyCount + 1) + '/' + MAX_TEXT_ONLY_RECOVERIES + '."'
-            });
-
-            // Send the tool call chunk
-            res.write(`data: ${JSON.stringify({
-              id: responseId,
-              object: 'chat.completion.chunk',
-              created: Math.floor(Date.now() / 1000),
-              model: model,
-              choices: [{
-                index: 0,
-                delta: {
-                  tool_calls: [{
-                    index: 0,
-                    id: syntheticCallId,
-                    type: 'function',
-                    function: { name: 'exec', arguments: syntheticArgs }
-                  }]
-                },
-                finish_reason: null
-              }]
-            })}\n\n`);
-
-            // Send finish_reason: tool_calls (forces OpenClaw to execute and continue)
-            res.write(`data: ${JSON.stringify({
-              id: responseId,
-              object: 'chat.completion.chunk',
-              created: Math.floor(Date.now() / 1000),
-              model: model,
-              choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }]
-            })}\n\n`);
-
-            toolCallsEmitted = true;
-            // Close the bidi stream — the synthetic tool call has no cursor-side
-            // counterpart, so there's no pending stream to route a result to.
-            // OpenClaw will execute the exec, send the result as a new request,
-            // and the proxy will create a fresh bidi stream with full context.
-            bidiState.close();
-          } else {
-            // Genuine stop: either no tools, task is complete, response is substantial,
-            // or we've exhausted recovery attempts
-            if (hasTools && textOnlyCount >= MAX_TEXT_ONLY_RECOVERIES) {
-              console.warn(`[h2-bidi] Exhausted ${MAX_TEXT_ONLY_RECOVERIES} text-only recoveries — allowing stop`);
-            } else if (hasTools && looksLikeTaskComplete) {
-              console.log(`[h2-bidi] Response contains task-complete signal — allowing stop`);
-            } else if (hasTools) {
-              console.warn(`[h2-bidi] Text-only response (${textLen} chars) — allowing stop (substantial content or no tools)`);
-            }
-
-            // Reset the text-only counter on a genuine stop so future sessions start fresh
-            bidiState._textOnlyRecoveryCount = 0;
-
-            res.write(`data: ${JSON.stringify({
-              id: responseId,
-              object: 'chat.completion.chunk',
-              created: Math.floor(Date.now() / 1000),
-              model: model,
-              choices: [{ index: 0, delta: {}, finish_reason: 'stop' }]
-            })}\n\n`);
-
-            // No tool calls — stream is done, close it
-            bidiState.close();
-          }
+          bidiState.close();
         }
       }
 
@@ -1104,63 +1003,6 @@ router.post('/chat/completions', async (req, res) => {
 
           const bidiState = await createBidiStream(authToken, bidiHeaders, cursorBody);
           console.log(`[h2-bidi] ▸ Bidirectional stream opened for fresh request`);
-
-          // ─── Text-only recovery gate ─────────────────────────────────────
-          //
-          // The text-only recovery mechanism injects synthetic tool calls when
-          // the model sends a text-only response while tools are available. It
-          // was designed for 24hr+ agent sessions where the model "forgets" its
-          // task. BUT it causes duplicate messages in normal usage because it
-          // can't distinguish "model lost context" from legitimate text replies
-          // (greetings, clarifications, short completions).
-          //
-          // Robust fix: Only enable text-only recovery when the model has
-          // PREVIOUSLY used real (non-recovery) tools in this conversation.
-          // If the model has never called a real tool, there's nothing to
-          // "recover" from — it's greeting, clarifying, or choosing not to
-          // use tools. This handles ALL edge cases:
-          //   - /start or /reset greeting → no real tools → disabled → 1 msg
-          //   - "what file?" clarification → no real tools → disabled → 1 msg
-          //   - mid-task lost context → real tools exist → enabled → recovers
-          //   - task done, short reply → real tools exist → enabled, but
-          //     TASK_COMPLETE_SIGNALS + counter limit (3) act as safety net
-          //
-          // Additionally, persist the recovery counter from message history
-          // so the MAX_TEXT_ONLY_RECOVERIES safety valve works across requests
-          // (bidiState is recreated fresh each time, losing the counter).
-          const hasRealToolUsage = messages.some(m =>
-            m.role === 'tool' &&
-            typeof m.content === 'string' &&
-            !m.content.includes('[proxy-recovery]')
-          );
-
-          if (!hasRealToolUsage) {
-            // Model has never used a real tool in this conversation.
-            // Text-only responses are expected behavior, not a sign of
-            // lost context. Disable recovery entirely.
-            bidiState._textOnlyRecoveryCount = 999;
-            console.log(`[h2-bidi] No real tool usage in conversation — text-only recovery disabled`);
-          } else {
-            // Model WAS actively using tools — recovery is valid here.
-            // Persist the counter from message history so the safety
-            // valve (MAX_TEXT_ONLY_RECOVERIES=3) works across requests.
-            let existingRecoveryCount = 0;
-            for (let i = messages.length - 1; i >= 0; i--) {
-              const msg = messages[i];
-              if (msg.role === 'tool' && typeof msg.content === 'string' &&
-                  msg.content.includes('[proxy-recovery]')) {
-                existingRecoveryCount++;
-              } else if (msg.role === 'assistant') {
-                continue; // Assistant messages interleave with tool results
-              } else {
-                break; // Hit a user/system/developer message — stop counting
-              }
-            }
-            if (existingRecoveryCount > 0) {
-              bidiState._textOnlyRecoveryCount = existingRecoveryCount;
-              console.log(`[h2-bidi] Active tool session — initialized recovery counter: ${existingRecoveryCount} prior attempt(s)`);
-            }
-          }
 
           // Set up SSE response
           res.setHeader('Content-Type', 'text/event-stream');
