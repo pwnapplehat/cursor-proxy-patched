@@ -670,15 +670,19 @@ function buildRgCommand(args) {
   }
 
   // ── Context lines (only meaningful in content mode) ──
+  // Model sends -A/-B/-C (from Grep tool def); proto fields are context_after/context_before/context.
+  // Cursor native: contextBefore → --before-context, contextAfter → --after-context,
+  //   context → --before-context + --after-context (when neither contextBefore nor contextAfter set)
   if (!mode || mode === 'content') {
-    const ctxC = parseInt(args['-C'], 10);
-    if (ctxC > 0) {
+    const ctxC = parseInt(args['-C'] ?? args.context, 10);
+    const ctxA = parseInt(args['-A'] ?? args.context_after ?? args.contextAfter, 10);
+    const ctxB = parseInt(args['-B'] ?? args.context_before ?? args.contextBefore, 10);
+    if (ctxA > 0 || ctxB > 0) {
+      // Explicit before/after takes priority (matches Cursor native behavior)
+      if (ctxB > 0) flags.push(`--before-context ${ctxB}`);
+      if (ctxA > 0) flags.push(`--after-context ${ctxA}`);
+    } else if (ctxC > 0) {
       flags.push(`-C ${ctxC}`);
-    } else {
-      const ctxA = parseInt(args['-A'], 10);
-      const ctxB = parseInt(args['-B'], 10);
-      if (ctxA > 0) flags.push(`-A ${ctxA}`);
-      if (ctxB > 0) flags.push(`-B ${ctxB}`);
     }
   }
 
