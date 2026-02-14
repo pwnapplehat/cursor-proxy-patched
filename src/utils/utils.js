@@ -1137,7 +1137,7 @@ class IncrementalFrameParser {
  * @returns {{ text: string, thinking: string, nativeToolCalls: Array }}
  */
 function processSingleFrame(magic, data, seenToolCallIds) {
-  const result = { text: '', thinking: '', nativeToolCalls: [] };
+  const result = { text: '', thinking: '', nativeToolCalls: [], error: null };
 
   try {
     if (magic === 0 || magic === 1) {
@@ -1173,6 +1173,11 @@ function processSingleFrame(magic, data, seenToolCallIds) {
         }
       }
     } else if (magic === 2 || magic === 3) {
+      // ConnectRPC error/trailer frame — parse and detect Cursor API errors.
+      // Critical: Cursor sends errors like ERROR_CONVERSATION_TOO_LONG and
+      // ERROR_USER_ABORTED_REQUEST as magic 2 frames. We must detect context
+      // overflow errors and propagate them so OpenClaw can trigger compaction
+      // (auto-summarization) instead of seeing an empty normal response.
       const gunzipData = magic === 2 ? data : zlib.gunzipSync(data);
       const utf8 = gunzipData.toString('utf-8');
       try {
@@ -1180,6 +1185,15 @@ function processSingleFrame(magic, data, seenToolCallIds) {
         if (message != null && (typeof message !== 'object' ||
           (Array.isArray(message) ? message.length > 0 : Object.keys(message).length > 0))) {
           console.error(utf8);
+
+          // Detect Cursor-specific errors and translate to standard OpenAI errors
+          // so OpenClaw's isContextOverflowError() can match them and trigger
+          // auto-compaction (summarization) instead of silently failing.
+          const cursorError = detectCursorApiError(message);
+          if (cursorError) {
+            result.error = cursorError;
+            console.warn(`[processSingleFrame] Detected Cursor API error: ${cursorError.type} — "${cursorError.message}"`);
+          }
         }
       } catch (_) {}
     }
@@ -1188,6 +1202,73 @@ function processSingleFrame(magic, data, seenToolCallIds) {
   }
 
   return result;
+}
+
+/**
+ * Detect and translate Cursor-specific API errors from ConnectRPC error frames.
+ *
+ * Cursor sends errors in a non-standard format:
+ *   {"error":{"code":"invalid_argument","message":"Error","details":[
+ *     {"type":"aiserver.v1.ErrorDetails","debug":{"error":"ERROR_CONVERSATION_TOO_LONG",...}}
+ *   ]}}
+ *
+ * OpenClaw's isContextOverflowError() checks for patterns like:
+ *   "context length exceeded", "prompt is too long", "exceeds model context window"
+ *
+ * This function translates Cursor errors into messages that match those patterns,
+ * enabling OpenClaw to trigger auto-compaction (summarization) instead of silently
+ * dropping the error and leaving the agent stuck.
+ *
+ * @param {object} message - Parsed JSON from a ConnectRPC error/trailer frame
+ * @returns {{ type: string, message: string, code: string } | null}
+ */
+function detectCursorApiError(message) {
+  if (!message?.error) return null;
+
+  // Extract the Cursor-specific error code from the details array
+  let cursorErrorCode = '';
+  let cursorDetail = '';
+  const details = message.error.details;
+  if (Array.isArray(details)) {
+    for (const d of details) {
+      const debugError = d?.debug?.error || '';
+      const debugDetail = d?.debug?.details?.detail || '';
+      if (debugError) cursorErrorCode = debugError;
+      if (debugDetail) cursorDetail = debugDetail;
+    }
+  }
+
+  const code = message.error.code || '';
+  const topMessage = message.error.message || '';
+
+  // Map Cursor errors to OpenAI-format errors that OpenClaw recognizes
+  if (cursorErrorCode === 'ERROR_CONVERSATION_TOO_LONG' ||
+      cursorDetail.toLowerCase().includes('conversation is too long')) {
+    return {
+      type: 'context_overflow',
+      message: 'prompt is too long: context length exceeded — the conversation exceeds the model context window. Please compact or shorten the conversation.',
+      code: 'context_length_exceeded',
+    };
+  }
+
+  if (cursorErrorCode === 'ERROR_USER_ABORTED_REQUEST') {
+    return {
+      type: 'user_aborted',
+      message: 'Tool call ended before result was received',
+      code: 'aborted',
+    };
+  }
+
+  // Generic fallback for unrecognized Cursor errors
+  if (cursorErrorCode) {
+    return {
+      type: 'cursor_error',
+      message: `Cursor API error: ${cursorErrorCode}${cursorDetail ? ' — ' + cursorDetail : ''}`,
+      code: code || 'unknown',
+    };
+  }
+
+  return null;
 }
 
 /**

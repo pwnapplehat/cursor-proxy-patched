@@ -186,6 +186,7 @@ async function streamBidiResponse(bidiState, res, model, responseId, hasTools, t
     let allThinking = '';
     let firstChunkSent = false;
     let toolCallsEmitted = false;
+    let cursorApiError = null; // Cursor API error detected from ConnectRPC error frames
 
     // ─── Write failure injection ──────────────────────────────────────
     // If the PREVIOUS turn's write operation failed (detected by post-write
@@ -367,8 +368,16 @@ async function streamBidiResponse(bidiState, res, model, responseId, hasTools, t
       resetTurnTimer(); // Reset on every frame — Cursor is still sending
       resetSafetyTimeout(); // Keep safety timeout alive while data is flowing
 
-      const { text, thinking, nativeToolCalls: frameTCs } =
+      const { text, thinking, nativeToolCalls: frameTCs, error: frameError } =
         processSingleFrame(magic, data, seenToolCallIds);
+
+      // Capture Cursor API errors (e.g., ERROR_CONVERSATION_TOO_LONG) so
+      // finalize() can send them as proper OpenAI-format errors that trigger
+      // OpenClaw's auto-compaction (summarization) instead of silently failing.
+      if (frameError && !cursorApiError) {
+        cursorApiError = frameError;
+        console.warn(`[h2-bidi:onFrame] Captured Cursor API error: type=${frameError.type} code=${frameError.code}`);
+      }
 
       // Feed each frame's tool calls through the streaming accumulator.
       // Non-streaming calls pass through immediately. Streaming calls are
@@ -527,19 +536,64 @@ async function streamBidiResponse(bidiState, res, model, responseId, hasTools, t
 
         toolCallsEmitted = true;
       } else {
-        if (hasTools) {
-          console.warn('[h2-bidi] WARNING: Tools provided but model did not output any tool calls.');
-        }
-        res.write(`data: ${JSON.stringify({
-          id: responseId,
-          object: 'chat.completion.chunk',
-          created: Math.floor(Date.now() / 1000),
-          model: model,
-          choices: [{ index: 0, delta: {}, finish_reason: 'stop' }]
-        })}\n\n`);
+        // ─── Cursor API error handling ──────────────────────────────────
+        // If we detected a Cursor-specific error (e.g., ERROR_CONVERSATION_TOO_LONG),
+        // send it as a proper OpenAI-format error that OpenClaw/pi-ai can parse.
+        // This is CRITICAL for context overflow errors: OpenClaw's isContextOverflowError()
+        // matches patterns like "context length exceeded" and "prompt is too long", and
+        // when matched, triggers auto-compaction (summarization) to shrink the context.
+        // Without this, context overflow silently appears as an empty response.
+        if (cursorApiError && cursorApiError.type === 'context_overflow') {
+          console.error(`[h2-bidi] CONTEXT OVERFLOW detected — sending OpenAI-format error to trigger compaction`);
+          console.error(`[h2-bidi]   Error: ${cursorApiError.message}`);
 
-        // No tool calls — stream is done, close it
-        bidiState.close();
+          // Send the error as an OpenAI-format SSE error that pi-ai will parse
+          // as an API error, allowing OpenClaw to detect it and trigger compaction.
+          // The message text is specifically crafted to match OpenClaw's
+          // isContextOverflowError() patterns (from errors.ts):
+          //   - "context length exceeded" ✓
+          //   - "prompt is too long" ✓
+          //   - "exceeds model context window" ✓ (in the message)
+          res.write(`data: ${JSON.stringify({
+            error: {
+              message: cursorApiError.message,
+              type: 'invalid_request_error',
+              code: cursorApiError.code,
+            }
+          })}\n\n`);
+
+          bidiState.close();
+        } else if (cursorApiError && cursorApiError.type === 'user_aborted') {
+          // ERROR_USER_ABORTED_REQUEST — Cursor aborted the stream.
+          // This is expected behavior when tool results arrive after stream close.
+          // Send as a normal stop to avoid confusing OpenClaw.
+          if (hasTools) {
+            console.warn('[h2-bidi] WARNING: User aborted request — tools were provided but no tool calls emitted.');
+          }
+          res.write(`data: ${JSON.stringify({
+            id: responseId,
+            object: 'chat.completion.chunk',
+            created: Math.floor(Date.now() / 1000),
+            model: model,
+            choices: [{ index: 0, delta: {}, finish_reason: 'stop' }]
+          })}\n\n`);
+
+          bidiState.close();
+        } else {
+          if (hasTools) {
+            console.warn('[h2-bidi] WARNING: Tools provided but model did not output any tool calls.');
+          }
+          res.write(`data: ${JSON.stringify({
+            id: responseId,
+            object: 'chat.completion.chunk',
+            created: Math.floor(Date.now() / 1000),
+            model: model,
+            choices: [{ index: 0, delta: {}, finish_reason: 'stop' }]
+          })}\n\n`);
+
+          // No tool calls — stream is done, close it
+          bidiState.close();
+        }
       }
 
       resolve({ toolCallsEmitted });

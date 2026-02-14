@@ -491,6 +491,9 @@ docker exec openclaw cat /home/node/.openclaw/openclaw.json | grep timeoutSecond
 | Agent says "can't spawn sub-agents" / "tools not available" | Proxy update needed — run the Updating section, then `/reset` |
 | Replies arrive all at once (batched) | Set `blockStreamingBreak: "text_end"` in config (see Step 3) |
 | 10+ minute response times | Context bloat from failed tool loops — send `/reset` |
+| `session file locked (timeout 10000ms)` | Stale lock from OOM-killed process — see Stale Session Lock Fix below |
+| Agent OOM-killed during heavy tasks (jadx, baksmali) | VM needs swap space — see Add Swap Space below |
+| `rg: Permission denied` or `rg: command not found` | ripgrep not installed in container — see Install ripgrep below |
 
 ### Debug Commands
 
@@ -521,6 +524,219 @@ docker exec openclaw npx openclaw devices list
 
 # Check proxy is reachable from OpenClaw
 docker exec openclaw curl -s http://127.0.0.1:3010/v1/models | head -c 200
+```
+
+### Add Swap Space (Prevents OOM Kills)
+
+Memory-intensive operations like decompiling APKs with Jadx or Ghidra can exceed the droplet's physical RAM (e.g., trying `java -Xmx4g` on a 3.8GB RAM VM). When the Linux OOM killer terminates these processes, it can leave stale lock files that block OpenClaw sessions entirely.
+
+**Solution:** Add swap space so the OS can spill excess memory to disk instead of killing processes.
+
+Run these commands on the **host VM** (SSH into the droplet):
+
+```bash
+# Create a 4GB swap file
+fallocate -l 4G /swapfile
+chmod 600 /swapfile
+mkswap /swapfile
+swapon /swapfile
+
+# Make it persistent across reboots
+echo '/swapfile none swap sw 0 0' >> /etc/fstab
+
+# Verify swap is active
+free -h
+```
+
+You should see a `Swap` row with `4.0G` total in the `free -h` output. This survives reboots thanks to the `/etc/fstab` entry.
+
+> **Recommendation:** For heavy RE workloads (Jadx, Ghidra, baksmali on large APKs), a droplet with **8GB+ RAM** is strongly recommended. Swap prevents crashes but is slower than real RAM.
+
+### Stale Session Lock Fix
+
+If an agent process gets OOM-killed or crashes mid-operation, OpenClaw's session journal file may retain a stale `.lock` file. This prevents the session from resuming and produces errors like:
+
+```
+session file locked (timeout 10000ms): pid=1 ...jsonl.lock
+```
+
+**Diagnosis — find stale lock files:**
+
+```bash
+docker exec openclaw find /home/node/.openclaw/agents/main/sessions/ -name "*.lock" -ls
+```
+
+**Fix — remove the stale lock and restart:**
+
+```bash
+# Remove the specific stale lock file (replace <session-id> with the actual ID from the find output)
+docker exec openclaw rm /home/node/.openclaw/agents/main/sessions/<session-id>.jsonl.lock
+
+# Restart OpenClaw to clear any cached state
+docker restart openclaw
+```
+
+If there are multiple stale locks, remove them all:
+
+```bash
+docker exec openclaw find /home/node/.openclaw/agents/main/sessions/ -name "*.lock" -delete
+docker restart openclaw
+```
+
+> **Root cause:** Usually caused by OOM kills (see Add Swap Space above) or unexpected container restarts. Adding swap space prevents most occurrences.
+
+### Install ripgrep in the OpenClaw Container
+
+The AI agent uses `ripgrep` (`rg`) for fast code/text searches via the `ripgrep_raw_search` native tool. It is **not installed by default** in the OpenClaw container, causing `rg: command not found` or `Permission denied` errors.
+
+**Install ripgrep (must run as root inside the container):**
+
+```bash
+docker exec -u root openclaw bash -c 'apt-get update && apt-get install -y ripgrep'
+```
+
+> **Important:** The `-u root` flag is required. The default container user (`node`) does not have permission to run `apt-get`. Running without `-u root` produces `Permission denied` errors.
+
+**Verify it works:**
+
+```bash
+docker exec openclaw rg --version
+```
+
+You should see output like `ripgrep 13.0.0` or similar. The agent can now use `rg` for searches without falling back to slower `grep` alternatives.
+
+> **Note:** This installation does not persist across container rebuilds. If you recreate the OpenClaw container (e.g., `docker rm openclaw && docker run ...`), you'll need to reinstall ripgrep.
+
+---
+
+## Context Management (Prevents ERROR_CONVERSATION_TOO_LONG)
+
+Long-running agent sessions accumulate tool call results and messages until the context exceeds the model's 200K token window. When this happens, Cursor's API returns `ERROR_CONVERSATION_TOO_LONG` and the agent dies. This section documents the three-layer defense system that prevents this.
+
+### How It Works
+
+The system uses three layers, each operating at a different stage:
+
+1. **Context Pruning (Layer 1 — every request):** Before each API call, old tool results (older than 5 minutes, beyond the 5 most recent assistant turns) are progressively trimmed. Large results get soft-trimmed (head + tail kept, middle cut) first, then hard-cleared if context is still too large. This keeps the context lean without losing conversation flow.
+
+2. **Compaction (Layer 2 — on overflow):** If pruning isn't enough and the API returns a context overflow error, OpenClaw automatically compresses older messages into a summary using the LLM. Before summarizing, `memoryFlush` (enabled by default) prompts the agent to save important findings to `memory/YYYY-MM-DD.md` files. After compaction, the request is retried (up to 3 attempts).
+
+3. **DM History Limit (Layer 3 — safety net):** As a final backstop, only the last 100 user turns (and their associated responses) are sent to the model. Older turns are dropped entirely. This prevents runaway growth even if layers 1 and 2 can't keep up.
+
+### Proxy Error Translation
+
+The proxy translates Cursor's `ERROR_CONVERSATION_TOO_LONG` (which arrives as a protobuf error frame, not an OpenAI-format error) into an OpenAI-compatible SSE error chunk containing `"prompt is too long: context length exceeded"`. This matches the patterns in OpenClaw's `isContextOverflowError` function, triggering auto-compaction.
+
+Without this translation, the proxy would silently send `finish_reason: 'stop'` and OpenClaw would think the response simply ended, never triggering compaction.
+
+### Required OpenClaw Container Patch
+
+OpenClaw's context pruning (`cache-ttl` mode) is hard-coded to only work with Anthropic providers. Since the Cursor proxy presents as a custom provider, this check must be patched in the bundled JavaScript:
+
+```bash
+# Patch isCacheTtlEligibleProvider to accept "cursor" provider
+docker exec openclaw node -e "
+const fs = require('fs');
+const candidates = ['/app/dist/entry.js', '/app/dist/entry.mjs'];
+let patched = false;
+for (const file of candidates) {
+  let code;
+  try { code = fs.readFileSync(file, 'utf8'); } catch { continue; }
+  const marker = 'isCacheTtlEligibleProvider';
+  const fnIdx = code.indexOf('function ' + marker);
+  if (fnIdx === -1) continue;
+  const region = code.substring(fnIdx, fnIdx + 600);
+  const rfIdx = region.lastIndexOf('return false');
+  if (rfIdx === -1) { console.error('return false not found in ' + file); continue; }
+  if (region.includes('cursor')) { console.log('Already patched: ' + file); patched = true; break; }
+  const globalIdx = fnIdx + rfIdx;
+  const indent = '  ';
+  const cursorCheck = 'if (normalizedProvider === \"cursor\") {\n' + indent + indent + 'return true;\n' + indent + '}\n' + indent;
+  code = code.substring(0, globalIdx) + cursorCheck + code.substring(globalIdx);
+  fs.writeFileSync(file, code);
+  console.log('Patched in ' + file);
+  patched = true;
+  break;
+}
+if (!patched) { console.error('ERROR: Could not patch'); process.exit(1); }
+"
+```
+
+> **Note:** This patch does not persist across OpenClaw container rebuilds or updates. Re-run it after any `docker pull` / recreate of the OpenClaw container.
+
+### openclaw.json Configuration
+
+Add these settings under `agents.defaults` in `/home/node/.openclaw/openclaw.json`:
+
+```json
+{
+  "agents": {
+    "defaults": {
+      "contextTokens": 200000,
+      "compaction": {
+        "mode": "safeguard",
+        "maxHistoryShare": 0.6,
+        "reserveTokensFloor": 20000
+      },
+      "contextPruning": {
+        "mode": "cache-ttl",
+        "ttl": "5m",
+        "keepLastAssistants": 5,
+        "softTrimRatio": 0.4,
+        "hardClearRatio": 0.6,
+        "minPrunableToolChars": 30000,
+        "softTrim": {
+          "maxChars": 6000,
+          "headChars": 2500,
+          "tailChars": 2500
+        },
+        "hardClear": {
+          "enabled": true,
+          "placeholder": "[Earlier tool result cleared to manage context. Key findings preserved in conversation history.]"
+        }
+      }
+    }
+  },
+  "channels": {
+    "telegram": {
+      "dmHistoryLimit": 100
+    }
+  }
+}
+```
+
+**Key parameter explanations:**
+
+- `contextTokens: 200000` — matches the model's context window (acts as a cap)
+- `compaction.maxHistoryShare: 0.6` — allows up to 60% of context for history before pruning old messages
+- `compaction.reserveTokensFloor: 20000` — always keeps 20K tokens free for the next response
+- `contextPruning.ttl: "5m"` — tool results older than 5 minutes become eligible for trimming
+- `contextPruning.keepLastAssistants: 5` — the 5 most recent assistant responses are never pruned
+- `contextPruning.softTrim` — large tool results are trimmed to 6000 chars (2500 head + 2500 tail)
+- `contextPruning.hardClear` — if soft-trim isn't enough, old results are replaced entirely with a placeholder
+- `dmHistoryLimit: 100` — only the last 100 user turns are sent to the model (safety net)
+- `memoryFlush` — enabled by default (not set explicitly); before compaction, the agent saves important findings to memory files
+
+### Verification
+
+After applying all changes and restarting OpenClaw:
+
+```bash
+docker exec openclaw node -e "
+const cfg = require('/home/node/.openclaw/openclaw.json');
+console.log('contextTokens:', cfg.agents?.defaults?.contextTokens);
+console.log('compaction.mode:', cfg.agents?.defaults?.compaction?.mode);
+console.log('contextPruning.mode:', cfg.agents?.defaults?.contextPruning?.mode);
+console.log('dmHistoryLimit:', cfg.channels?.telegram?.dmHistoryLimit);
+"
+```
+
+Expected output:
+```
+contextTokens: 200000
+compaction.mode: safeguard
+contextPruning.mode: cache-ttl
+dmHistoryLimit: 100
 ```
 
 ---
@@ -628,11 +844,14 @@ ls -lh /tmp/snapchat.apk && docker cp /tmp/snapchat.apk openclaw:/home/node/.ope
 2. **Rate limits** — each tool call round-trip is a separate API request; heavy use burns through limits fast
 3. **ToS violation** — your Cursor account could be banned
 4. **Tool emulation** — native Cursor tools (exec, read, write, edit, web_search) work reliably; extended OpenClaw tools work via the `__oc` gateway through `exec`
-5. **Context bloat** — long sessions with many tool calls accumulate context, increasing response times (60–127s per request at 400+ messages); use `/reset` periodically
+5. **Context management** — long sessions are automatically managed via three layers (pruning, compaction, history limit); see Context Management section for setup and the required container patch
 6. **Sub-agent scope** — sub-agents spawned via `sessions_spawn` cannot spawn their own sub-agents (one level deep)
 7. **Agent timeout** — OpenClaw default is 10 minutes (600s); increase to 86400 (24h) for long-running tasks (see Agent Timeout Configuration)
 8. **File transfer** — `scp`/`sftp` may fail on some droplets; use the Python HTTP server method (see Transferring Files section)
+9. **OOM kills on low-RAM droplets** — memory-intensive tasks (Jadx, Ghidra, baksmali) can trigger Linux OOM killer on VMs with less than 8GB RAM; add swap space to mitigate (see Add Swap Space under Troubleshooting)
+10. **Stale session locks** — OOM kills or crashes can leave `.lock` files blocking sessions; manual cleanup required (see Stale Session Lock Fix under Troubleshooting)
+11. **ripgrep not pre-installed** — the OpenClaw container does not include `ripgrep` by default; must be installed manually as root, and does not persist across container rebuilds (see Install ripgrep under Troubleshooting)
 
 ---
 
-*Last updated: February 13, 2026 (added file transfer guide, agent timeout config, proxy timeout docs). Patched repo: [github.com/pwnapplehat/cursor-proxy-patched](https://github.com/pwnapplehat/cursor-proxy-patched).*
+*Last updated: February 14, 2026 (added context management system, proxy error translation, swap space setup, stale session lock fix, ripgrep installation guide). Patched repo: [github.com/pwnapplehat/cursor-proxy-patched](https://github.com/pwnapplehat/cursor-proxy-patched).*
