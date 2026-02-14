@@ -661,7 +661,13 @@ function buildRgCommand(args) {
   else flags.push('-n');
 
   // ── Case insensitivity ──
-  if (args['-i'] === true) flags.push('-i');
+  // Model sends "-i": true (from Grep tool def); proto field is "case_insensitive".
+  // Cursor's native client: caseInsensitive === true → --ignore-case, else → --case-sensitive
+  if (args['-i'] === true || args.case_insensitive === true || args.caseInsensitive === true) {
+    flags.push('--ignore-case');
+  } else {
+    flags.push('--case-sensitive');
+  }
 
   // ── Context lines (only meaningful in content mode) ──
   if (!mode || mode === 'content') {
