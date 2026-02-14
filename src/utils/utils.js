@@ -726,11 +726,11 @@ const SPECIAL_TOOL_CONVERSIONS = {
   // ─── Directory listing ──────────────────────────────────────────────
   'list_dir': (args) => ({
     name: 'exec',
-    arguments: { command: `ls -la ${shellEscape(args.target_directory || args.directory_path || args.path || '.')}` },
+    arguments: { command: `ls -la ${shellEscape(args.target_directory || args.directory_path || args.path || '.')}`, yieldMs: 120000 },
   }),
   'list_dir_v2': (args) => ({
     name: 'exec',
-    arguments: { command: `ls -la ${shellEscape(args.target_directory || args.directory_path || args.path || '.')}` },
+    arguments: { command: `ls -la ${shellEscape(args.target_directory || args.directory_path || args.path || '.')}`, yieldMs: 120000 },
   }),
 
   // ─── Search tools ──────────────────────────────────────────────────
@@ -756,7 +756,7 @@ const SPECIAL_TOOL_CONVERSIONS = {
     }
     return {
       name: 'exec',
-      arguments: { command: `rm -f ${shellEscape(pathVal)}` },
+      arguments: { command: `rm -f ${shellEscape(pathVal)}`, yieldMs: 120000 },
     };
   },
 
@@ -957,6 +957,15 @@ function convertNativeToolCall(tc) {
     if (CURSOR_DROP_PARAMS.has(key)) continue;
     const mappedKey = CURSOR_TO_OPENCLAW_PARAMS[key] || key;
     mappedArgs[mappedKey] = value;
+  }
+
+  // ── Inject yieldMs for all exec calls ──
+  // OpenClaw auto-backgrounds commands after yieldMs (default 10s).
+  // The global config tools.exec.backgroundMs may not hot-reload reliably,
+  // and the PI_BASH_YIELD_MS env var can override it.
+  // Safest: always send yieldMs per-call for exec tools.
+  if (openclawName === 'exec' && !('yieldMs' in mappedArgs)) {
+    mappedArgs.yieldMs = 120000;
   }
 
   console.log(`[convertNativeToolCall] ${cursorName} → ${openclawName} (params: ${Object.keys(args).join(',')} → ${Object.keys(mappedArgs).join(',')})`);
