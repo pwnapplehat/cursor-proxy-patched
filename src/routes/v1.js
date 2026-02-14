@@ -1105,6 +1105,35 @@ router.post('/chat/completions', async (req, res) => {
           const bidiState = await createBidiStream(authToken, bidiHeaders, cursorBody);
           console.log(`[h2-bidi] ▸ Bidirectional stream opened for fresh request`);
 
+          // ─── Initialize text-only recovery counter from message history ──
+          // The _textOnlyRecoveryCount lives on the bidiState object, which is
+          // created fresh for each request. Without this initialization, the
+          // counter always starts at 0 and the MAX_TEXT_ONLY_RECOVERIES safety
+          // valve never triggers — causing an infinite loop when the model
+          // legitimately responds with text only (e.g., greeting after /start).
+          //
+          // Fix: scan the incoming message history for consecutive [proxy-recovery]
+          // tool results at the tail. These are the synthetic tool calls we
+          // injected in previous iterations of this same conversation turn.
+          // Their count tells us how many recoveries have already been attempted.
+          let existingRecoveryCount = 0;
+          for (let i = messages.length - 1; i >= 0; i--) {
+            const msg = messages[i];
+            if (msg.role === 'tool' && typeof msg.content === 'string' &&
+                msg.content.includes('[proxy-recovery]')) {
+              existingRecoveryCount++;
+            } else if (msg.role === 'assistant') {
+              // Assistant text messages interleave with tool results — skip them
+              continue;
+            } else {
+              break; // Hit a user/system/developer message — stop counting
+            }
+          }
+          if (existingRecoveryCount > 0) {
+            bidiState._textOnlyRecoveryCount = existingRecoveryCount;
+            console.log(`[h2-bidi] Initialized recovery counter from message history: ${existingRecoveryCount} prior recovery attempt(s)`);
+          }
+
           // Set up SSE response
           res.setHeader('Content-Type', 'text/event-stream');
           res.setHeader('Cache-Control', 'no-cache');
