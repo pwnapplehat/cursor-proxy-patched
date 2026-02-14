@@ -1105,32 +1105,45 @@ router.post('/chat/completions', async (req, res) => {
           const bidiState = await createBidiStream(authToken, bidiHeaders, cursorBody);
           console.log(`[h2-bidi] ▸ Bidirectional stream opened for fresh request`);
 
-          // ─── Text-only recovery: greeting detection + counter persistence ──
+          // ─── Text-only recovery gate ─────────────────────────────────────
           //
-          // Problem 1 (greeting loop): When there's only 1 user message (e.g.,
-          // /start or /reset), the model CORRECTLY responds with text only — it's
-          // a greeting, not a "lost context" scenario. The text-only recovery
-          // must be completely disabled here or it injects synthetic tool calls
-          // that cause duplicate greeting messages.
+          // The text-only recovery mechanism injects synthetic tool calls when
+          // the model sends a text-only response while tools are available. It
+          // was designed for 24hr+ agent sessions where the model "forgets" its
+          // task. BUT it causes duplicate messages in normal usage because it
+          // can't distinguish "model lost context" from legitimate text replies
+          // (greetings, clarifications, short completions).
           //
-          // Problem 2 (counter reset): The _textOnlyRecoveryCount lives on the
-          // bidiState, which is recreated for each request. Without persisting
-          // the count from message history, the MAX_TEXT_ONLY_RECOVERIES safety
-          // valve never triggers (counter always starts at 0 → infinite loop).
+          // Robust fix: Only enable text-only recovery when the model has
+          // PREVIOUSLY used real (non-recovery) tools in this conversation.
+          // If the model has never called a real tool, there's nothing to
+          // "recover" from — it's greeting, clarifying, or choosing not to
+          // use tools. This handles ALL edge cases:
+          //   - /start or /reset greeting → no real tools → disabled → 1 msg
+          //   - "what file?" clarification → no real tools → disabled → 1 msg
+          //   - mid-task lost context → real tools exist → enabled → recovers
+          //   - task done, short reply → real tools exist → enabled, but
+          //     TASK_COMPLETE_SIGNALS + counter limit (3) act as safety net
           //
-          // Fix: Detect greetings by counting user messages. For multi-turn
-          // conversations, scan history for prior [proxy-recovery] tool results
-          // to persist the counter across bidiState recreations.
-          const userMsgCount = messages.filter(m => m.role === 'user').length;
+          // Additionally, persist the recovery counter from message history
+          // so the MAX_TEXT_ONLY_RECOVERIES safety valve works across requests
+          // (bidiState is recreated fresh each time, losing the counter).
+          const hasRealToolUsage = messages.some(m =>
+            m.role === 'tool' &&
+            typeof m.content === 'string' &&
+            !m.content.includes('[proxy-recovery]')
+          );
 
-          if (userMsgCount <= 1) {
-            // Initial greeting — model correctly responds with text only.
-            // Disable text-only recovery entirely (set counter above max).
+          if (!hasRealToolUsage) {
+            // Model has never used a real tool in this conversation.
+            // Text-only responses are expected behavior, not a sign of
+            // lost context. Disable recovery entirely.
             bidiState._textOnlyRecoveryCount = 999;
-            console.log(`[h2-bidi] Initial greeting (${userMsgCount} user message) — text-only recovery disabled`);
+            console.log(`[h2-bidi] No real tool usage in conversation — text-only recovery disabled`);
           } else {
-            // Multi-turn conversation — count prior recovery attempts from
-            // message history to persist the safety counter across requests.
+            // Model WAS actively using tools — recovery is valid here.
+            // Persist the counter from message history so the safety
+            // valve (MAX_TEXT_ONLY_RECOVERIES=3) works across requests.
             let existingRecoveryCount = 0;
             for (let i = messages.length - 1; i >= 0; i--) {
               const msg = messages[i];
@@ -1145,7 +1158,7 @@ router.post('/chat/completions', async (req, res) => {
             }
             if (existingRecoveryCount > 0) {
               bidiState._textOnlyRecoveryCount = existingRecoveryCount;
-              console.log(`[h2-bidi] Initialized recovery counter from message history: ${existingRecoveryCount} prior recovery attempt(s)`);
+              console.log(`[h2-bidi] Active tool session — initialized recovery counter: ${existingRecoveryCount} prior attempt(s)`);
             }
           }
 
