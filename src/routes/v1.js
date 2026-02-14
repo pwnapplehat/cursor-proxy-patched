@@ -281,7 +281,15 @@ async function streamBidiResponse(bidiState, res, model, responseId, hasTools, t
     let stallCheckCount = 0;
     let provisionalAckSent = false;
     const TURN_INACTIVITY_MS = 800;
-    const FAST_FINALIZE_MS = 250;
+    // OPTIMIZATION (2026-02-14): Reduced from 250ms to 80ms.
+    // This is the delay before finalizing non-streaming tool calls (read_file,
+    // run_terminal_cmd, ripgrep, etc. — the vast majority of calls).
+    // 80ms is enough to catch parallel tool calls in a burst (Cursor sends
+    // them within ~10-50ms of each other) while minimizing the per-call
+    // overhead that accumulates over 20+ tool calls per session.
+    // At 250ms x 20 calls = 5s of unnecessary delay that pushes closer to
+    // Cursor's server-side timeout. At 80ms x 20 calls = 1.6s total.
+    const FAST_FINALIZE_MS = 80;
 
     // CONFIRMED ROOT CAUSE (diagnostic logs 2026-02-13):
     // Cursor's server sends streaming tool call frames ONLY in response to

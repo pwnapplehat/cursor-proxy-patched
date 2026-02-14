@@ -661,7 +661,7 @@ class BidiStreamState extends EventEmitter {
    * @param {string} outputText
    */
   sendToolResult(toolEnum, cursorToolCallId, outputText) {
-    // Stop heartbeat if any (no-op since heartbeat is disabled, kept for safety)
+    // Stop heartbeat — the real result is here
     this._stopWaitHeartbeat();
 
     if (this.ended || !this.stream || this.stream.destroyed) {
@@ -701,24 +701,13 @@ class BidiStreamState extends EventEmitter {
 
   /**
    * Start buffering frames (while waiting for OpenClaw to execute tool).
-   *
-   * NOTE (2026-02-14): Application-level heartbeats REMOVED.
-   * We previously sent empty ConnectRPC frames every 8s while waiting
-   * for tool results. However, native Cursor clients ONLY send two types
-   * of client-to-server messages: (1) the initial request and (2) tool
-   * result messages. Our empty heartbeat frames were extra data that
-   * Cursor's server doesn't expect. After 20+ tool calls with many
-   * heartbeats, the accumulated unexpected frames likely triggered
-   * Cursor's server to abort with ERROR_USER_ABORTED_REQUEST.
-   *
-   * H2-level PINGs (every 30s, transport layer) are sufficient to keep
-   * the TCP connection alive through NAT/firewalls/LBs without sending
-   * any application-level data that Cursor's server might misinterpret.
+   * Also starts the wait-heartbeat interval to keep the bidi stream
+   * active at the application level while OpenClaw executes the tool.
    */
   startBuffering() {
     this._waitingForToolResult = true;
     this.bufferedFrames = [];
-    // Heartbeat intentionally NOT started — see comment above
+    this._startWaitHeartbeat();
   }
 
   /**
@@ -758,8 +747,14 @@ class BidiStreamState extends EventEmitter {
 
   /**
    * Start periodic heartbeat while waiting for tool results from OpenClaw.
-   * Sends an application-level signal every 8 seconds to prevent Cursor's
-   * server from aborting due to idle stream detection.
+   *
+   * TUNING (2026-02-14): Interval increased from 8s to 25s.
+   * At 8s, a 100-second tool execution sends ~12 heartbeat frames.
+   * Over 20+ tool calls, that's dozens of extra client→server frames
+   * that native Cursor never sends. Cursor's server may count or rate-limit
+   * client messages. At 25s, the same 100s tool sends ~4 frames, and fast
+   * tools (< 25s, the majority) send ZERO heartbeats — much closer to
+   * native Cursor behavior. Still keeps the stream alive for long operations.
    */
   _startWaitHeartbeat() {
     this._stopWaitHeartbeat();
@@ -769,7 +764,7 @@ class BidiStreamState extends EventEmitter {
         return;
       }
       this.sendHeartbeat();
-    }, 8 * 1000); // every 8 seconds
+    }, 25 * 1000); // every 25 seconds
   }
 
   /**
