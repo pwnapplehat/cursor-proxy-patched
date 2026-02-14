@@ -636,10 +636,13 @@ const CURSOR_TO_OPENCLAW_PARAMS = {
   'contents': 'content',
   'contents_after_edit': 'content',     // EditFileV2Params full-file replace
   'search_term': 'query',
+  'is_background': 'background',        // Cursor sends is_background; OpenClaw exec uses 'background'
 };
 
 // Cursor-specific params to drop (not used by OpenClaw)
-const CURSOR_DROP_PARAMS = new Set(['explanation', 'is_background', 'blocking']);
+// NOTE: is_background is NOT dropped — it maps to OpenClaw's 'background' param (see above).
+// blocking is dropped because OpenClaw uses yieldMs instead.
+const CURSOR_DROP_PARAMS = new Set(['explanation', 'blocking']);
 
 // ─── Ripgrep command builder ─────────────────────────────────────────
 // Translates Cursor's ripgrep tool args into a proper `rg` shell command.
@@ -710,7 +713,11 @@ function buildRgCommand(args) {
     cmd += ` | head -${headLimit}`;
   }
 
-  return { name: 'exec', arguments: { command: cmd } };
+  // ── yieldMs override ──
+  // OpenClaw auto-backgrounds commands after `yieldMs` (default 10s from tools.exec.backgroundMs).
+  // Ripgrep on large codebases can legitimately take 15-60s with full-content scans.
+  // Set a per-call yieldMs of 120s so rg has time to finish before being auto-backgrounded.
+  return { name: 'exec', arguments: { command: cmd, yieldMs: 120000 } };
 }
 
 // Tools that need full argument restructuring (not just param rename).
@@ -731,11 +738,11 @@ const SPECIAL_TOOL_CONVERSIONS = {
   'ripgrep_search':     (args) => buildRgCommand(args),
   'file_search': (args) => ({
     name: 'exec',
-    arguments: { command: `find ${shellEscape(args.path || '.')} -name ${shellEscape(args.pattern || args.query || '*')} 2>/dev/null` },
+    arguments: { command: `find ${shellEscape(args.path || '.')} -name ${shellEscape(args.pattern || args.query || '*')} 2>/dev/null`, yieldMs: 120000 },
   }),
   'glob_file_search': (args) => ({
     name: 'exec',
-    arguments: { command: `find ${shellEscape(args.path || '.')} -name ${shellEscape(args.glob_pattern || args.pattern || '*')} 2>/dev/null` },
+    arguments: { command: `find ${shellEscape(args.path || '.')} -name ${shellEscape(args.glob_pattern || args.pattern || '*')} 2>/dev/null`, yieldMs: 120000 },
   }),
 
   // ─── File delete ─────────────────────────────────────────────────────

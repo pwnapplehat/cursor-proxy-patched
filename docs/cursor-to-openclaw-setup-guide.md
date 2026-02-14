@@ -178,6 +178,11 @@ cat > /home/node/.openclaw/openclaw.json << '\''OCEOF'\''
         "enabled": true
       }
     }
+  },
+  "tools": {
+    "exec": {
+      "backgroundMs": 120000
+    }
   }
 }
 OCEOF
@@ -473,6 +478,40 @@ docker exec openclaw cat /home/node/.openclaw/openclaw.json | grep timeoutSecond
 
 > **Note:** The maximum allowed value is `86400` (24 hours) — OpenClaw's schema enforces this hard cap. Setting `0` is invalid (schema requires a positive integer). The CloudClaw dashboard default is 600 seconds (10 minutes) to prevent excessive API credit usage for other users.
 
+### Exec Auto-Background Timeout (tools.exec.backgroundMs)
+
+OpenClaw's `exec` tool auto-backgrounds any command that takes longer than `tools.exec.backgroundMs` (default: **10000ms = 10 seconds**). When a command is auto-backgrounded, it returns `status: "running"` instead of the actual output — the AI model sees "Command still running" and loses the result.
+
+This is already configured in Step 3 (`"tools": { "exec": { "backgroundMs": 120000 } }`), but if you need to change it on an existing deployment:
+
+```bash
+docker exec -u root openclaw bash -c '
+python3 -c "
+import json
+cfg_path = \"/home/node/.openclaw/openclaw.json\"
+with open(cfg_path) as f:
+    cfg = json.load(f)
+if \"tools\" not in cfg:
+    cfg[\"tools\"] = {}
+if \"exec\" not in cfg[\"tools\"]:
+    cfg[\"tools\"][\"exec\"] = {}
+cfg[\"tools\"][\"exec\"][\"backgroundMs\"] = 120000
+with open(cfg_path, \"w\") as f:
+    json.dump(cfg, f, indent=2)
+print(\"Done — exec backgroundMs set to 120000 (2 minutes)\")
+"'
+docker exec -u root openclaw chown node:node /home/node/.openclaw/openclaw.json
+docker restart openclaw
+```
+
+Verify:
+
+```bash
+docker exec openclaw cat /home/node/.openclaw/openclaw.json | python3 -c "import sys,json; c=json.load(sys.stdin); print('backgroundMs:', c.get('tools',{}).get('exec',{}).get('backgroundMs','NOT SET'))"
+```
+
+> **Why 120000 (2 minutes)?** On large codebases (3+ GB, 200K+ files), `rg`, `grep`, and `find` commands can legitimately take 15-60 seconds. The default 10s causes these to be auto-backgrounded, which breaks the tool result flow. 120s gives search tools enough time while still catching truly stuck commands.
+
 ---
 
 ## Troubleshooting
@@ -498,6 +537,7 @@ docker exec openclaw cat /home/node/.openclaw/openclaw.json | grep timeoutSecond
 | 10+ minute response times | Context bloat from failed tool loops — send `/reset` |
 | `session file locked (timeout 10000ms)` | Stale lock from OOM-killed process — see Stale Session Lock Fix below |
 | Agent OOM-killed during heavy tasks (jadx, baksmali) | VM needs swap space — see Add Swap Space below |
+| `rg`/`grep`/`find` returns "Command still running" | OpenClaw auto-backgrounded the command (default 10s) — increase `tools.exec.backgroundMs` to `120000` (see Exec Auto-Background Timeout above) |
 | `rg: Permission denied` or `rg: command not found` | ripgrep not installed in container — see Install ripgrep below |
 | `ERR_HTTP2_STREAM_ERROR` / `NGHTTP2_INTERNAL_ERROR` crash | H2 session dropped between requests — ensure patched `app.js` (process-level error handlers) and `h2-bidi.js` (guarded error emit) are deployed |
 
