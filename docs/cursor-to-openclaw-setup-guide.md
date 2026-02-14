@@ -373,7 +373,7 @@ When the cookie expires (proxy shows 401 errors):
 2. Copy the new cookie
 3. Update the cookie inside the OpenClaw container:
    ```bash
-   docker exec openclaw bash -c '
+   docker exec -u root openclaw bash -c '
    python3 -c "
    import json
    cfg = json.load(open(\"/home/node/.openclaw/openclaw.json\"))
@@ -381,6 +381,7 @@ When the cookie expires (proxy shows 401 errors):
    json.dump(cfg, open(\"/home/node/.openclaw/openclaw.json\", \"w\"), indent=2)
    print(\"Cookie updated.\")
    "'
+   docker exec -u root openclaw chown node:node /home/node/.openclaw/openclaw.json
    ```
 4. Restart:
    ```bash
@@ -449,7 +450,7 @@ These are already baked into the patched repo. No action needed.
 To increase the agent run timeout (e.g., to 24 hours for long reverse engineering sessions):
 
 ```bash
-docker exec openclaw bash -c '
+docker exec -u root openclaw bash -c '
 python3 -c "
 import json
 cfg_path = \"/home/node/.openclaw/openclaw.json\"
@@ -460,6 +461,7 @@ with open(cfg_path, \"w\") as f:
     json.dump(cfg, f, indent=2)
 print(\"Done — agent timeout set to 86400s (24 hours)\")
 "'
+docker exec -u root openclaw chown node:node /home/node/.openclaw/openclaw.json
 docker restart openclaw
 ```
 
