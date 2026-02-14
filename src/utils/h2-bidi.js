@@ -608,7 +608,15 @@ class BidiStreamState extends EventEmitter {
     this.stream.on('error', (err) => {
       console.error(`[h2-bidi] Stream error: ${err.message}`);
       this.ended = true;
-      this.emit('error', err);
+      // Only re-emit if there are listeners attached. After a request completes,
+      // v1.js removes its error listener. If the H2 session drops between
+      // requests, this error fires with no listeners — Node.js would throw
+      // an unhandled 'error' event and crash the process. Guard against that.
+      if (this.listenerCount('error') > 0) {
+        this.emit('error', err);
+      } else {
+        console.warn(`[h2-bidi] Stream error with no listeners (session dropped between requests) — suppressed to prevent crash`);
+      }
     });
 
     // Diagnose HTTP/2 flow control issues
@@ -930,6 +938,9 @@ async function createBidiStream(authToken, headers, initialBody) {
 
     session.on('error', (err) => {
       console.error(`[h2-bidi] Session error: ${err.message}`);
+      // reject() is a no-op if the Promise already resolved (session was
+      // successfully created and is now being used). The error is logged
+      // above for diagnostics. No need to throw or crash.
       reject(err);
     });
 

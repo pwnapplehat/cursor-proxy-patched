@@ -2,6 +2,17 @@ const express = require('express');
 const morgan = require('morgan');
 const app = express();
 
+// ─── Process-level safety nets ──────────────────────────────────────────
+// Prevent the proxy from crashing on stray unhandled errors (e.g., H2
+// stream errors that fire after listeners are removed, network drops, etc.)
+process.on('uncaughtException', (err) => {
+  console.error(`[PROCESS] Uncaught exception (non-fatal): ${err.message}`);
+  console.error(err.stack);
+});
+process.on('unhandledRejection', (reason) => {
+  console.error(`[PROCESS] Unhandled rejection (non-fatal):`, reason);
+});
+
 const config = require('./config/config');
 const routes = require('./routes');
 
