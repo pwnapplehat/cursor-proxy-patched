@@ -661,6 +661,9 @@ class BidiStreamState extends EventEmitter {
    * @param {string} outputText
    */
   sendToolResult(toolEnum, cursorToolCallId, outputText) {
+    // Stop heartbeat — the real result is here
+    this._stopWaitHeartbeat();
+
     if (this.ended || !this.stream || this.stream.destroyed) {
       console.warn('[h2-bidi] Cannot send tool result — stream already ended');
       return false;
@@ -698,10 +701,74 @@ class BidiStreamState extends EventEmitter {
 
   /**
    * Start buffering frames (while waiting for OpenClaw to execute tool).
+   * Also starts the wait-heartbeat interval to keep the bidi stream
+   * active at the application level while OpenClaw executes the tool.
    */
   startBuffering() {
     this._waitingForToolResult = true;
     this.bufferedFrames = [];
+    this._startWaitHeartbeat();
+  }
+
+  /**
+   * Send a lightweight application-level heartbeat on the bidi stream.
+   *
+   * In the Cursor IDE, tool results are sent directly on the bidi stream
+   * with zero intermediate hops. Our proxy introduces an HTTP break
+   * (OpenClaw executes the tool and sends a NEW request with the result).
+   * During this break, the bidi stream is idle at the application level —
+   * only H2 PINGs (transport-level) flow. Cursor's server may interpret
+   * this application-level silence as "client abandoned the request" and
+   * abort with ERROR_USER_ABORTED_REQUEST.
+   *
+   * This heartbeat sends a minimal empty ConnectRPC envelope (5 bytes:
+   * [0x00][0x00000000]) on the stream. It's a valid ConnectRPC frame
+   * with an empty protobuf payload — most servers ignore empty messages
+   * but the DATA frame on the H2 stream keeps the connection alive at
+   * the application level.
+   *
+   * @returns {boolean} true if sent successfully
+   */
+  sendHeartbeat() {
+    if (this.ended || !this.stream || this.stream.destroyed) return false;
+
+    // Empty ConnectRPC frame: flag=0 (uncompressed), length=0, no payload
+    const emptyFrame = frameMessage(Buffer.alloc(0));
+    try {
+      this.stream.write(emptyFrame);
+      this.lastActivityAt = Date.now();
+      console.log(`[h2-bidi:HEARTBEAT] Sent empty frame (${emptyFrame.length} bytes) to keep stream active`);
+      return true;
+    } catch (err) {
+      console.warn(`[h2-bidi:HEARTBEAT] Failed to send: ${err.message}`);
+      return false;
+    }
+  }
+
+  /**
+   * Start periodic heartbeat while waiting for tool results from OpenClaw.
+   * Sends an application-level signal every 8 seconds to prevent Cursor's
+   * server from aborting due to idle stream detection.
+   */
+  _startWaitHeartbeat() {
+    this._stopWaitHeartbeat();
+    this._waitHeartbeatInterval = setInterval(() => {
+      if (!this._waitingForToolResult || this.ended) {
+        this._stopWaitHeartbeat();
+        return;
+      }
+      this.sendHeartbeat();
+    }, 8 * 1000); // every 8 seconds
+  }
+
+  /**
+   * Stop the wait-heartbeat interval.
+   */
+  _stopWaitHeartbeat() {
+    if (this._waitHeartbeatInterval) {
+      clearInterval(this._waitHeartbeatInterval);
+      this._waitHeartbeatInterval = null;
+    }
   }
 
   /**
@@ -801,7 +868,8 @@ class BidiStreamState extends EventEmitter {
    * Close the stream and session.
    */
   close() {
-    // Stop keepalive PINGs first
+    // Stop all intervals first
+    this._stopWaitHeartbeat();
     if (this._keepAliveInterval) {
       clearInterval(this._keepAliveInterval);
       this._keepAliveInterval = null;
