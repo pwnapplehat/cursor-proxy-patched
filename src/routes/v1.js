@@ -586,44 +586,83 @@ async function streamBidiResponse(bidiState, res, model, responseId, hasTools, t
 
           bidiState.close();
         } else if (cursorApiError && cursorApiError.type === 'user_aborted') {
-          // ERROR_USER_ABORTED_REQUEST — Cursor aborted the stream before the model
-          // generated a response. This happens when tool call results arrive after
-          // Cursor's backend times out waiting. If the model had already emitted text
-          // or tool calls, the response was already sent and this is harmless.
-          // But if the response is EMPTY (no text, no tool calls), sending an empty
-          // finish_reason:'stop' causes OpenClaw to think the agent finished and stop
-          // the entire run. Fix: inject a synthetic continuation message so the agent
-          // knows to keep going.
+          // ERROR_USER_ABORTED_REQUEST — Cursor's server aborted the stream.
+          // This is a SERVER-SIDE timeout (not our proxy). Cursor's backend has
+          // a deadline for receiving tool results; if the full round-trip
+          // (proxy → OpenClaw → VPS tool execution → OpenClaw → proxy → Cursor)
+          // exceeds that deadline, Cursor aborts with this error.
+          //
+          // CRITICAL FIX (2026-02-14): The old approach injected a TEXT message
+          // with finish_reason:'stop'. OpenClaw treated this as a normal final
+          // response, sent it to the user, and STOPPED the agent loop. The agent
+          // died every time Cursor aborted.
+          //
+          // NEW APPROACH: Inject a SYNTHETIC TOOL CALL with finish_reason:'tool_calls'.
+          // This forces OpenClaw to continue the agent loop:
+          //   1. OpenClaw sees a tool call → executes it (harmless exec echo)
+          //   2. OpenClaw sends the result back as a new API request
+          //   3. The proxy finds no pending stream (old one is closed)
+          //   4. Falls through to create a NEW bidi stream with full context
+          //   5. Cursor processes it as a fresh request → agent continues
+          //
+          // This makes the agent survive Cursor server-side aborts automatically.
           const responseIsEmpty = !allTextAccumulated || allTextAccumulated.trim().length === 0;
 
           if (responseIsEmpty && hasTools) {
-            console.warn('[h2-bidi] User aborted with EMPTY response — injecting continuation to keep agent alive');
+            console.warn('[h2-bidi] User aborted with EMPTY response — injecting synthetic tool call to keep agent alive');
 
-            // Send a synthetic assistant text chunk that prompts the agent to continue.
-            // This makes OpenClaw process it as a normal turn with text content,
-            // and the agent will see the message and continue its work.
-            const continuationText = '[Note: The previous API request was interrupted before a response could be generated. This is a transient issue — please continue from where you left off.]';
+            // Synthetic exec tool call — harmless echo that keeps the loop alive
+            const syntheticCallId = `call_${uuidv4()}`;
+            const syntheticArgs = JSON.stringify({
+              command: 'echo "[proxy-recovery] Cursor API interrupted this request. The agent is resuming automatically. No action needed."'
+            });
+
+            // Send the tool call chunk (same format as real tool calls at line 529-548)
             res.write(`data: ${JSON.stringify({
               id: responseId,
               object: 'chat.completion.chunk',
               created: Math.floor(Date.now() / 1000),
               model: model,
-              choices: [{ index: 0, delta: { role: 'assistant', content: continuationText }, finish_reason: null }]
+              choices: [{
+                index: 0,
+                delta: {
+                  tool_calls: [{
+                    index: 0,
+                    id: syntheticCallId,
+                    type: 'function',
+                    function: { name: 'exec', arguments: syntheticArgs }
+                  }]
+                },
+                finish_reason: null
+              }]
             })}\n\n`);
-          } else if (hasTools) {
-            console.warn('[h2-bidi] WARNING: User aborted request — tools were provided but no tool calls emitted (response had content).');
+
+            // Send finish_reason: tool_calls (forces OpenClaw to execute and continue)
+            res.write(`data: ${JSON.stringify({
+              id: responseId,
+              object: 'chat.completion.chunk',
+              created: Math.floor(Date.now() / 1000),
+              model: model,
+              choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }]
+            })}\n\n`);
+
+            toolCallsEmitted = true;
+            bidiState.close();
+          } else {
+            // Response had content (text was already streamed) — send stop
+            if (hasTools) {
+              console.warn('[h2-bidi] WARNING: User aborted request — response had content but no tool calls emitted.');
+            }
+            res.write(`data: ${JSON.stringify({
+              id: responseId,
+              object: 'chat.completion.chunk',
+              created: Math.floor(Date.now() / 1000),
+              model: model,
+              choices: [{ index: 0, delta: {}, finish_reason: 'stop' }]
+            })}\n\n`);
+
+            bidiState.close();
           }
-
-          // Always send the stop signal after any content
-          res.write(`data: ${JSON.stringify({
-            id: responseId,
-            object: 'chat.completion.chunk',
-            created: Math.floor(Date.now() / 1000),
-            model: model,
-            choices: [{ index: 0, delta: {}, finish_reason: 'stop' }]
-          })}\n\n`);
-
-          bidiState.close();
         } else {
           if (hasTools) {
             console.warn('[h2-bidi] WARNING: Tools provided but model did not output any tool calls.');
