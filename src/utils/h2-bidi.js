@@ -621,6 +621,37 @@ class BidiStreamState extends EventEmitter {
 
     // Check if the stream is flowing or paused
     console.log(`[h2-bidi:FLOW] stream readableFlowing=${this.stream.readableFlowing} readableHighWaterMark=${this.stream.readableHighWaterMark}`);
+
+    // ─── HTTP/2 Keepalive PING ──────────────────────────────────────────
+    // During tool execution (which can take seconds to minutes), the H2
+    // connection sits idle. Cloud infrastructure (NAT gateways, firewalls,
+    // load balancers, AWS ALBs) commonly drop idle TCP connections after
+    // 60-300 seconds of silence. If the connection is dropped, the next
+    // stream.write() for the tool result fails silently, causing
+    // ERROR_USER_ABORTED_REQUEST.
+    //
+    // Fix: Send an HTTP/2 PING frame every 30 seconds to keep the TCP
+    // connection alive through any NAT/firewall/LB idle timeout.
+    // PINGs are H2-level (not application-level) and don't affect the
+    // stream data or Cursor's server behavior — they're just keepalive.
+    this._keepAliveInterval = setInterval(() => {
+      if (this.ended || !this.session || this.session.destroyed) {
+        clearInterval(this._keepAliveInterval);
+        return;
+      }
+      try {
+        this.session.ping((err, duration) => {
+          if (err) {
+            console.warn(`[h2-bidi:KEEPALIVE] PING failed: ${err.message} — session may be dead`);
+          } else {
+            console.log(`[h2-bidi:KEEPALIVE] PING OK (${duration}ms)`);
+          }
+        });
+      } catch (err) {
+        console.warn(`[h2-bidi:KEEPALIVE] PING error: ${err.message}`);
+        clearInterval(this._keepAliveInterval);
+      }
+    }, 30 * 1000); // every 30 seconds
   }
 
   /**
@@ -770,6 +801,11 @@ class BidiStreamState extends EventEmitter {
    * Close the stream and session.
    */
   close() {
+    // Stop keepalive PINGs first
+    if (this._keepAliveInterval) {
+      clearInterval(this._keepAliveInterval);
+      this._keepAliveInterval = null;
+    }
     if (this.stream && !this.stream.destroyed) {
       try { this.stream.end(); } catch (_) {}
     }
@@ -821,6 +857,23 @@ async function createBidiStream(authToken, headers, initialBody) {
     session.on('error', (err) => {
       console.error(`[h2-bidi] Session error: ${err.message}`);
       reject(err);
+    });
+
+    // ─── GOAWAY handling ─────────────────────────────────────────────
+    // Cursor's server (or intermediate proxies) may send GOAWAY frames
+    // for session rotation, maintenance, or overload. Active streams
+    // should continue per HTTP/2 spec (only new streams are rejected),
+    // but logging is essential for diagnosing 24-hour disconnections.
+    session.on('goaway', (errorCode, lastStreamID, opaqueData) => {
+      const errName = errorCode === 0 ? 'NO_ERROR (graceful)' : `code=${errorCode}`;
+      console.warn(`[h2-bidi:SESSION] GOAWAY received: ${errName} lastStreamID=${lastStreamID}` +
+        (opaqueData && opaqueData.length > 0 ? ` data=${opaqueData.toString('utf-8').substring(0, 200)}` : ''));
+    });
+
+    // Session close — fires when the H2 session is fully torn down.
+    // This happens after GOAWAY + all streams finish, or on network failure.
+    session.on('close', () => {
+      console.warn(`[h2-bidi:SESSION] Session CLOSED — TCP connection to Cursor is gone`);
     });
 
     // Set timeout for connection (not for the stream lifetime)
