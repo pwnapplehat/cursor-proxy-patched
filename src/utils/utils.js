@@ -641,6 +641,68 @@ const CURSOR_TO_OPENCLAW_PARAMS = {
 // Cursor-specific params to drop (not used by OpenClaw)
 const CURSOR_DROP_PARAMS = new Set(['explanation', 'is_background', 'blocking']);
 
+// ─── Ripgrep command builder ─────────────────────────────────────────
+// Translates Cursor's ripgrep tool args into a proper `rg` shell command.
+// Without this, output_mode:"files_with_matches" (→ rg -l), -i, and glob
+// filters were silently ignored, causing full-content scans that took 5-10s+
+// on large codebases and triggering ERROR_USER_ABORTED_REQUEST.
+function buildRgCommand(args) {
+  const flags = [];
+  const pattern = args.pattern || '';
+  const searchPath = args.path || '.';
+
+  // ── Output mode ──
+  // files_with_matches → -l (stop after first match per file — dramatically faster)
+  // count → -c (output match count per file)
+  // content (default) → -n (include line numbers)
+  const mode = args.output_mode;
+  if (mode === 'files_with_matches') flags.push('-l');
+  else if (mode === 'count') flags.push('-c');
+  else flags.push('-n');
+
+  // ── Case insensitivity ──
+  if (args['-i'] === true) flags.push('-i');
+
+  // ── Context lines (only meaningful in content mode) ──
+  if (!mode || mode === 'content') {
+    const ctxC = parseInt(args['-C'], 10);
+    if (ctxC > 0) {
+      flags.push(`-C ${ctxC}`);
+    } else {
+      const ctxA = parseInt(args['-A'], 10);
+      const ctxB = parseInt(args['-B'], 10);
+      if (ctxA > 0) flags.push(`-A ${ctxA}`);
+      if (ctxB > 0) flags.push(`-B ${ctxB}`);
+    }
+  }
+
+  // ── Multiline matching ──
+  if (args.multiline === true) flags.push('-U --multiline-dotall');
+
+  // ── Glob filter (e.g. "*.smali", "*.json") ──
+  if (args.glob && typeof args.glob === 'string') flags.push(`--glob ${shellEscape(args.glob)}`);
+
+  // ── File type filter (e.g. "js", "py") ──
+  if (args.type && typeof args.type === 'string') flags.push(`--type ${shellEscape(args.type)}`);
+
+  // ── Assemble command ──
+  const flagStr = flags.length ? flags.join(' ') + ' ' : '';
+  let cmd = `rg ${flagStr}${shellEscape(pattern)} ${shellEscape(searchPath)}`;
+
+  // ── Offset + head_limit pipeline ──
+  const offset = parseInt(args.offset, 10);
+  const headLimit = parseInt(args.head_limit, 10);
+  if (offset > 0 && headLimit > 0) {
+    cmd += ` | tail -n +${offset + 1} | head -${headLimit}`;
+  } else if (offset > 0) {
+    cmd += ` | tail -n +${offset + 1}`;
+  } else if (headLimit > 0) {
+    cmd += ` | head -${headLimit}`;
+  }
+
+  return { name: 'exec', arguments: { command: cmd } };
+}
+
 // Tools that need full argument restructuring (not just param rename).
 // Each returns { name, arguments } ready for OpenClaw.
 const SPECIAL_TOOL_CONVERSIONS = {
@@ -655,18 +717,8 @@ const SPECIAL_TOOL_CONVERSIONS = {
   }),
 
   // ─── Search tools ──────────────────────────────────────────────────
-  'ripgrep_raw_search': (args) => {
-    const pattern = args.pattern || '';
-    const path = args.path || '.';
-    const limit = args.head_limit ? ` | head -${args.head_limit}` : '';
-    return { name: 'exec', arguments: { command: `rg ${shellEscape(pattern)} ${shellEscape(path)}${limit}` } };
-  },
-  'ripgrep_search': (args) => {
-    const pattern = args.pattern || '';
-    const path = args.path || '.';
-    const limit = args.head_limit ? ` | head -${args.head_limit}` : '';
-    return { name: 'exec', arguments: { command: `rg ${shellEscape(pattern)} ${shellEscape(path)}${limit}` } };
-  },
+  'ripgrep_raw_search': (args) => buildRgCommand(args),
+  'ripgrep_search':     (args) => buildRgCommand(args),
   'file_search': (args) => ({
     name: 'exec',
     arguments: { command: `find ${shellEscape(args.path || '.')} -name ${shellEscape(args.pattern || args.query || '*')} 2>/dev/null` },
