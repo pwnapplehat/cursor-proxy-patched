@@ -516,6 +516,10 @@ async function streamBidiResponse(bidiState, res, model, responseId, hasTools, t
 
       // ─── Emit tool calls or stop ─────────────────────────────────────
       if (finalToolCalls.length > 0) {
+        // Model is actively using tools — reset the text-only recovery counter
+        // so that a future text-only response is treated as a fresh anomaly.
+        bidiState._textOnlyRecoveryCount = 0;
+
         console.log(`[h2-bidi] Emitting ${finalToolCalls.length} tool call(s): ${finalToolCalls.map(tc => tc.function.name).join(', ')}`);
 
         // Register pending tool calls on the bidiState for continuation
@@ -611,6 +615,9 @@ async function streamBidiResponse(bidiState, res, model, responseId, hasTools, t
           if (responseIsEmpty && hasTools) {
             console.warn('[h2-bidi] User aborted with EMPTY response — injecting synthetic tool call to keep agent alive');
 
+            // Reset text-only recovery counter — abort recovery is a different path
+            bidiState._textOnlyRecoveryCount = 0;
+
             // Synthetic exec tool call — harmless echo that keeps the loop alive
             const syntheticCallId = `call_${uuidv4()}`;
             const syntheticArgs = JSON.stringify({
@@ -664,19 +671,119 @@ async function streamBidiResponse(bidiState, res, model, responseId, hasTools, t
             bidiState.close();
           }
         } else {
-          if (hasTools) {
-            console.warn('[h2-bidi] WARNING: Tools provided but model did not output any tool calls.');
-          }
-          res.write(`data: ${JSON.stringify({
-            id: responseId,
-            object: 'chat.completion.chunk',
-            created: Math.floor(Date.now() / 1000),
-            model: model,
-            choices: [{ index: 0, delta: {}, finish_reason: 'stop' }]
-          })}\n\n`);
+          // ─── Text-only response with tools available ────────────────────
+          // In long-running agent sessions (24hr+), the model can "forget"
+          // its task after many recovery cycles and send a text-only response
+          // (e.g., "Could you clarify what you'd like me to do?") instead of
+          // continuing with tool calls. If we send finish_reason:'stop',
+          // OpenClaw delivers the text and the agent loop TERMINATES.
+          //
+          // FIX: When tools are available and the response looks like a
+          // "lost context" message (short, no substantive content), inject
+          // a synthetic tool call to force the agent to continue its loop.
+          // The synthetic memory_search call makes the agent re-read its
+          // task context, which helps it recover and resume work.
+          //
+          // Safety: We track consecutive text-only recoveries to prevent
+          // infinite loops. After MAX_TEXT_ONLY_RECOVERIES consecutive
+          // text-only responses, we allow the stop (the model genuinely
+          // has nothing more to do, or something else is wrong).
+          const MAX_TEXT_ONLY_RECOVERIES = 3;
+          const textLen = allTextAccumulated.trim().length;
+          const textOnlyCount = bidiState._textOnlyRecoveryCount || 0;
 
-          // No tool calls — stream is done, close it
-          bidiState.close();
+          // Heuristic: inject recovery if:
+          // 1. Tools are available (this is an agent session, not a simple chat)
+          // 2. Response is short (< 2000 chars) — likely a "confused" response,
+          //    not a genuine lengthy analysis the agent wants to deliver
+          // 3. We haven't exceeded the consecutive recovery limit
+          // 4. The response doesn't contain obvious "task complete" signals
+          const TASK_COMPLETE_SIGNALS = [
+            /(?:task|work|analysis|reverse.?engineering|RE)\s+(?:is\s+)?(?:complete|done|finished)/i,
+            /(?:completed|finished)\s+(?:the\s+)?(?:task|work|analysis|RE)/i,
+            /(?:all\s+)?(?:tasks?\s+)?(?:are\s+)?(?:done|complete|finished)/i,
+            /here\s+(?:is|are)\s+(?:the|my)\s+(?:final|complete)\s+(?:report|summary|findings|results)/i,
+            /saved?\s+(?:the\s+)?(?:final\s+)?(?:report|results|findings)\s+to/i,
+          ];
+          const looksLikeTaskComplete = TASK_COMPLETE_SIGNALS.some(p => p.test(allTextAccumulated));
+
+          const shouldInjectRecovery = hasTools &&
+            textLen < 2000 &&
+            textLen > 0 &&
+            textOnlyCount < MAX_TEXT_ONLY_RECOVERIES &&
+            !looksLikeTaskComplete;
+
+          if (shouldInjectRecovery) {
+            bidiState._textOnlyRecoveryCount = textOnlyCount + 1;
+            console.warn(`[h2-bidi] Text-only response with tools available (${textLen} chars, recovery #${textOnlyCount + 1}/${MAX_TEXT_ONLY_RECOVERIES}) — injecting synthetic tool call to keep agent alive`);
+            console.warn(`[h2-bidi] Response preview: ${allTextAccumulated.substring(0, 200).replace(/\n/g, '\\n')}`);
+
+            // Inject a synthetic exec tool call that reminds the agent to continue
+            const syntheticCallId = `call_${uuidv4()}`;
+            const syntheticArgs = JSON.stringify({
+              command: 'echo "[proxy-recovery] The AI model sent a text-only response without using any tools. This usually means context was lost. The agent should re-read its task context and continue working. Recovery attempt ' + (textOnlyCount + 1) + '/' + MAX_TEXT_ONLY_RECOVERIES + '."'
+            });
+
+            // Send the tool call chunk
+            res.write(`data: ${JSON.stringify({
+              id: responseId,
+              object: 'chat.completion.chunk',
+              created: Math.floor(Date.now() / 1000),
+              model: model,
+              choices: [{
+                index: 0,
+                delta: {
+                  tool_calls: [{
+                    index: 0,
+                    id: syntheticCallId,
+                    type: 'function',
+                    function: { name: 'exec', arguments: syntheticArgs }
+                  }]
+                },
+                finish_reason: null
+              }]
+            })}\n\n`);
+
+            // Send finish_reason: tool_calls (forces OpenClaw to execute and continue)
+            res.write(`data: ${JSON.stringify({
+              id: responseId,
+              object: 'chat.completion.chunk',
+              created: Math.floor(Date.now() / 1000),
+              model: model,
+              choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }]
+            })}\n\n`);
+
+            toolCallsEmitted = true;
+            // Close the bidi stream — the synthetic tool call has no cursor-side
+            // counterpart, so there's no pending stream to route a result to.
+            // OpenClaw will execute the exec, send the result as a new request,
+            // and the proxy will create a fresh bidi stream with full context.
+            bidiState.close();
+          } else {
+            // Genuine stop: either no tools, task is complete, response is substantial,
+            // or we've exhausted recovery attempts
+            if (hasTools && textOnlyCount >= MAX_TEXT_ONLY_RECOVERIES) {
+              console.warn(`[h2-bidi] Exhausted ${MAX_TEXT_ONLY_RECOVERIES} text-only recoveries — allowing stop`);
+            } else if (hasTools && looksLikeTaskComplete) {
+              console.log(`[h2-bidi] Response contains task-complete signal — allowing stop`);
+            } else if (hasTools) {
+              console.warn(`[h2-bidi] Text-only response (${textLen} chars) — allowing stop (substantial content or no tools)`);
+            }
+
+            // Reset the text-only counter on a genuine stop so future sessions start fresh
+            bidiState._textOnlyRecoveryCount = 0;
+
+            res.write(`data: ${JSON.stringify({
+              id: responseId,
+              object: 'chat.completion.chunk',
+              created: Math.floor(Date.now() / 1000),
+              model: model,
+              choices: [{ index: 0, delta: {}, finish_reason: 'stop' }]
+            })}\n\n`);
+
+            // No tool calls — stream is done, close it
+            bidiState.close();
+          }
         }
       }
 
