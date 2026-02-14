@@ -661,7 +661,7 @@ class BidiStreamState extends EventEmitter {
    * @param {string} outputText
    */
   sendToolResult(toolEnum, cursorToolCallId, outputText) {
-    // Stop heartbeat — the real result is here
+    // Stop heartbeat if any (no-op since heartbeat is disabled, kept for safety)
     this._stopWaitHeartbeat();
 
     if (this.ended || !this.stream || this.stream.destroyed) {
@@ -701,13 +701,24 @@ class BidiStreamState extends EventEmitter {
 
   /**
    * Start buffering frames (while waiting for OpenClaw to execute tool).
-   * Also starts the wait-heartbeat interval to keep the bidi stream
-   * active at the application level while OpenClaw executes the tool.
+   *
+   * NOTE (2026-02-14): Application-level heartbeats REMOVED.
+   * We previously sent empty ConnectRPC frames every 8s while waiting
+   * for tool results. However, native Cursor clients ONLY send two types
+   * of client-to-server messages: (1) the initial request and (2) tool
+   * result messages. Our empty heartbeat frames were extra data that
+   * Cursor's server doesn't expect. After 20+ tool calls with many
+   * heartbeats, the accumulated unexpected frames likely triggered
+   * Cursor's server to abort with ERROR_USER_ABORTED_REQUEST.
+   *
+   * H2-level PINGs (every 30s, transport layer) are sufficient to keep
+   * the TCP connection alive through NAT/firewalls/LBs without sending
+   * any application-level data that Cursor's server might misinterpret.
    */
   startBuffering() {
     this._waitingForToolResult = true;
     this.bufferedFrames = [];
-    this._startWaitHeartbeat();
+    // Heartbeat intentionally NOT started — see comment above
   }
 
   /**
