@@ -5,29 +5,29 @@
  * Two responsibilities:
  *
  * 1. /goal Telegram command — manages goals via the plugin command system.
- *    Registered at startup by registerGoalCommand(). Supports:
- *      /goal <text>              — set a new goal (shortcut)
- *      /goal set <text>          — set a new goal with optional flags
- *      /goal list                — list all goals
- *      /goal status              — show active goal details
- *      /goal pause [ref]         — pause a goal
- *      /goal resume [ref]        — resume a goal
- *      /goal delete [ref]        — delete a goal
- *      /goal reset [ref]         — reset continuation count
- *      /goal clear               — delete all goals
- *      /goal help                — show usage
+ *    Registered at startup by registerGoalCommand().
  *
- * 2. onTurnEnd() — auto-continuation when the agent finishes a turn.
+ * 2. onTurnEnd() — AI-gated auto-continuation when the agent finishes a turn.
  *    Called from the patched server-chat.js lifecycle handler.
  *
- * Safety features (auto-continuation):
- *   - Per-goal cooldown (configurable, default 15s)
- *   - Maximum continuation count per goal (configurable, default 200)
- *   - Rapid-fire loop detection (5 continuations < 30s apart → 2 min pause)
- *   - Main-session-only filtering (Cursor proxy sessions are ignored)
- *   - Silent error handling (never crashes the host process)
+ *    Flow:
+ *      a. server-chat.js captures the agent's response text before the buffer
+ *         is cleared (stored in globalThis.__gmLastResponse)
+ *      b. On lifecycle "end", onTurnEnd() is called with the response text
+ *      c. If an active goal exists, the response is sent to Claude via the
+ *         cursor proxy API for analysis
+ *      d. Claude returns YES (continue) or NO (stop)
+ *      e. Only YES triggers a continuation — NO is silently ignored
  *
- * Loaded by the patched server-chat.js via dynamic import().
+ *    This prevents blind continuation on casual messages, greetings,
+ *    or any response unrelated to the active goal.
+ *
+ * Safety:
+ *   - AI analysis gate (primary filter — Claude decides YES/NO)
+ *   - Max continuations per goal (configurable, default 200)
+ *   - Cooldown between continuations (configurable, default 15s)
+ *   - Silent error handling (never crashes the host process)
+ *   - If AI call fails for any reason → don't continue (fail-safe)
  */
 
 import { readFile, writeFile, mkdir } from "node:fs/promises";
@@ -39,23 +39,42 @@ import { randomBytes } from "node:crypto";
 /* ------------------------------------------------------------------ */
 
 const GOAL_FILE = "/home/node/.openclaw/goals.json";
+const CONFIG_FILE = "/home/node/.openclaw/openclaw.json";
 const LOG = "[goal-monitor]";
 
-// Rapid-fire detection
-const RAPID_WINDOW_MS = 30_000;   // 30 s window
-const RAPID_MAX       = 5;        // max rapid continuations before pause
-const EMERGENCY_MS    = 120_000;  // 2 min emergency cooldown
+// AI analysis
+const DEFAULT_ANALYSIS_MODEL = "claude-4.6-opus-max";
+const ANALYSIS_TIMEOUT_MS = 60_000; // 60s timeout for AI call
+const MAX_RESPONSE_CHARS = 12_000; // truncate very long responses
 
-// Absolute minimum between any two continuations regardless of config
-const ABS_MIN_COOLDOWN_MS = 10_000; // 10 s
+// Cooldown (minimum between continuations, also limits AI analysis calls)
+const ABS_MIN_COOLDOWN_MS = 10_000; // 10s absolute minimum
+
+// AI analysis system prompt
+const ANALYSIS_SYSTEM_PROMPT = `You are a goal monitor for an AI coding agent. Your ONLY job is to decide whether the agent should automatically continue working based on its last response and the active goal.
+
+Rules for YES (agent should continue):
+- The agent's response is clearly related to the active goal
+- The agent completed a step but the overall goal is NOT finished
+- The agent is asking for user permission or confirmation to continue (it should be told to continue)
+- The agent paused between phases or tasks described in the goal
+- The agent mentioned next steps it plans to take
+
+Rules for NO (agent should NOT continue):
+- The agent's response is NOT related to the active goal (casual conversation, greeting, unrelated topic)
+- The agent explicitly states ALL work described in the goal is genuinely complete and finished
+- The agent hit an unrecoverable error it cannot fix on its own
+- The response is a simple acknowledgment like "ok", "sure", "hello" not related to work
+- The response is a heartbeat/status check not related to the goal
+
+Output ONLY the single word YES or NO.
+No explanation. No reasoning. No quotes. Just the word.`;
 
 /* ------------------------------------------------------------------ */
-/*  In-memory state (lives for the lifetime of the OpenClaw process)   */
+/*  In-memory state                                                    */
 /* ------------------------------------------------------------------ */
 
-let lastTriggerTs   = 0;
-let rapidFireCount  = 0;
-let emergencyUntil  = 0;
+let lastTriggerTs = 0;
 
 /* ------------------------------------------------------------------ */
 /*  Goal store helpers                                                 */
@@ -90,15 +109,190 @@ function generateId() {
 function findGoal(goals, ref) {
   if (!ref) return null;
   const trimmed = ref.trim();
-  // Try 1-based index
   const idx = parseInt(trimmed, 10);
   if (!isNaN(idx) && idx >= 1 && idx <= goals.length) {
     return goals[idx - 1];
   }
-  // Try ID prefix
   const lower = trimmed.toLowerCase();
   const matches = goals.filter((g) => g.id.toLowerCase().startsWith(lower));
   return matches.length === 1 ? matches[0] : null;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Proxy config discovery                                             */
+/* ------------------------------------------------------------------ */
+
+let cachedProxyConfig = null;
+let proxyConfigReadAt = 0;
+
+async function getProxyConfig() {
+  // Cache for 60s to avoid reading config on every call
+  if (cachedProxyConfig && Date.now() - proxyConfigReadAt < 60_000) {
+    return cachedProxyConfig;
+  }
+
+  try {
+    const raw = await readFile(CONFIG_FILE, "utf-8");
+    const cfg = JSON.parse(raw);
+
+    const providers = cfg?.ai?.providers;
+    if (!providers) return null;
+
+    let found = null;
+
+    // Array format: [{ name, type, baseUrl, apiKey }]
+    if (Array.isArray(providers)) {
+      // Prefer provider with cursor-proxy in URL
+      found = providers.find(
+        (p) =>
+          p.baseUrl &&
+          p.apiKey &&
+          (p.baseUrl.includes("cursor-proxy") ||
+            p.baseUrl.includes(":3010")),
+      );
+      // Fallback: first provider with baseUrl + apiKey
+      if (!found) {
+        found = providers.find((p) => p.baseUrl && p.apiKey);
+      }
+    }
+
+    // Object format: { "name": { baseUrl, apiKey } }
+    if (!found && typeof providers === "object" && !Array.isArray(providers)) {
+      for (const key of Object.keys(providers)) {
+        const p = providers[key];
+        if (p?.baseUrl && p?.apiKey) {
+          if (
+            p.baseUrl.includes("cursor-proxy") ||
+            p.baseUrl.includes(":3010")
+          ) {
+            found = p;
+            break;
+          }
+          if (!found) found = p;
+        }
+      }
+    }
+
+    if (found) {
+      cachedProxyConfig = {
+        baseUrl: found.baseUrl.replace(/\/+$/, ""),
+        apiKey: found.apiKey,
+      };
+      proxyConfigReadAt = Date.now();
+      return cachedProxyConfig;
+    }
+  } catch (err) {
+    console.error(`${LOG} config read error:`, err?.message || err);
+  }
+
+  return null;
+}
+
+/* ------------------------------------------------------------------ */
+/*  AI Analysis Gate                                                   */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Parse YES/NO from AI response, handling quotes, whitespace, periods.
+ */
+function parseYesNo(text) {
+  if (!text || typeof text !== "string") return false;
+  const cleaned = text
+    .trim()
+    .replace(/^["'`]+/, "")
+    .replace(/["'`]+$/, "")
+    .trim()
+    .replace(/[.!?]+$/, "")
+    .trim()
+    .toUpperCase();
+  return cleaned === "YES";
+}
+
+/**
+ * Call Claude via the cursor proxy to analyze if the agent should continue.
+ *
+ * @param {string} responseText — the agent's last response
+ * @param {string} goalText — the active goal description
+ * @param {string} model — model name to use for analysis
+ * @returns {Promise<boolean>} — true if agent should continue
+ */
+async function analyzeWithAI(responseText, goalText, model) {
+  const config = await getProxyConfig();
+  if (!config) {
+    console.error(`${LOG} cannot reach proxy — no provider config found`);
+    return false; // fail-safe: don't continue
+  }
+
+  // Truncate very long responses (keep the end which has conclusions)
+  let truncatedResponse = responseText;
+  if (responseText.length > MAX_RESPONSE_CHARS) {
+    truncatedResponse =
+      "[...truncated...]\n" +
+      responseText.slice(responseText.length - MAX_RESPONSE_CHARS);
+  }
+
+  const userPrompt = [
+    `ACTIVE GOAL: "${goalText}"`,
+    "",
+    "AGENT'S LAST RESPONSE:",
+    "---",
+    truncatedResponse,
+    "---",
+    "",
+    "Based on the goal and the agent's response above, should the agent automatically continue working? Reply YES or NO.",
+  ].join("\n");
+
+  const url = `${config.baseUrl}/chat/completions`;
+  const body = JSON.stringify({
+    model: model || DEFAULT_ANALYSIS_MODEL,
+    messages: [
+      { role: "system", content: ANALYSIS_SYSTEM_PROMPT },
+      { role: "user", content: userPrompt },
+    ],
+    max_tokens: 10,
+    stream: false,
+  });
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), ANALYSIS_TIMEOUT_MS);
+
+  try {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${config.apiKey}`,
+      },
+      body,
+      signal: controller.signal,
+    });
+
+    if (!response.ok) {
+      const errText = await response.text().catch(() => "");
+      console.error(
+        `${LOG} AI analysis HTTP ${response.status}: ${errText.slice(0, 200)}`,
+      );
+      return false; // fail-safe
+    }
+
+    const data = await response.json();
+    const answer = data?.choices?.[0]?.message?.content || "";
+    const decision = parseYesNo(answer);
+
+    console.log(
+      `${LOG} AI analysis: raw="${answer.trim()}" → ${decision ? "YES (continue)" : "NO (stop)"}`,
+    );
+    return decision;
+  } catch (err) {
+    if (err?.name === "AbortError") {
+      console.error(`${LOG} AI analysis timed out after ${ANALYSIS_TIMEOUT_MS}ms`);
+    } else {
+      console.error(`${LOG} AI analysis error:`, err?.message || String(err));
+    }
+    return false; // fail-safe: don't continue on error
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 /* ================================================================== */
@@ -106,9 +300,7 @@ function findGoal(goals, ref) {
 /* ================================================================== */
 
 /**
- * Register the /goal command via OpenClaw's plugin command system.
- * Called from the command registration patch in server-chat.js.
- *
+ * Register /goal as a plugin command for Telegram.
  * @param {function} registerPluginCommand — from plugins/commands.js
  */
 export function registerGoalCommand(registerPluginCommand) {
@@ -126,11 +318,6 @@ export function registerGoalCommand(registerPluginCommand) {
   }
 }
 
-/**
- * Handle /goal command from Telegram.
- * @param {object} ctx — PluginCommandContext
- * @returns {Promise<{text: string}>}
- */
 async function handleGoalCommand(ctx) {
   try {
     const args = (ctx.args || "").trim();
@@ -140,7 +327,9 @@ async function handleGoalCommand(ctx) {
 
     const spaceIdx = args.indexOf(" ");
     const sub =
-      spaceIdx === -1 ? args.toLowerCase() : args.slice(0, spaceIdx).toLowerCase();
+      spaceIdx === -1
+        ? args.toLowerCase()
+        : args.slice(0, spaceIdx).toLowerCase();
     const rest = spaceIdx === -1 ? "" : args.slice(spaceIdx + 1).trim();
 
     switch (sub) {
@@ -161,26 +350,24 @@ async function handleGoalCommand(ctx) {
       case "clear":
         return await cmdClear();
       default:
-        // Treat entire args as goal text (shortcut for "set")
         return await cmdSet(args);
     }
   } catch (err) {
     console.error(`${LOG} command error:`, err?.message || err);
-    return { text: "⚠️ Goal command failed. Check container logs." };
+    return { text: "Command failed. Check container logs." };
   }
 }
 
-/* ---- Help ---- */
-
 function formatHelp() {
   return [
-    "🎯 Goal Monitor Commands",
+    "Goal Monitor Commands",
     "",
     "/goal <text> — Set a new goal (shortcut)",
     "/goal set <text> — Set a new goal",
     "/goal set <text> --max N — With max continuations",
     "/goal set <text> --cooldown N — With cooldown (seconds)",
     "/goal set <text> --delay N — With heartbeat delay (seconds)",
+    "/goal set <text> --model NAME — Analysis model (default: claude-4.6-opus-max)",
     "/goal list — List all goals",
     "/goal status — Show active goal details",
     "/goal pause [#] — Pause (default: active goal)",
@@ -200,21 +387,19 @@ function formatHelp() {
   ].join("\n");
 }
 
-/* ---- Set ---- */
-
 async function cmdSet(text) {
   if (!text) {
     return {
       text:
-        "⚠️ Usage: /goal set <description>\n" +
+        "Usage: /goal set <description>\n" +
         "Example: /goal set Continue RE till all phases done",
     };
   }
 
-  // Parse optional flags: --max N, --cooldown N, --delay N
   let maxCont = 200;
   let cooldown = 15;
   let delay = 5;
+  let model = DEFAULT_ANALYSIS_MODEL;
   let goalText = text;
 
   const maxMatch = goalText.match(/--max\s+(\d+)/i);
@@ -235,14 +420,19 @@ async function cmdSet(text) {
     goalText = goalText.replace(delayMatch[0], "").trim();
   }
 
+  const modelMatch = goalText.match(/--model\s+(\S+)/i);
+  if (modelMatch) {
+    model = modelMatch[1];
+    goalText = goalText.replace(modelMatch[0], "").trim();
+  }
+
   if (!goalText) {
-    return { text: "⚠️ Goal text cannot be empty after parsing flags." };
+    return { text: "Goal text cannot be empty after parsing flags." };
   }
 
   const store = await readGoalStore();
-  if (!store) return { text: "⚠️ Failed to read goal store." };
+  if (!store) return { text: "Failed to read goal store." };
 
-  // Deactivate any currently active goal
   for (const g of store.goals) {
     if (g.active) {
       g.active = false;
@@ -259,6 +449,7 @@ async function cmdSet(text) {
     max_continuations: maxCont,
     cooldown_seconds: cooldown,
     delay_seconds: delay,
+    analysis_model: model,
     continuation_count: 0,
     last_continuation_at: null,
   };
@@ -266,57 +457,51 @@ async function cmdSet(text) {
   store.goals.push(newGoal);
   await writeGoalStore(store);
 
-  // Reset in-memory safety state
   lastTriggerTs = 0;
-  rapidFireCount = 0;
-  emergencyUntil = 0;
 
   return {
     text: [
-      "🎯 Goal set!",
+      "Goal set!",
       "",
-      `📝 ${goalText}`,
-      `🔄 Max: ${maxCont} continuations`,
-      `⏱ Cooldown: ${cooldown}s`,
-      `⏳ Delay: ${delay}s`,
-      `🆔 ${newGoal.id}`,
+      `Goal: ${goalText}`,
+      `Max: ${maxCont} continuations`,
+      `Cooldown: ${cooldown}s`,
+      `Delay: ${delay}s`,
+      `Model: ${model}`,
+      `ID: ${newGoal.id}`,
       "",
-      "Agent will auto-continue towards this goal.",
+      "Agent will auto-continue when AI analysis confirms relevance.",
     ].join("\n"),
   };
 }
 
-/* ---- List ---- */
-
 async function cmdList() {
   const store = await readGoalStore();
-  if (!store) return { text: "⚠️ Failed to read goal store." };
+  if (!store) return { text: "Failed to read goal store." };
 
   if (!store.goals.length) {
-    return { text: "📋 No goals. Use /goal <text> to create one." };
+    return { text: "No goals. Use /goal <text> to create one." };
   }
 
-  const lines = ["📋 Goals:", ""];
+  const lines = ["Goals:", ""];
   store.goals.forEach((g, i) => {
-    const status = g.active ? "🟢 Active" : "⏸ Inactive";
+    const status = g.active ? "[Active]" : "[Paused]";
     const count = g.continuation_count || 0;
     const max = g.max_continuations || 200;
-    lines.push(`${i + 1}. [${status}] ${g.text}`);
+    lines.push(`${i + 1}. ${status} ${g.text}`);
     lines.push(`   ID: ${g.id} | Progress: ${count}/${max}`);
   });
 
   return { text: lines.join("\n") };
 }
 
-/* ---- Status ---- */
-
 async function cmdStatus() {
   const store = await readGoalStore();
-  if (!store) return { text: "⚠️ Failed to read goal store." };
+  if (!store) return { text: "Failed to read goal store." };
 
   const active = store.goals.find((g) => g.active);
   if (!active) {
-    return { text: "ℹ️ No active goal. Use /goal <text> to set one." };
+    return { text: "No active goal. Use /goal <text> to set one." };
   }
 
   const count = active.continuation_count || 0;
@@ -324,45 +509,36 @@ async function cmdStatus() {
   const pct = max > 0 ? Math.round((count / max) * 100) : 0;
 
   const lines = [
-    "🎯 Active Goal",
+    "Active Goal",
     "",
-    `📝 ${active.text}`,
-    `📊 Progress: ${count}/${max} (${pct}%)`,
-    `⏱ Cooldown: ${active.cooldown_seconds || 15}s`,
-    `⏳ Delay: ${active.delay_seconds || 5}s`,
-    `📅 Created: ${active.created_at || "unknown"}`,
-    `🕐 Last continuation: ${active.last_continuation_at || "never"}`,
-    `🆔 ${active.id}`,
+    `Goal: ${active.text}`,
+    `Progress: ${count}/${max} (${pct}%)`,
+    `Cooldown: ${active.cooldown_seconds || 15}s`,
+    `Delay: ${active.delay_seconds || 5}s`,
+    `Model: ${active.analysis_model || DEFAULT_ANALYSIS_MODEL}`,
+    `Created: ${active.created_at || "unknown"}`,
+    `Last continuation: ${active.last_continuation_at || "never"}`,
+    `ID: ${active.id}`,
   ];
-
-  const now = Date.now();
-  if (now < emergencyUntil) {
-    lines.push("");
-    lines.push(
-      `⚠️ Emergency cooldown: ${Math.round((emergencyUntil - now) / 1000)}s remaining`,
-    );
-  }
 
   return { text: lines.join("\n") };
 }
 
-/* ---- Pause ---- */
-
 async function cmdPause(ref) {
   const store = await readGoalStore();
-  if (!store) return { text: "⚠️ Failed to read goal store." };
+  if (!store) return { text: "Failed to read goal store." };
 
   let goal;
   if (!ref) {
     goal = store.goals.find((g) => g.active);
-    if (!goal) return { text: "ℹ️ No active goal to pause." };
+    if (!goal) return { text: "No active goal to pause." };
   } else {
     goal = findGoal(store.goals, ref);
-    if (!goal) return { text: `⚠️ Goal not found: "${ref}"` };
+    if (!goal) return { text: `Goal not found: "${ref}"` };
   }
 
   if (!goal.active) {
-    return { text: `ℹ️ Already paused: "${goal.text}"` };
+    return { text: `Already paused: "${goal.text}"` };
   }
 
   goal.active = false;
@@ -370,31 +546,27 @@ async function cmdPause(ref) {
   goal.deactivated_reason = "paused_by_user";
   await writeGoalStore(store);
 
-  return { text: `⏸ Goal paused: "${goal.text}"` };
+  return { text: `Paused: "${goal.text}"` };
 }
-
-/* ---- Resume ---- */
 
 async function cmdResume(ref) {
   const store = await readGoalStore();
-  if (!store) return { text: "⚠️ Failed to read goal store." };
+  if (!store) return { text: "Failed to read goal store." };
 
   let goal;
   if (!ref) {
-    // Find most recent inactive goal
     const inactive = store.goals.filter((g) => !g.active);
     goal = inactive.length ? inactive[inactive.length - 1] : null;
-    if (!goal) return { text: "ℹ️ No paused goal to resume." };
+    if (!goal) return { text: "No paused goal to resume." };
   } else {
     goal = findGoal(store.goals, ref);
-    if (!goal) return { text: `⚠️ Goal not found: "${ref}"` };
+    if (!goal) return { text: `Goal not found: "${ref}"` };
   }
 
   if (goal.active) {
-    return { text: `ℹ️ Already active: "${goal.text}"` };
+    return { text: `Already active: "${goal.text}"` };
   }
 
-  // Deactivate any currently active goal first
   for (const g of store.goals) {
     if (g.active) {
       g.active = false;
@@ -408,19 +580,14 @@ async function cmdResume(ref) {
   delete goal.deactivated_reason;
   await writeGoalStore(store);
 
-  // Reset in-memory state
   lastTriggerTs = 0;
-  rapidFireCount = 0;
-  emergencyUntil = 0;
 
-  return { text: `▶️ Goal resumed: "${goal.text}"` };
+  return { text: `Resumed: "${goal.text}"` };
 }
-
-/* ---- Delete ---- */
 
 async function cmdDelete(ref) {
   const store = await readGoalStore();
-  if (!store) return { text: "⚠️ Failed to read goal store." };
+  if (!store) return { text: "Failed to read goal store." };
 
   let goal;
   if (!ref) {
@@ -428,118 +595,85 @@ async function cmdDelete(ref) {
     if (!goal) {
       goal = store.goals.length ? store.goals[store.goals.length - 1] : null;
     }
-    if (!goal) return { text: "ℹ️ No goals to delete." };
+    if (!goal) return { text: "No goals to delete." };
   } else {
     goal = findGoal(store.goals, ref);
-    if (!goal) return { text: `⚠️ Goal not found: "${ref}"` };
+    if (!goal) return { text: `Goal not found: "${ref}"` };
   }
 
-  const text = goal.text;
+  const goalText = goal.text;
   store.goals = store.goals.filter((g) => g.id !== goal.id);
   await writeGoalStore(store);
 
-  return { text: `🗑 Deleted: "${text}"` };
+  return { text: `Deleted: "${goalText}"` };
 }
-
-/* ---- Reset Count ---- */
 
 async function cmdReset(ref) {
   const store = await readGoalStore();
-  if (!store) return { text: "⚠️ Failed to read goal store." };
+  if (!store) return { text: "Failed to read goal store." };
 
   let goal;
   if (!ref) {
     goal = store.goals.find((g) => g.active);
-    if (!goal) return { text: "ℹ️ No active goal to reset." };
+    if (!goal) return { text: "No active goal to reset." };
   } else {
     goal = findGoal(store.goals, ref);
-    if (!goal) return { text: `⚠️ Goal not found: "${ref}"` };
+    if (!goal) return { text: `Goal not found: "${ref}"` };
   }
 
   goal.continuation_count = 0;
   goal.last_continuation_at = null;
   await writeGoalStore(store);
 
-  // Reset in-memory state
   lastTriggerTs = 0;
-  rapidFireCount = 0;
-  emergencyUntil = 0;
 
-  return { text: `🔄 Count reset for: "${goal.text}"` };
+  return { text: `Count reset for: "${goal.text}"` };
 }
-
-/* ---- Clear All ---- */
 
 async function cmdClear() {
   const store = { version: 1, goals: [] };
   await writeGoalStore(store);
-
   lastTriggerTs = 0;
-  rapidFireCount = 0;
-  emergencyUntil = 0;
-
-  return { text: "🗑 All goals deleted." };
+  return { text: "All goals deleted." };
 }
 
 /* ================================================================== */
-/*  PART 2: Auto-Continuation (onTurnEnd)                              */
+/*  PART 2: Auto-Continuation with AI Analysis Gate                    */
 /* ================================================================== */
 
 /**
  * Called from patched server-chat.js when an agent lifecycle "end" fires.
  *
- * @param {string} sessionKey  — session that just finished its turn
+ * @param {string} sessionKey — session that just finished
+ * @param {string} responseText — the agent's full response from this turn
  * @param {object} deps
  * @param {function} deps.enqueueSystemEvent
  * @param {function} deps.requestHeartbeatNow
- * @param {function} deps.resolveMainSessionKeyFromConfig
  */
-export async function onTurnEnd(sessionKey, deps) {
+export async function onTurnEnd(sessionKey, responseText, deps) {
   try {
-    const {
-      enqueueSystemEvent,
-      requestHeartbeatNow,
-      resolveMainSessionKeyFromConfig,
-    } = deps;
+    const { enqueueSystemEvent, requestHeartbeatNow } = deps;
 
-    /* ---- 1. Only continue for the MAIN session ---- */
-    let mainKey;
-    try {
-      mainKey = resolveMainSessionKeyFromConfig();
-    } catch {
-      return; // can't resolve → skip silently
-    }
-    if (sessionKey !== mainKey) {
-      return; // Cursor proxy / isolated sessions are unaffected
-    }
-
-    /* ---- 2. Read goal store ---- */
+    /* ---- 1. Read goal store ---- */
     const store = await readGoalStore();
     if (!store) return;
 
     const goal = (store.goals || []).find((g) => g.active === true);
-    if (!goal) return;
+    if (!goal) return; // no active goal → nothing to do
 
     const now = Date.now();
 
-    /* ---- 3. Emergency cooldown (rapid-fire protection) ---- */
-    if (now < emergencyUntil) {
-      console.log(
-        `${LOG} emergency cooldown active — ${Math.round((emergencyUntil - now) / 1000)}s left`,
-      );
-      return;
-    }
-
-    /* ---- 4. Per-goal cooldown ---- */
+    /* ---- 2. Cooldown check ---- */
     const cooldownMs = Math.max(
       (goal.cooldown_seconds || 15) * 1000,
       ABS_MIN_COOLDOWN_MS,
     );
     if (now - lastTriggerTs < cooldownMs) {
-      return; // still in cooldown
+      console.log(`${LOG} cooldown active — skipping`);
+      return;
     }
 
-    /* ---- 5. Max continuations ---- */
+    /* ---- 3. Max continuations check ---- */
     const maxCont = goal.max_continuations || 200;
     const count = goal.continuation_count || 0;
     if (count >= maxCont) {
@@ -553,31 +687,37 @@ export async function onTurnEnd(sessionKey, deps) {
       return;
     }
 
-    /* ---- 6. Rapid-fire detection ---- */
-    if (now - lastTriggerTs < RAPID_WINDOW_MS) {
-      rapidFireCount++;
-      if (rapidFireCount >= RAPID_MAX) {
-        console.warn(
-          `${LOG} rapid-fire detected (${rapidFireCount} in <30s) — emergency pause 120s`,
-        );
-        emergencyUntil = now + EMERGENCY_MS;
-        rapidFireCount = 0;
-        return;
-      }
-    } else {
-      rapidFireCount = 0;
+    /* ---- 4. AI Analysis Gate ---- */
+    if (!responseText || responseText.trim().length === 0) {
+      console.log(`${LOG} empty response — skipping analysis`);
+      return;
     }
 
-    /* ---- 7. Update goal store ---- */
+    console.log(
+      `${LOG} analyzing response (${responseText.length} chars) against goal: "${goal.text.slice(0, 80)}"`,
+    );
+
+    const shouldContinue = await analyzeWithAI(
+      responseText,
+      goal.text,
+      goal.analysis_model || DEFAULT_ANALYSIS_MODEL,
+    );
+
+    if (!shouldContinue) {
+      console.log(`${LOG} AI said NO — not continuing`);
+      return;
+    }
+
+    /* ---- 5. Update goal store ---- */
     goal.continuation_count = count + 1;
     goal.last_continuation_at = new Date(now).toISOString();
     await writeGoalStore(store);
 
-    /* ---- 8. Update in-memory state ---- */
+    /* ---- 6. Update in-memory state ---- */
     lastTriggerTs = now;
 
-    /* ---- 9. Enqueue continuation system-event ---- */
-    const text = [
+    /* ---- 7. Enqueue continuation system-event ---- */
+    const continuationText = [
       `[GOAL AUTO-CONTINUE #${goal.continuation_count}/${maxCont}]`,
       `Active goal: "${goal.text}"`,
       ``,
@@ -588,9 +728,9 @@ export async function onTurnEnd(sessionKey, deps) {
       `If ALL tasks described in the goal are genuinely complete, respond with exactly: GOAL_COMPLETE`,
     ].join("\n");
 
-    enqueueSystemEvent(text, { sessionKey });
+    enqueueSystemEvent(continuationText, { sessionKey });
 
-    /* ---- 10. Schedule heartbeat after a short settle delay ---- */
+    /* ---- 8. Schedule heartbeat after settle delay ---- */
     const delayMs = Math.max(5000, (goal.delay_seconds || 5) * 1000);
     setTimeout(() => {
       try {

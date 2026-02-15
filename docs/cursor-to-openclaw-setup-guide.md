@@ -915,35 +915,38 @@ ls -lh /tmp/snapchat.apk && docker cp /tmp/snapchat.apk openclaw:/home/node/.ope
 
 ## Goal Monitor — Autonomous Agent Continuation
 
-The **Goal Monitor** patches OpenClaw's lifecycle handler so the agent keeps working
-towards a goal without manual intervention. When the agent finishes a text-only turn
-and an active goal exists, the monitor automatically enqueues a continuation message
-and triggers a new agent turn.
+The **Goal Monitor** patches OpenClaw so the agent keeps working towards a goal
+without manual intervention. It uses **AI-gated analysis** — when the agent finishes a
+turn, the monitor captures the full response, sends it to Claude for analysis against
+the active goal, and only continues if Claude confirms the work is relevant and incomplete.
 
 Goals are managed directly from **Telegram** using the `/goal` command — no SSH required.
 
 ### How It Works
 
-1. OpenClaw's `server-chat.js` is patched with two hooks:
-   - **Lifecycle patch**: calls `goal-monitor.mjs` → `onTurnEnd()` whenever an agent
-     lifecycle event with `phase: "end"` fires on the **main** session.
+1. OpenClaw's `server-chat.js` is patched with three hooks:
+   - **Text capture**: saves the agent's response text (from `chatRunState.buffers`)
+     to `globalThis.__gmLastResponse` inside `emitChatFinal` before the buffer is cleared.
+   - **Lifecycle patch**: on lifecycle `"end"`, reads the captured text and calls
+     `goal-monitor.mjs` → `onTurnEnd(sessionKey, responseText, deps)`.
    - **Command registration**: registers `/goal` as a plugin command via
-     `registerPluginCommand()` so it appears in Telegram's command menu and
-     has a real handler (not just forwarded to the agent).
-2. `goal-monitor.mjs` reads `/home/node/.openclaw/goals.json`.
-3. If an active goal exists and cooldown/limits are satisfied, it enqueues a
-   `System:` event with the goal text and triggers `requestHeartbeatNow`.
-4. The heartbeat runner picks up the event and runs a new agent turn — the agent
-   sees the goal instruction and continues working.
+     `registerPluginCommand()` for the Telegram command menu.
+2. `onTurnEnd()` reads the active goal from `goals.json`.
+3. The agent's response text is sent to Claude (via the cursor proxy API) with a
+   structured prompt asking: should the agent continue working on this goal? YES/NO.
+4. Only if Claude returns **YES**, a `System:` event is enqueued and
+   `requestHeartbeatNow` triggers the next turn. If **NO**, nothing happens.
+5. If the AI call fails for any reason (network error, timeout, rate limit),
+   the fail-safe is to **not continue** — preventing accidental loops.
 
 ### Safety Features
 
 | Feature | Default | Purpose |
 |---|---|---|
-| Per-goal cooldown | 15 s | Prevents immediate re-trigger |
+| AI analysis gate | always on | Claude analyzes each response — only YES triggers continuation |
+| Per-goal cooldown | 15 s | Minimum time between continuations (also limits AI analysis calls) |
 | Max continuations | 200 | Auto-deactivates the goal after N turns |
-| Rapid-fire detection | 5 in < 30 s | Emergency 2-min pause if looping |
-| Main-session filter | always on | Cursor proxy sessions are never auto-continued |
+| AI call fail-safe | always on | If AI call fails → don't continue (never loops on errors) |
 
 ### Deploying the Goal Monitor
 
@@ -962,13 +965,14 @@ python3 deploy.py
 The deploy script:
 1. Discovers compiled file paths inside the OpenClaw container
    (`server-chat.js`, `system-events.js`, `heartbeat-wake.js`,
-   `main-session.js`, `plugins/commands.js`)
+   `plugins/commands.js`)
 2. Creates a backup at `server-chat.js.goal-monitor-backup`
-3. Inserts the lifecycle patch (anchored on `clearAgentRunContext`)
-4. Appends the command registration patch (registers `/goal` plugin command)
-5. Deploys `goal-monitor.mjs` to `/app/goal-monitor.mjs`
-6. Creates initial `goals.json` at `/home/node/.openclaw/goals.json`
-7. Restarts the OpenClaw container
+3. Inserts the text capture patch (inside `emitChatFinal`, saves response before buffer clear)
+4. Inserts the lifecycle patch (after `clearAgentRunContext`, passes response text to goal-monitor)
+5. Appends the command registration patch (registers `/goal` plugin command)
+6. Deploys `goal-monitor.mjs` to `/app/goal-monitor.mjs`
+7. Creates initial `goals.json` at `/home/node/.openclaw/goals.json`
+8. Restarts the OpenClaw container
 
 After restart, `/goal` appears in the Telegram command menu automatically.
 
@@ -985,6 +989,7 @@ All goal management is done via the `/goal` command in Telegram:
 /goal set <text> --max 50        — With max continuations
 /goal set <text> --cooldown 30   — With cooldown seconds
 /goal set <text> --delay 10      — With heartbeat delay seconds
+/goal set <text> --model NAME    — Analysis model (default: claude-4.6-opus-max)
 /goal list                       — List all goals
 /goal status                     — Show active goal details
 /goal pause [#]                  — Pause a goal (default: active)
@@ -1030,7 +1035,7 @@ docker logs openclaw -f --tail 50 2>&1 | grep goal-monitor
 ```bash
 cd /opt/cursor-proxy-patched/goal-monitor
 python3 deploy.py --revert    # restores from backup and restarts
-python3 deploy.py --verify    # check if both patches are applied
+python3 deploy.py --verify    # check if all three patches are applied
 ```
 
 ### Configuration Reference (goals.json)
@@ -1042,6 +1047,7 @@ python3 deploy.py --verify    # check if both patches are applied
 | `max_continuations` | number | 200 | Auto-deactivate after this many turns |
 | `cooldown_seconds` | number | 15 | Minimum seconds between continuations |
 | `delay_seconds` | number | 5 | Delay before triggering heartbeat (settle time) |
+| `analysis_model` | string | claude-4.6-opus-max | Model used for AI analysis (YES/NO decision) |
 
 ---
 

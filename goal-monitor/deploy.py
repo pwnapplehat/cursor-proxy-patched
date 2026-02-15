@@ -7,24 +7,19 @@ Run this script on the DROPLET (not your local machine).
 
 What it does:
   1. Copies goal-monitor.mjs into the OpenClaw container at /app/goal-monitor.mjs
-  2. Finds the compiled server-chat.js inside the container
-  3. Discovers relative import paths for OpenClaw's internal modules
-  4. Patches server-chat.js with TWO hooks:
-     a. Lifecycle patch — calls onTurnEnd() when agent finishes a turn
-     b. Command registration — registers /goal as a plugin command for Telegram
-  5. Creates the initial goals.json store
-  6. Fixes file permissions (node user)
-  7. Restarts the OpenClaw container
+  2. Finds compiled source files inside the container
+  3. Patches server-chat.js with THREE hooks:
+     a. Text capture    — saves agent response text before buffer is cleared
+     b. Lifecycle patch — calls onTurnEnd() with response text at turn end
+     c. Cmd registration— registers /goal as a Telegram plugin command
+  4. Creates the initial goals.json store
+  5. Restarts the OpenClaw container
 
 Usage:
   cd /opt/cursor-proxy-patched/goal-monitor
   python3 deploy.py             # apply the patch
   python3 deploy.py --revert    # revert the patch (restores backup)
   python3 deploy.py --verify    # check if the patch is applied
-
-Prerequisites:
-  - Docker must be running
-  - Container named "openclaw" must exist
 """
 
 import argparse
@@ -39,6 +34,9 @@ from pathlib import PurePosixPath
 CONTAINER = "openclaw"
 GOAL_MONITOR_SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "goal-monitor.mjs")
 GOAL_FILE_PATH = "/home/node/.openclaw/goals.json"
+
+# Patch markers (used to detect if already patched and for --verify)
+TEXT_CAPTURE_MARKER = "--- GOAL MONITOR: TEXT CAPTURE ---"
 LIFECYCLE_MARKER = "--- GOAL MONITOR PATCH ---"
 CMD_REG_MARKER = "--- GOAL MONITOR: COMMAND REGISTRATION ---"
 BACKUP_SUFFIX = ".goal-monitor-backup"
@@ -48,9 +46,7 @@ BACKUP_SUFFIX = ".goal-monitor-backup"
 
 def run(cmd, capture=True, check=True):
     """Run a shell command and return stdout."""
-    result = subprocess.run(
-        cmd, shell=True, capture_output=capture, text=True,
-    )
+    result = subprocess.run(cmd, shell=True, capture_output=capture, text=True)
     if check and result.returncode != 0:
         print(f"[ERROR] Command failed: {cmd}")
         if result.stderr:
@@ -83,24 +79,22 @@ def find_file_in_container(pattern, hint_path=""):
         f"find /app -name '{pattern}' {extra} 2>/dev/null | head -5",
         check=False,
     )
-    paths = [p.strip() for p in result.splitlines() if p.strip()]
-    return paths
+    return [p.strip() for p in result.splitlines() if p.strip()]
 
 
 def discover_paths():
     """Discover all required file paths inside the container."""
-    print("[1/8] Discovering file paths inside the OpenClaw container...")
+    print("[1/7] Discovering file paths inside the OpenClaw container...")
 
     # server-chat.js
     candidates = find_file_in_container("server-chat.js", "gateway")
     if not candidates:
         candidates = find_file_in_container("server-chat.cjs", "gateway")
     if not candidates:
-        print("[ERROR] Could not find server-chat.js in the container.")
-        print("  Searched: /app/**/gateway/server-chat.{js,cjs}")
+        print("[ERROR] Could not find server-chat.js")
         sys.exit(1)
     server_chat = candidates[0]
-    print(f"  server-chat.js      → {server_chat}")
+    print(f"  server-chat.js      -> {server_chat}")
 
     # system-events.js
     candidates = find_file_in_container("system-events.js", "infra")
@@ -110,7 +104,7 @@ def discover_paths():
         print("[ERROR] Could not find system-events.js")
         sys.exit(1)
     system_events = candidates[0]
-    print(f"  system-events       → {system_events}")
+    print(f"  system-events       -> {system_events}")
 
     # heartbeat-wake.js
     candidates = find_file_in_container("heartbeat-wake.js", "infra")
@@ -120,51 +114,34 @@ def discover_paths():
         print("[ERROR] Could not find heartbeat-wake.js")
         sys.exit(1)
     heartbeat_wake = candidates[0]
-    print(f"  heartbeat-wake      → {heartbeat_wake}")
+    print(f"  heartbeat-wake      -> {heartbeat_wake}")
 
-    # main-session.js
-    candidates = find_file_in_container("main-session.js", "sessions")
-    if not candidates:
-        candidates = find_file_in_container("main-session.js", "config")
-    if not candidates:
-        candidates = find_file_in_container("main-session.cjs", "sessions")
-    if not candidates:
-        candidates = find_file_in_container("sessions.js", "config")
-    if not candidates:
-        print("[ERROR] Could not find main-session.js or sessions.js")
-        sys.exit(1)
-    main_session = candidates[0]
-    print(f"  main-session        → {main_session}")
-
-    # plugins/commands.js (for /goal command registration)
+    # plugins/commands.js
     candidates = find_file_in_container("commands.js", "plugins")
     if not candidates:
         candidates = find_file_in_container("commands.cjs", "plugins")
     if not candidates:
         print("[ERROR] Could not find plugins/commands.js")
-        print("  Searched: /app/**/plugins/commands.{js,cjs}")
         sys.exit(1)
-    # Filter to get the right one (there may be other commands.js files)
     plugins_commands = None
     for c in candidates:
-        if "plugins" in c and "commands" in c:
+        if "plugins" in c:
             plugins_commands = c
             break
     if not plugins_commands:
         plugins_commands = candidates[0]
-    print(f"  plugins/commands    → {plugins_commands}")
+    print(f"  plugins/commands    -> {plugins_commands}")
 
     return {
         "server_chat": server_chat,
         "system_events": system_events,
         "heartbeat_wake": heartbeat_wake,
-        "main_session": main_session,
         "plugins_commands": plugins_commands,
     }
 
 
 def compute_relative_path(from_file, to_file):
-    """Compute a POSIX relative path from one file's directory to another file."""
+    """Compute a POSIX relative path from one file's directory to another."""
     from_dir = str(PurePosixPath(from_file).parent)
     to_path = str(PurePosixPath(to_file))
     from_parts = from_dir.strip("/").split("/")
@@ -185,28 +162,45 @@ def compute_relative_path(from_file, to_file):
 
 # ── patching ─────────────────────────────────────────────────────────
 
-def build_lifecycle_patch(rel_sys_events, rel_heartbeat, rel_main_session):
+def build_text_capture_patch():
+    """Build the text capture code inserted inside emitChatFinal.
+
+    This saves the agent's response text to globalThis.__gmLastResponse
+    BEFORE the buffer is cleared. The lifecycle patch reads it later.
+    """
+    return (
+        f'    // {TEXT_CAPTURE_MARKER}\n'
+        f'    globalThis.__gmLastResponse = {{ text: text, sessionKey: sessionKey, ts: Date.now() }};\n'
+        f'    // --- END GOAL MONITOR: TEXT CAPTURE ---'
+    )
+
+
+def build_lifecycle_patch(rel_sys_events, rel_heartbeat):
     """Build the lifecycle patch code (inserted after clearAgentRunContext).
 
-    Every line is pre-indented with 4 spaces to align with the
-    surrounding if-block inside the compiled server-chat.js.
+    Reads the captured response text from globalThis and passes it to
+    goal-monitor's onTurnEnd along with the session key.
+    No session filtering — works for ALL sessions.
     """
     indent = "    "
     lines = [
         f"// {LIFECYCLE_MARKER}",
-        f'if (lifecyclePhase === "end" && !isAborted && sessionKey) {{',
-        f'  Promise.all([',
-        f'    import("/app/goal-monitor.mjs"),',
-        f'    import("{rel_sys_events}"),',
-        f'    import("{rel_heartbeat}"),',
-        f'    import("{rel_main_session}")',
-        f'  ]).then(([gm, se, hb, ms]) => {{',
-        f'    gm.onTurnEnd(sessionKey, {{',
-        f'      enqueueSystemEvent: se.enqueueSystemEvent,',
-        f'      requestHeartbeatNow: hb.requestHeartbeatNow,',
-        f'      resolveMainSessionKeyFromConfig: ms.resolveMainSessionKeyFromConfig',
-        f'    }});',
-        f'  }}).catch(() => {{}});',
+        f'if (lifecyclePhase === "end" && !isAborted) {{',
+        f'  const __gmData = globalThis.__gmLastResponse;',
+        f'  if (__gmData && Date.now() - __gmData.ts < 10000) {{',
+        f'    const __gmText = __gmData.text || "";',
+        f'    const __gmSession = __gmData.sessionKey || sessionKey;',
+        f'    Promise.all([',
+        f'      import("/app/goal-monitor.mjs"),',
+        f'      import("{rel_sys_events}"),',
+        f'      import("{rel_heartbeat}")',
+        f'    ]).then(([gm, se, hb]) => {{',
+        f'      gm.onTurnEnd(__gmSession, __gmText, {{',
+        f'        enqueueSystemEvent: se.enqueueSystemEvent,',
+        f'        requestHeartbeatNow: hb.requestHeartbeatNow',
+        f'      }});',
+        f'    }}).catch(() => {{}});',
+        f'  }}',
         f'}}',
         f'// --- END GOAL MONITOR PATCH ---',
     ]
@@ -214,13 +208,7 @@ def build_lifecycle_patch(rel_sys_events, rel_heartbeat, rel_main_session):
 
 
 def build_cmd_registration_patch(rel_plugins_commands):
-    """Build the command registration code (appended to end of file).
-
-    This runs at module load time via a Promise chain.
-    When server-chat.js is evaluated, this fires immediately and registers
-    /goal as a plugin command via registerPluginCommand, making it
-    available in Telegram before any user interaction.
-    """
+    """Build the command registration code (appended to end of file)."""
     lines = [
         f"// {CMD_REG_MARKER}",
         "Promise.all([",
@@ -243,13 +231,12 @@ def apply_patch(paths):
     """Extract, patch, and re-deploy server-chat.js."""
     server_chat = paths["server_chat"]
 
-    # Compute relative import paths from server-chat.js's directory
+    # Compute relative import paths
     rel_se = compute_relative_path(server_chat, paths["system_events"])
     rel_hb = compute_relative_path(server_chat, paths["heartbeat_wake"])
-    rel_ms = compute_relative_path(server_chat, paths["main_session"])
     rel_pc = compute_relative_path(server_chat, paths["plugins_commands"])
 
-    print(f"\n[2/8] Extracting {server_chat} from container...")
+    print(f"\n[2/7] Extracting {server_chat} from container...")
     local_original = "/tmp/server-chat-original.js"
     local_patched = "/tmp/server-chat-patched.js"
     docker_cp_from(server_chat, local_original)
@@ -258,60 +245,100 @@ def apply_patch(paths):
         source = f.read()
 
     # Check if already patched
-    has_lifecycle = LIFECYCLE_MARKER in source
-    has_cmd_reg = CMD_REG_MARKER in source
-    if has_lifecycle and has_cmd_reg:
-        print("  [WARN] File is already fully patched. Use --revert first to re-patch.")
-        return False
-    if has_lifecycle or has_cmd_reg:
-        print("  [WARN] File has a partial patch. Use --revert first, then re-deploy.")
+    if LIFECYCLE_MARKER in source or TEXT_CAPTURE_MARKER in source or CMD_REG_MARKER in source:
+        print("  [WARN] File already has patches. Use --revert first to re-patch.")
         return False
 
-    # Create backup inside the container
-    print(f"[3/8] Creating backup at {server_chat}{BACKUP_SUFFIX}...")
+    # Create backup
+    print(f"[3/7] Creating backup at {server_chat}{BACKUP_SUFFIX}...")
     docker_exec(f"cp {server_chat} {server_chat}{BACKUP_SUFFIX}")
 
-    # ── Lifecycle Patch ──────────────────────────────────────────────
-    # Find clearAgentRunContext(evt.runId); and insert after it
-    pattern = re.compile(
+    # ── PATCH 1: Text Capture (inside emitChatFinal) ─────────────────
+    # Find: chatRunState.buffers.delete(clientRunId)
+    # Insert BEFORE it: save text to globalThis.__gmLastResponse
+    print("[4/7] Applying text capture patch (inside emitChatFinal)...")
+
+    # The pattern in emitChatFinal:
+    #   const text = chatRunState.buffers.get(clientRunId)?.trim() ?? "";
+    #   chatRunState.buffers.delete(clientRunId);
+    # We insert between these two lines.
+    text_capture_pattern = re.compile(
+        r'((?:const|let|var)\s+(\w+)\s*=\s*chatRunState\.buffers\.get\(clientRunId\).*?;)'
+        r'(\s*\n)'
+        r'(\s*chatRunState\.buffers\.delete\(clientRunId\)\s*;)',
+        re.DOTALL,
+    )
+
+    tc_match = text_capture_pattern.search(source)
+    if not tc_match:
+        # Fallback: try simpler pattern
+        tc_fallback = re.compile(
+            r'(chatRunState\.buffers\.get\(clientRunId\).*?;\s*\n)'
+            r'(\s*)(chatRunState\.buffers\.delete\(clientRunId\)\s*;)',
+            re.DOTALL,
+        )
+        tc_match = tc_fallback.search(source)
+        if not tc_match:
+            print("[ERROR] Could not find chatRunState.buffers.get/delete pattern")
+            print("  The compiled code structure may differ from expected.")
+            sys.exit(1)
+
+        # Fallback insertion: before buffers.delete
+        insert_pos = tc_match.start(3)
+        text_var = "text"  # assume variable is named 'text'
+        capture_code = build_text_capture_patch()
+        source = source[:insert_pos] + capture_code + "\n" + source[insert_pos:]
+    else:
+        # Primary insertion: between the buffer read and the delete
+        text_var = tc_match.group(2)  # captured variable name (usually 'text')
+        insert_pos = tc_match.end(1) + len(tc_match.group(3))
+        capture_code = build_text_capture_patch().replace(
+            "text: text,", f"text: {text_var},"
+        )
+        source = source[:insert_pos] + capture_code + "\n" + source[insert_pos:]
+
+    # ── PATCH 2: Lifecycle Handler (after clearAgentRunContext) ───────
+    print("[5/7] Applying lifecycle patch (after clearAgentRunContext)...")
+
+    lifecycle_pattern = re.compile(
         r'(clearAgentRunContext\s*\(\s*evt\.runId\s*\)\s*;)',
         re.MULTILINE,
     )
-    matches = list(pattern.finditer(source))
-    if not matches:
-        pattern2 = re.compile(r'(clearAgentRunContext\([^)]*\)\s*;)', re.MULTILINE)
-        matches = list(pattern2.finditer(source))
+    lc_matches = list(lifecycle_pattern.finditer(source))
+    if not lc_matches:
+        lifecycle_pattern2 = re.compile(
+            r'(clearAgentRunContext\([^)]*\)\s*;)', re.MULTILINE
+        )
+        lc_matches = list(lifecycle_pattern2.finditer(source))
 
-    if not matches:
-        print("[ERROR] Could not find clearAgentRunContext(evt.runId) in server-chat.js")
-        print("  The compiled code structure may differ from expected.")
+    if not lc_matches:
+        print("[ERROR] Could not find clearAgentRunContext in server-chat.js")
         sys.exit(1)
 
-    match = matches[-1]
-    insert_pos = match.end()
+    lc_match = lc_matches[-1]
+    insert_pos = lc_match.end()
+    lifecycle_code = build_lifecycle_patch(rel_se, rel_hb)
+    source = source[:insert_pos] + "\n" + lifecycle_code + "\n" + source[insert_pos:]
 
-    print(f"[4/8] Applying lifecycle patch (after position {insert_pos})...")
-    lifecycle_code = build_lifecycle_patch(rel_se, rel_hb, rel_ms)
-    patched = source[:insert_pos] + "\n" + lifecycle_code + "\n" + source[insert_pos:]
-
-    # ── Command Registration Patch ───────────────────────────────────
-    print("[5/8] Applying command registration patch (appended to file)...")
+    # ── PATCH 3: Command Registration (appended to end) ──────────────
+    print("[6/7] Applying command registration patch (appended)...")
     cmd_reg_code = build_cmd_registration_patch(rel_pc)
-    patched = patched + "\n" + cmd_reg_code + "\n"
+    source = source + "\n" + cmd_reg_code + "\n"
+
+    # Verify all patches present
+    for marker, name in [
+        (TEXT_CAPTURE_MARKER, "text capture"),
+        (LIFECYCLE_MARKER, "lifecycle"),
+        (CMD_REG_MARKER, "command registration"),
+    ]:
+        if marker not in source:
+            print(f"[ERROR] {name} patch marker missing after patching")
+            sys.exit(1)
 
     with open(local_patched, "w", encoding="utf-8") as f:
-        f.write(patched)
+        f.write(source)
 
-    # Verify both patches present
-    if LIFECYCLE_MARKER not in patched:
-        print("[ERROR] Lifecycle patch marker missing — something went wrong.")
-        sys.exit(1)
-    if CMD_REG_MARKER not in patched:
-        print("[ERROR] Command registration patch marker missing — something went wrong.")
-        sys.exit(1)
-
-    # Copy patched file back
-    print(f"[6/8] Deploying patched server-chat.js to container...")
+    # Copy back
     docker_cp_to(local_patched, server_chat)
     docker_exec(f"chown node:node {server_chat}")
 
@@ -322,7 +349,7 @@ def apply_patch(paths):
 
 def deploy_goal_monitor():
     """Copy goal-monitor.mjs into the container."""
-    print("[7/8] Deploying goal-monitor.mjs to /app/goal-monitor.mjs...")
+    print("  Deploying goal-monitor.mjs to /app/goal-monitor.mjs...")
     if not os.path.isfile(GOAL_MONITOR_SRC):
         print(f"[ERROR] Cannot find {GOAL_MONITOR_SRC}")
         sys.exit(1)
@@ -335,7 +362,7 @@ def create_initial_goal_store():
     gf = GOAL_FILE_PATH
     check = docker_exec(f"test -f {gf} && echo exists || echo missing", check=False)
     if "exists" in check:
-        print("  goals.json already exists — skipping creation")
+        print("  goals.json already exists — skipping")
         return
     store = {"version": 1, "goals": []}
     docker_exec(
@@ -345,7 +372,6 @@ def create_initial_goal_store():
         f"\"",
         check=False,
     )
-    # Fallback: write via echo if python3 isn't available
     check2 = docker_exec(f"test -f {gf} && echo exists || echo missing", check=False)
     if "missing" in check2:
         docker_exec(f"mkdir -p $(dirname {gf})")
@@ -377,62 +403,62 @@ def revert_patch(paths):
 # ── verify ───────────────────────────────────────────────────────────
 
 def verify_patch(paths):
-    """Check if the patch is currently applied."""
+    """Check if all patches are currently applied."""
     server_chat = paths["server_chat"]
 
-    lc_check = docker_exec(
-        f"grep -c '{LIFECYCLE_MARKER}' {server_chat} 2>/dev/null || echo 0",
-        check=False,
-    )
-    lc_count = lc_check.strip().split("\n")[-1]
+    markers = {
+        "text capture": TEXT_CAPTURE_MARKER,
+        "lifecycle": LIFECYCLE_MARKER,
+        "command registration": CMD_REG_MARKER,
+    }
 
-    cmd_check = docker_exec(
-        f"grep -c '{CMD_REG_MARKER}' {server_chat} 2>/dev/null || echo 0",
-        check=False,
-    )
-    cmd_count = cmd_check.strip().split("\n")[-1]
+    all_ok = True
+    for name, marker in markers.items():
+        check = docker_exec(
+            f"grep -c '{marker}' {server_chat} 2>/dev/null || echo 0",
+            check=False,
+        )
+        count = check.strip().split("\n")[-1]
+        if count and int(count) > 0:
+            print(f"  [OK] {name} patch applied")
+        else:
+            print(f"  [MISSING] {name} patch NOT applied")
+            all_ok = False
 
-    has_lifecycle = lc_count and int(lc_count) > 0
-    has_cmd_reg = cmd_count and int(cmd_count) > 0
-
-    if has_lifecycle and has_cmd_reg:
-        print(f"[OK] Both patches applied in {server_chat}")
-    elif has_lifecycle:
-        print(f"[WARN] Only lifecycle patch applied (missing command registration)")
-    elif has_cmd_reg:
-        print(f"[WARN] Only command registration applied (missing lifecycle patch)")
-    else:
-        print(f"[INFO] No patches applied in {server_chat}")
-        return
-
-    # Check goal-monitor.mjs
+    # Check files
     gm_check = docker_exec(
         "test -f /app/goal-monitor.mjs && echo exists || echo missing",
         check=False,
     )
     if "exists" in gm_check:
-        print("[OK] /app/goal-monitor.mjs exists")
+        print("  [OK] /app/goal-monitor.mjs exists")
     else:
-        print("[WARN] /app/goal-monitor.mjs is MISSING")
+        print("  [MISSING] /app/goal-monitor.mjs")
+        all_ok = False
 
-    # Check goals.json
     goal_check = docker_exec(
         f"test -f {GOAL_FILE_PATH} && echo exists || echo missing",
         check=False,
     )
     if "exists" in goal_check:
-        print(f"[OK] {GOAL_FILE_PATH} exists")
+        print(f"  [OK] {GOAL_FILE_PATH} exists")
     else:
-        print(f"[WARN] {GOAL_FILE_PATH} is MISSING")
+        print(f"  [MISSING] {GOAL_FILE_PATH}")
+        all_ok = False
+
+    if all_ok:
+        print("\n  All patches and files verified.")
+    else:
+        print("\n  Some patches or files are missing. Re-deploy with: python3 deploy.py")
 
 
 # ── restart ──────────────────────────────────────────────────────────
 
 def restart_container():
     """Restart the OpenClaw container."""
-    print("[8/8] Restarting OpenClaw container...")
+    print("[7/7] Restarting OpenClaw container...")
     run(f"docker restart {CONTAINER}")
-    print("  Container restarted. Waiting 5 seconds for startup...")
+    print("  Waiting 5 seconds for startup...")
     time.sleep(5)
     status = run(f"docker ps --filter name={CONTAINER} --format '{{{{.Status}}}}'")
     print(f"  Container status: {status}")
@@ -444,14 +470,8 @@ def main():
     parser = argparse.ArgumentParser(
         description="Deploy the Goal Monitor patch for OpenClaw",
     )
-    parser.add_argument(
-        "--revert", action="store_true",
-        help="Revert the patch (restore from backup)",
-    )
-    parser.add_argument(
-        "--verify", action="store_true",
-        help="Check if the patch is applied",
-    )
+    parser.add_argument("--revert", action="store_true", help="Revert the patch")
+    parser.add_argument("--verify", action="store_true", help="Check if patch is applied")
     parser.add_argument(
         "--container", default=CONTAINER,
         help=f"Docker container name (default: {CONTAINER})",
@@ -470,7 +490,6 @@ def main():
         print(f"[ERROR] Container '{CONTAINER}' is not running.")
         sys.exit(1)
 
-    # Discover paths
     paths = discover_paths()
 
     if args.verify:
@@ -484,7 +503,7 @@ def main():
 
     # Full deploy
     print("\n" + "=" * 60)
-    print("  Goal Monitor — Deploy & Patch")
+    print("  Goal Monitor — Deploy & Patch (with AI Analysis Gate)")
     print("=" * 60 + "\n")
 
     patched = apply_patch(paths)
@@ -504,20 +523,20 @@ Next steps:
   1. Set a goal from Telegram:
      /goal Continue reverse engineering till all phases complete
 
-  2. Send the agent a message via Telegram to start working.
+  2. Send the agent a message to start working.
 
-  3. When the agent finishes a turn, the goal monitor will
-     automatically trigger a continuation.
+  3. When the agent finishes a turn, the goal monitor will:
+     - Capture the agent's response text
+     - Send it to Claude for analysis against the active goal
+     - Only continue if Claude says YES
 
   4. Monitor logs:
      docker logs openclaw -f --tail 50 2>&1 | grep goal-monitor
 
-  5. Manage goals from Telegram:
+  5. Manage goals:
      /goal list
      /goal status
      /goal pause
-     /goal resume
-     /goal delete
 """)
 
 
