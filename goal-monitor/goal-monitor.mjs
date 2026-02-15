@@ -8,10 +8,10 @@
  *    Registered at startup by registerGoalCommand().
  *
  * 2. onTurnEnd() — AI-gated auto-continuation when the agent finishes a turn.
- *    Called from the patched server-chat.js lifecycle handler.
+ *    Called from the patched gateway chunk (gateway-cli-*.js in /app/dist/).
  *
  *    Flow:
- *      a. server-chat.js captures the agent's response text before the buffer
+ *      a. Gateway chunk captures the agent's response text before the buffer
  *         is cleared (stored in globalThis.__gmLastResponse)
  *      b. On lifecycle "end", onTurnEnd() is called with the response text
  *      c. If an active goal exists, the response is sent to Claude via the
@@ -634,7 +634,7 @@ async function cmdClear() {
 /* ================================================================== */
 
 /**
- * Called from patched server-chat.js when an agent lifecycle "end" fires.
+ * Called from patched gateway chunk when an agent lifecycle "end" fires.
  *
  * @param {string} sessionKey — session that just finished
  * @param {string} responseText — the agent's full response from this turn
