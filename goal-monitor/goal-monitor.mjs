@@ -310,7 +310,7 @@ export function registerGoalCommand(registerPluginCommand) {
   }
 }
 
-async function handleGoalCommand(ctx) {
+export async function handleGoalCommand(ctx) {
   try {
     const args = (ctx.args || "").trim();
     if (!args || args.toLowerCase() === "help") {

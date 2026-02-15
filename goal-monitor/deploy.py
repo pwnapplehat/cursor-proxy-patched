@@ -12,10 +12,18 @@ What it does:
      a. Text capture    — saves agent response text before buffer is cleared
      b. Lifecycle patch — calls onTurnEnd() at turn end with response text
         (enqueueSystemEvent and requestHeartbeatNow are local to the chunk)
-  4. Patches extensionAPI.js with command registration hook
-     (registerPluginCommand is a local function inside extensionAPI.js)
+  4. Patches the reply module (reply-*.js) with command registration
+     — registers /goal directly in the authoritative pluginCommands Map
+     — picked up by Telegram bot.command() setup and auto-reply chain
   5. Creates the initial goals.json store
   6. Restarts the OpenClaw container
+
+Why the reply module and NOT extensionAPI.js?
+  Rolldown duplicates the pluginCommands Map into multiple chunks.
+  extensionAPI.js has its own copy of registerPluginCommand + Map, but the
+  Telegram bot dispatcher and auto-reply handlePluginCommand both read from
+  the Map in reply-*.js. Registering in extensionAPI.js adds to the wrong
+  Map — the command is invisible to the dispatcher.
 
 Usage:
   cd /opt/cursor-proxy-patched/goal-monitor
@@ -37,13 +45,11 @@ GOAL_MONITOR_SRC = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "goal-monitor.mjs"
 )
 GOAL_FILE_PATH = "/home/node/.openclaw/goals.json"
-EXTENSION_API_PATH = "/app/dist/extensionAPI.js"
 
 # Patch markers (used to detect existing patches and for --verify)
 TEXT_CAPTURE_MARKER = "--- GOAL MONITOR: TEXT CAPTURE ---"
 LIFECYCLE_MARKER = "--- GOAL MONITOR PATCH ---"
 CMD_REG_MARKER = "--- GOAL MONITOR: COMMAND REGISTRATION ---"
-INIT_TRIGGER_MARKER = "--- GOAL MONITOR: INIT TRIGGER ---"
 BACKUP_SUFFIX = ".goal-monitor-backup"
 
 
@@ -137,29 +143,49 @@ def discover_paths():
         else:
             print(f"  [OK] All required functions found in {os.path.basename(gf)}")
 
-    # ── extensionAPI.js: stable path, contains registerPluginCommand ──
-    ext_ok = False
-    ext_check = docker_exec(
-        f"test -f {EXTENSION_API_PATH} && echo exists || echo missing",
-        check=False,
-    )
-    if "exists" in ext_check:
-        reg_count = docker_exec(
-            f'grep -c "registerPluginCommand" "{EXTENSION_API_PATH}" 2>/dev/null || echo 0',
+    # ── Reply module: contains the AUTHORITATIVE pluginCommands Map ──
+    # This is the Map that the Telegram bot.command() setup and auto-reply
+    # handlePluginCommand handler both read from. It lives in reply-*.js.
+    #
+    # We find it by searching for files containing getPluginCommandSpecs
+    # (the function called by registerTelegramNativeCommands to build the
+    # Telegram command menu). Only the reply chunk has this + pluginCommands.
+    reply_candidates = find_dist_files_containing("getPluginCommandSpecs")
+    reply_module = None
+
+    # Prefer files matching reply-*.js pattern
+    reply_files = [f for f in reply_candidates if "/reply-" in f]
+    if reply_files:
+        # Further narrow: must also contain pluginCommands Map definition
+        for rf in reply_files:
+            check = docker_exec(
+                f'grep -c "pluginCommands" "{rf}" 2>/dev/null || echo 0',
+                check=False,
+            )
+            c = check.strip().split("\n")[-1]
+            if int(c) > 5:  # Should have many references
+                reply_module = rf
+                break
+        if not reply_module:
+            reply_module = reply_files[0]
+    elif reply_candidates:
+        reply_module = reply_candidates[0]
+
+    if reply_module:
+        print(f"  Reply module: {reply_module}")
+        # Verify it has the pluginCommands Map
+        pc_count = docker_exec(
+            f'grep -c "pluginCommands" "{reply_module}" 2>/dev/null || echo 0',
             check=False,
         )
-        c = reg_count.strip().split("\n")[-1]
-        if int(c) > 0:
-            print(f"  extensionAPI.js: {EXTENSION_API_PATH} ({c} registerPluginCommand refs)")
-            ext_ok = True
-        else:
-            print(f"  [WARN] registerPluginCommand not found in {EXTENSION_API_PATH}")
+        c = pc_count.strip().split("\n")[-1]
+        print(f"  [OK] pluginCommands refs: {c}")
     else:
-        print(f"  [WARN] {EXTENSION_API_PATH} not found — command registration will be skipped")
+        print("  [WARN] Reply module not found — /goal command registration will be skipped")
 
     return {
         "gateway_files": gateway_files,
-        "extension_api": EXTENSION_API_PATH if ext_ok else None,
+        "reply_module": reply_module,
     }
 
 
@@ -206,38 +232,50 @@ def build_lifecycle_patch():
 
 
 def build_cmd_registration_patch():
-    """Build the command registration code (appended to extensionAPI.js).
+    """Build the command registration code (appended to reply module).
 
-    registerPluginCommand is a local function defined in extensionAPI.js,
-    so it is directly accessible at the append point — no imports needed.
+    Directly inserts into the pluginCommands Map that the Telegram bot
+    dispatcher and auto-reply handlePluginCommand both read from.
+
+    The pluginCommands Map is a module-scoped const in the reply chunk,
+    so code appended to the file can access it directly. The handler
+    dynamically imports goal-monitor.mjs and delegates to handleGoalCommand.
+
+    Timing: This code runs at module load time (when reply-*.js is first
+    imported during Telegram channel init). registerTelegramNativeCommands()
+    is called AFTER the module loads, so getPluginCommandSpecs() will see
+    the /goal entry and register a native bot.command("goal") handler.
+    Result: /goal appears in the Telegram command menu and is handled
+    by grammY before reaching bot.on("message").
     """
     lines = [
         f"// {CMD_REG_MARKER}",
-        'import("/app/goal-monitor.mjs").then((gm) => {',
-        '  if (typeof gm.registerGoalCommand === "function") {',
-        "    gm.registerGoalCommand(registerPluginCommand);",
+        "// Register /goal in the authoritative pluginCommands Map.",
+        "// This Map is read by both bot.command() setup and auto-reply handlePluginCommand.",
+        "(function() {",
+        '  var gmKey = "/goal";',
+        "  if (pluginCommands.has(gmKey)) {",
+        '    console.log("[goal-monitor] /goal already registered — skipping");',
+        "    return;",
         "  }",
-        "}).catch((err) => {",
-        '  console.error("[goal-monitor] /goal command registration failed:", err?.message || String(err));',
-        "});",
+        "  pluginCommands.set(gmKey, {",
+        '    name: "goal",',
+        '    description: "Manage autonomous continuation goals",',
+        "    acceptsArgs: true,",
+        "    requireAuth: true,",
+        '    pluginId: "goal-monitor",',
+        "    handler: async function(ctx) {",
+        "      try {",
+        '        var gm = await import("/app/goal-monitor.mjs");',
+        "        return gm.handleGoalCommand(ctx);",
+        "      } catch (err) {",
+        '        return { text: "\\u26a0\\ufe0f Goal monitor error: " + (err.message || String(err)) };',
+        "      }",
+        "    }",
+        "  });",
+        '  console.log("[goal-monitor] /goal command registered in reply module");',
+        "})();",
         "// --- END GOAL MONITOR: COMMAND REGISTRATION ---",
-    ]
-    return "\n".join(lines)
-
-
-def build_init_trigger_patch():
-    """Build the init trigger code (appended to the gateway chunk).
-
-    extensionAPI.js is lazy-loaded and may never be imported during normal
-    startup. This force-import at module level ensures it loads when the
-    gateway starts, which triggers the command registration code we
-    appended to extensionAPI.js.
-    """
-    lines = [
-        f"// {INIT_TRIGGER_MARKER}",
-        "// Force-load extensionAPI.js so the appended /goal command registration runs",
-        'import("/app/dist/extensionAPI.js").catch(() => {});',
-        "// --- END GOAL MONITOR: INIT TRIGGER ---",
     ]
     return "\n".join(lines)
 
@@ -258,7 +296,7 @@ def patch_gateway_chunk(filepath):
         source = f.read()
 
     # Check if already patched
-    if LIFECYCLE_MARKER in source or TEXT_CAPTURE_MARKER in source or INIT_TRIGGER_MARKER in source:
+    if LIFECYCLE_MARKER in source or TEXT_CAPTURE_MARKER in source:
         print(f"  [SKIP] {basename} already patched. Use --revert first to re-patch.")
         return False
 
@@ -342,18 +380,10 @@ def patch_gateway_chunk(filepath):
     lifecycle_code = build_lifecycle_patch()
     source = source[:insert_pos] + "\n" + lifecycle_code + "\n" + source[insert_pos:]
 
-    # ── PATCH 3: Init Trigger (appended to end of file) ────────────
-    # This runs at module load time (not inside a function),
-    # force-loading extensionAPI.js so its command registration runs.
-    print(f"  Appending init trigger to {basename} ...")
-    init_trigger_code = build_init_trigger_patch()
-    source = source + "\n" + init_trigger_code + "\n"
-
-    # Verify all three patches are present
+    # Verify both patches are present
     for marker, name in [
         (TEXT_CAPTURE_MARKER, "text capture"),
         (LIFECYCLE_MARKER, "lifecycle"),
-        (INIT_TRIGGER_MARKER, "init trigger"),
     ]:
         if marker not in source:
             print(f"  [ERROR] {name} patch marker missing after patching {basename}")
@@ -368,11 +398,17 @@ def patch_gateway_chunk(filepath):
     return True
 
 
-# ── extensionAPI.js patching ─────────────────────────────────────────
+# ── reply module patching ────────────────────────────────────────────
 
 
-def patch_extension_api(filepath):
-    """Append command registration patch to extensionAPI.js."""
+def patch_reply_module(filepath):
+    """Append command registration patch to the reply module (reply-*.js).
+
+    The reply module contains the authoritative pluginCommands Map that
+    both the Telegram bot.command() dispatcher and the auto-reply chain's
+    handlePluginCommand read from. Registering directly in this Map
+    ensures /goal is visible to all dispatch paths.
+    """
     basename = os.path.basename(filepath)
     local_original = f"/tmp/{basename}.original"
     local_patched = f"/tmp/{basename}.patched"
@@ -387,17 +423,23 @@ def patch_extension_api(filepath):
         print(f"  [SKIP] {basename} already has command registration patch.")
         return False
 
-    # Verify registerPluginCommand is defined in this file
-    if "function registerPluginCommand" not in source:
-        print(f"  [WARN] registerPluginCommand function not found in {basename}")
-        print(f"  Command registration skipped — /goal will not be available in Telegram menu")
+    # Verify this file has the pluginCommands Map
+    if "pluginCommands" not in source:
+        print(f"  [WARN] pluginCommands not found in {basename}")
+        print(f"  Command registration skipped — /goal will not be available")
         return False
+
+    # Verify this file has getPluginCommandSpecs (confirming it feeds the bot setup)
+    if "getPluginCommandSpecs" not in source:
+        print(f"  [WARN] getPluginCommandSpecs not found in {basename}")
+        print(f"  This may not be the correct reply module")
 
     # Create backup
     docker_exec(f'cp "{filepath}" "{filepath}{BACKUP_SUFFIX}"')
     print(f"  Backup created: {filepath}{BACKUP_SUFFIX}")
 
-    # Append command registration
+    # Append command registration — runs at module load time, before
+    # registerTelegramNativeCommands() calls getPluginCommandSpecs()
     cmd_reg_code = build_cmd_registration_patch()
     source = source + "\n" + cmd_reg_code + "\n"
 
@@ -450,8 +492,8 @@ def create_initial_goal_store():
 def revert_patches(paths):
     """Restore all patched files from their backups."""
     all_files = list(paths["gateway_files"])
-    if paths.get("extension_api"):
-        all_files.append(paths["extension_api"])
+    if paths.get("reply_module"):
+        all_files.append(paths["reply_module"])
 
     reverted = 0
     for filepath in all_files:
@@ -482,13 +524,12 @@ def verify_patches(paths):
     """Check if all patches are currently applied."""
     all_ok = True
 
-    # Check gateway chunks
+    # Check gateway chunks (text capture + lifecycle only)
     for gf in paths["gateway_files"]:
         basename = os.path.basename(gf)
         for marker, name in [
             (TEXT_CAPTURE_MARKER, "text capture"),
             (LIFECYCLE_MARKER, "lifecycle"),
-            (INIT_TRIGGER_MARKER, "init trigger"),
         ]:
             count = docker_exec(
                 f'grep -c "{marker}" "{gf}" 2>/dev/null || echo 0',
@@ -501,18 +542,19 @@ def verify_patches(paths):
                 print(f"  [MISSING] {name} patch in {basename}")
                 all_ok = False
 
-    # Check extensionAPI.js
-    if paths.get("extension_api"):
-        ext_api = paths["extension_api"]
+    # Check reply module (command registration)
+    if paths.get("reply_module"):
+        reply = paths["reply_module"]
+        reply_base = os.path.basename(reply)
         count = docker_exec(
-            f'grep -c "{CMD_REG_MARKER}" "{ext_api}" 2>/dev/null || echo 0',
+            f'grep -c "{CMD_REG_MARKER}" "{reply}" 2>/dev/null || echo 0',
             check=False,
         )
         c = count.strip().split("\n")[-1]
         if c and int(c) > 0:
-            print(f"  [OK] command registration patch in extensionAPI.js")
+            print(f"  [OK] command registration patch in {reply_base}")
         else:
-            print(f"  [MISSING] command registration patch in extensionAPI.js")
+            print(f"  [MISSING] command registration patch in {reply_base}")
             all_ok = False
 
     # Check deployed files
@@ -603,19 +645,60 @@ def main():
 
     any_patched = False
 
+    # Step 0: Revert any stale patches from previous deployments
+    # Previous versions patched extensionAPI.js (wrong Map) and added init
+    # trigger patches to gateway chunks. Revert everything cleanly first.
+    print("\n[CLEANUP] Reverting any previous patches ...")
+    stale_reverted = 0
+    all_backup_candidates = list(paths["gateway_files"])
+    if paths.get("reply_module"):
+        all_backup_candidates.append(paths["reply_module"])
+    # Also check extensionAPI.js (no longer patched, but may have stale patch)
+    ext_api_check = docker_exec(
+        'test -f /app/dist/extensionAPI.js.goal-monitor-backup && echo exists || echo missing',
+        check=False,
+    )
+    if "exists" in ext_api_check:
+        print("  Reverting stale extensionAPI.js patch ...")
+        docker_exec(
+            'cp /app/dist/extensionAPI.js.goal-monitor-backup /app/dist/extensionAPI.js',
+            check=False,
+        )
+        docker_exec('chown node:node /app/dist/extensionAPI.js', check=False)
+        docker_exec('rm -f /app/dist/extensionAPI.js.goal-monitor-backup', check=False)
+        stale_reverted += 1
+
+    for filepath in all_backup_candidates:
+        backup = filepath + BACKUP_SUFFIX
+        check = docker_exec(
+            f'test -f "{backup}" && echo exists || echo missing', check=False
+        )
+        if "exists" in check:
+            basename = os.path.basename(filepath)
+            print(f"  Reverting {basename} from backup ...")
+            docker_exec(f'cp "{backup}" "{filepath}"')
+            docker_exec(f'chown node:node "{filepath}"')
+            docker_exec(f'rm -f "{backup}"')
+            stale_reverted += 1
+
+    if stale_reverted:
+        print(f"  Reverted {stale_reverted} file(s) to clean state")
+    else:
+        print("  No previous patches found — clean state")
+
     # Step 1: Patch gateway chunk(s) — text capture + lifecycle
     print("\n[PATCH] Patching gateway chunk(s) ...")
     for gf in paths["gateway_files"]:
         if patch_gateway_chunk(gf):
             any_patched = True
 
-    # Step 2: Patch extensionAPI.js — command registration
-    if paths.get("extension_api"):
-        print("\n[PATCH] Patching extensionAPI.js ...")
-        if patch_extension_api(paths["extension_api"]):
+    # Step 2: Patch reply module — command registration in the correct Map
+    if paths.get("reply_module"):
+        print("\n[PATCH] Patching reply module for /goal command ...")
+        if patch_reply_module(paths["reply_module"]):
             any_patched = True
     else:
-        print("\n[SKIP] extensionAPI.js not available — /goal command registration skipped")
+        print("\n[SKIP] Reply module not found — /goal command registration skipped")
 
     # Step 3: Deploy goal-monitor.mjs
     print("\n[DEPLOY] Deploying goal-monitor.mjs and goals.json ...")

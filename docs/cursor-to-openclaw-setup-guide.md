@@ -933,9 +933,10 @@ Goals are managed directly from **Telegram** using the `/goal` command — no SS
      the captured text and calls `goal-monitor.mjs` → `onTurnEnd()`.
      References `enqueueSystemEvent` and `requestHeartbeatNow` directly
      (they are local to the same chunk — no cross-file imports needed).
-   - **Command registration** (in `extensionAPI.js`): registers `/goal` as a
-     plugin command via `registerPluginCommand()` for the Telegram command menu.
-     `extensionAPI.js` has a stable filename (no hash).
+   - **Command registration** (in `reply-*.js`): registers `/goal` directly in
+     the authoritative `pluginCommands` Map that the Telegram bot dispatcher and
+     auto-reply `handlePluginCommand` both read from. Picked up natively by
+     `bot.command()` setup — appears in the Telegram command menu.
 2. `onTurnEnd()` reads the active goal from `goals.json`.
 3. The agent's response text is sent to Claude (via the cursor proxy API) with a
    structured prompt asking: should the agent continue working on this goal? YES/NO.
@@ -969,12 +970,14 @@ python3 deploy.py
 
 The deploy script:
 1. Discovers compiled chunk files in `/app/dist/` by **content search**
-   (finds `gateway-cli-*.js` via `chatRunState`, and `extensionAPI.js` by stable name)
-2. Creates backups of each file (`.goal-monitor-backup` suffix)
-3. Patches gateway chunk(s): text capture (inside `emitChatFinal`) + lifecycle
+   (finds `gateway-cli-*.js` via `chatRunState`, `reply-*.js` via `getPluginCommandSpecs`)
+2. Reverts any stale patches from previous deployments (including old `extensionAPI.js` patches)
+3. Creates backups of each file (`.goal-monitor-backup` suffix)
+4. Patches gateway chunk(s): text capture (inside `emitChatFinal`) + lifecycle
    (after `clearAgentRunContext`, with direct references to `enqueueSystemEvent`
    and `requestHeartbeatNow`)
-4. Patches `extensionAPI.js`: appends `/goal` command registration
+5. Patches reply module (`reply-*.js`): appends `/goal` command registration
+   directly in the `pluginCommands` Map
 5. Deploys `goal-monitor.mjs` to `/app/goal-monitor.mjs`
 6. Creates initial `goals.json` at `/home/node/.openclaw/goals.json`
 7. Restarts the OpenClaw container
@@ -1069,8 +1072,8 @@ python3 deploy.py --verify    # check if all three patches are applied
 9. **OOM kills on low-RAM droplets** — memory-intensive tasks (Jadx, Ghidra, baksmali) can trigger Linux OOM killer on VMs with less than 8GB RAM; add swap space to mitigate (see Add Swap Space under Troubleshooting)
 10. **Stale session locks** — OOM kills or crashes can leave `.lock` files blocking sessions; manual cleanup required (see Stale Session Lock Fix under Troubleshooting)
 11. **ripgrep not pre-installed** — the OpenClaw container does not include `ripgrep` by default; must be installed manually as root, and does not persist across container rebuilds (see Install ripgrep under Troubleshooting)
-12. **Goal monitor patch** — the `gateway-cli-*.js` patch, `extensionAPI.js` patch, and `/app/goal-monitor.mjs` live inside the container filesystem; they survive `docker restart` but are lost on `docker rm` + `docker run`; re-run `python3 deploy.py` to re-apply (see Goal Monitor section)
+12. **Goal monitor patch** — the `gateway-cli-*.js` patches, `reply-*.js` patch, and `/app/goal-monitor.mjs` live inside the container filesystem; they survive `docker restart` but are lost on `docker rm` + `docker run`; re-run `python3 deploy.py` to re-apply (see Goal Monitor section)
 
 ---
 
-*Last updated: February 6, 2026 (Goal Monitor rewritten with content-based discovery for Rolldown bundled chunks, direct function references in gateway chunk, extensionAPI.js command registration, exec auto-background disable, context management system, proxy error translation, swap space setup, stale session lock fix, ripgrep installation guide). Patched repo: [github.com/pwnapplehat/cursor-proxy-patched](https://github.com/pwnapplehat/cursor-proxy-patched).*
+*Last updated: February 16, 2026 (Goal Monitor command registration moved from extensionAPI.js to reply module — fixes duplicate pluginCommands Map issue caused by Rolldown bundling; /goal now registered in the authoritative Map and appears in Telegram command menu natively; content-based discovery for Rolldown bundled chunks, direct function references in gateway chunk, exec auto-background disable, context management system, proxy error translation, swap space setup, stale session lock fix, ripgrep installation guide). Patched repo: [github.com/pwnapplehat/cursor-proxy-patched](https://github.com/pwnapplehat/cursor-proxy-patched).*
