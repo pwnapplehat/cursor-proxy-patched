@@ -8,14 +8,14 @@ Run this script on the DROPLET (not your local machine).
 What it does:
   1. Copies goal-monitor.mjs into the OpenClaw container at /app/goal-monitor.mjs
   2. Discovers compiled chunk files in /app/dist/ by CONTENT search
-     (not filenames — the bundler uses hashed names)
+     (handles Rolldown's hashed filenames automatically)
   3. Patches gateway chunk(s) with TWO hooks:
-     a. Text capture — saves agent response text before buffer is cleared
-     b. Lifecycle    — calls onTurnEnd() at turn end; references
-                       enqueueSystemEvent & requestHeartbeatNow directly
-                       (both are local variables in the same chunk)
-  4. Patches extensionAPI.js to register /goal as a Telegram plugin command
-     (registerPluginCommand is a top-level function in that file)
+     a. Text capture    — saves agent response text before buffer is cleared
+     b. Lifecycle patch — calls onTurnEnd() at turn end
+        (enqueueSystemEvent and requestHeartbeatNow are local to the chunk,
+         so no cross-file imports are needed)
+  4. Patches extensionAPI.js with command registration hook
+     (registerPluginCommand is a local function in extensionAPI.js)
   5. Creates the initial goals.json store
   6. Restarts the OpenClaw container
 
@@ -35,8 +35,11 @@ import sys
 import time
 
 CONTAINER = "openclaw"
-GOAL_MONITOR_SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "goal-monitor.mjs")
+GOAL_MONITOR_SRC = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "goal-monitor.mjs"
+)
 GOAL_FILE_PATH = "/home/node/.openclaw/goals.json"
+EXTENSION_API_PATH = "/app/dist/extensionAPI.js"
 
 # Patch markers (used to detect existing patches and for --verify)
 TEXT_CAPTURE_MARKER = "--- GOAL MONITOR: TEXT CAPTURE ---"
@@ -46,6 +49,7 @@ BACKUP_SUFFIX = ".goal-monitor-backup"
 
 
 # ── helpers ──────────────────────────────────────────────────────────
+
 
 def run(cmd, capture=True, check=True):
     """Run a shell command and return stdout."""
@@ -61,8 +65,8 @@ def run(cmd, capture=True, check=True):
 def docker_exec(cmd, check=True):
     """Run a bash command inside the OpenClaw container.
 
-    Uses bash -c with single-quote wrapping so globs and pipes
-    are expanded by the container's shell, not the host's.
+    Uses bash -c with single-quote wrapping for proper glob expansion
+    and correct handling of special characters.
     """
     escaped = cmd.replace("'", "'\\''")
     return run(
@@ -83,12 +87,9 @@ def docker_cp_from(container_path, local_path):
 
 # ── discovery ────────────────────────────────────────────────────────
 
-def find_dist_files_containing(pattern):
-    """Find .js files in /app/dist/ containing a string pattern.
 
-    Uses grep -rl with --include to avoid matching node_modules
-    or non-JS files.
-    """
+def find_dist_files_containing(pattern):
+    """Find .js files in /app/dist/ containing a string pattern."""
     result = docker_exec(
         f'grep -rl "{pattern}" /app/dist/ --include="*.js" 2>/dev/null',
         check=False,
@@ -99,33 +100,29 @@ def find_dist_files_containing(pattern):
 
 
 def discover_paths():
-    """Discover all required file paths by content search in /app/dist/.
+    """Discover all required file paths inside the container by content search."""
+    print("[1] Discovering compiled files in /app/dist/ ...")
 
-    Returns dict with:
-      gateway_files  — list of chunk files containing the chat lifecycle code
-      extension_api  — path to extensionAPI.js (for /goal command registration)
-    """
-    print("[1] Discovering compiled files in /app/dist/...")
-
-    # ── Gateway chunk(s) ─────────────────────────────────────────
-    # The gateway chunk contains chatRunState, emitChatFinal,
-    # clearAgentRunContext, enqueueSystemEvent, requestHeartbeatNow
-    # — all as local variables/functions in the same file.
+    # ── Gateway chunk(s): contain chatRunState + emitChatFinal ────────
     gateway_candidates = find_dist_files_containing("chatRunState")
     if not gateway_candidates:
         print("[ERROR] Could not find any file containing 'chatRunState' in /app/dist/")
         sys.exit(1)
 
-    # Prefer files matching the known "gateway-cli" naming pattern
+    # Prefer gateway-cli files (known Rolldown chunk pattern)
     gateway_files = [f for f in gateway_candidates if "gateway-cli" in f]
     if not gateway_files:
-        # Fallback: take any dist-level JS file with chatRunState
-        gateway_files = gateway_candidates
+        # Fallback: take non-test dist files that have chatRunState
+        gateway_files = gateway_candidates[:2]
+
+    if not gateway_files:
+        print("[ERROR] Could not identify gateway chunk files")
+        sys.exit(1)
 
     for gf in gateway_files:
         print(f"  Gateway chunk: {gf}")
 
-    # Verify that key functions exist in each gateway chunk
+    # Verify key functions exist in each gateway chunk
     required_fns = [
         "emitChatFinal",
         "clearAgentRunContext",
@@ -134,89 +131,82 @@ def discover_paths():
     ]
     for gf in gateway_files:
         missing = []
-        for fn_name in required_fns:
+        for fn in required_fns:
             count = docker_exec(
-                f'grep -c "{fn_name}" "{gf}" 2>/dev/null || echo 0',
+                f'grep -c "{fn}" "{gf}" 2>/dev/null || echo 0',
                 check=False,
-            ).strip().split("\n")[-1]
-            if count == "0":
-                missing.append(fn_name)
+            )
+            c = count.strip().split("\n")[-1]
+            if c == "0":
+                missing.append(fn)
         if missing:
             print(f"  [WARN] Missing in {os.path.basename(gf)}: {', '.join(missing)}")
+        else:
+            print(f"  [OK] All required functions found in {os.path.basename(gf)}")
 
-    # ── extensionAPI.js ──────────────────────────────────────────
-    # Stable filename (no hash). Contains registerPluginCommand as
-    # a top-level function definition.
-    ext_api = "/app/dist/extensionAPI.js"
+    # ── extensionAPI.js: stable path, contains registerPluginCommand ──
     ext_check = docker_exec(
-        f'test -f {ext_api} && echo exists || echo missing',
+        f'test -f {EXTENSION_API_PATH} && echo exists || echo missing',
         check=False,
     )
     if "exists" not in ext_check:
-        # Fallback: find by content
-        candidates = find_dist_files_containing("registerPluginCommand")
-        if candidates:
-            ext_api = candidates[0]
-            print(f"  [INFO] extensionAPI.js not at expected path, using: {ext_api}")
-        else:
-            print("  [WARN] registerPluginCommand not found — /goal command won't register")
-            ext_api = None
+        print(f"[ERROR] {EXTENSION_API_PATH} not found in container")
+        sys.exit(1)
+
+    reg_count = docker_exec(
+        f'grep -c "registerPluginCommand" "{EXTENSION_API_PATH}" 2>/dev/null || echo 0',
+        check=False,
+    )
+    c = reg_count.strip().split("\n")[-1]
+    if int(c) > 0:
+        print(f"  extensionAPI.js: {EXTENSION_API_PATH} (registerPluginCommand: {c} refs)")
     else:
-        # Double-check it actually has the function
-        fn_check = docker_exec(
-            f'grep -c "registerPluginCommand" "{ext_api}" 2>/dev/null || echo 0',
-            check=False,
-        ).strip().split("\n")[-1]
-        if fn_check == "0":
-            print("  [WARN] extensionAPI.js exists but doesn't contain registerPluginCommand")
-            ext_api = None
-        else:
-            print(f"  Extension API: {ext_api}")
+        print(f"  [WARN] registerPluginCommand not found in {EXTENSION_API_PATH}")
 
     return {
         "gateway_files": gateway_files,
-        "extension_api": ext_api,
+        "extension_api": EXTENSION_API_PATH,
     }
 
 
 # ── patch builders ───────────────────────────────────────────────────
 
+
 def build_text_capture_patch():
     """Build the text capture code inserted inside emitChatFinal.
 
-    This saves the agent's response text (and the sessionKey) to
-    globalThis.__gmLastResponse BEFORE the buffer is cleared.
-    The lifecycle patch reads it later.
+    This saves the agent's response text to globalThis.__gmLastResponse
+    BEFORE the buffer is cleared. The lifecycle patch reads it later.
     """
     return (
-        f'    // {TEXT_CAPTURE_MARKER}\n'
-        f'    globalThis.__gmLastResponse = {{ text: text, sessionKey: sessionKey, ts: Date.now() }};\n'
-        f'    // --- END GOAL MONITOR: TEXT CAPTURE ---'
+        f"    // {TEXT_CAPTURE_MARKER}\n"
+        f"    globalThis.__gmLastResponse = {{ text: text, sessionKey: sessionKey, ts: Date.now() }};\n"
+        f"    // --- END GOAL MONITOR: TEXT CAPTURE ---"
     )
 
 
 def build_lifecycle_patch():
     """Build the lifecycle patch code (inserted after clearAgentRunContext).
 
-    References enqueueSystemEvent and requestHeartbeatNow DIRECTLY
-    since they are local variables in the same gateway chunk file.
-    Only one dynamic import is needed: goal-monitor.mjs itself.
+    References enqueueSystemEvent and requestHeartbeatNow DIRECTLY —
+    they are local variables in the same gateway chunk file.
+    Only dynamic import needed is for /app/goal-monitor.mjs.
     """
     indent = "    "
     lines = [
         f"// {LIFECYCLE_MARKER}",
         f'if (lifecyclePhase === "end" && !isAborted) {{',
-        f'  const __gmData = globalThis.__gmLastResponse;',
-        f'  if (__gmData && Date.now() - __gmData.ts < 10000) {{',
+        f"  const __gmData = globalThis.__gmLastResponse;",
+        f"  if (__gmData && Date.now() - __gmData.ts < 10000) {{",
         f'    import("/app/goal-monitor.mjs").then((gm) => {{',
         f'      gm.onTurnEnd(__gmData.sessionKey || sessionKey, __gmData.text || "", {{',
-        f'        enqueueSystemEvent,',
-        f'        requestHeartbeatNow',
-        f'      }});',
-        f'    }}).catch(() => {{}});',
-        f'  }}',
-        f'}}',
-        f'// --- END GOAL MONITOR PATCH ---',
+        f"        enqueueSystemEvent,",
+        f"        requestHeartbeatNow",
+        f"      }});",
+        f"    }}).catch(() => {{}});",
+        f"  }}",
+        f"}}",
+        f"// --- END GOAL MONITOR PATCH ---",
     ]
     return "\n".join(indent + line for line in lines)
 
@@ -224,76 +214,76 @@ def build_lifecycle_patch():
 def build_cmd_registration_patch():
     """Build the command registration code (appended to extensionAPI.js).
 
-    registerPluginCommand is a top-level function defined in the same
-    file (extensionAPI.js), so it's directly accessible — no imports needed
-    except for goal-monitor.mjs itself.
+    registerPluginCommand is a local function defined in extensionAPI.js
+    (line ~2561), so it is directly accessible at the append point.
     """
     lines = [
         f"// {CMD_REG_MARKER}",
         'import("/app/goal-monitor.mjs").then((gm) => {',
         '  if (typeof gm.registerGoalCommand === "function") {',
-        '    gm.registerGoalCommand(registerPluginCommand);',
-        '  }',
-        '}).catch((err) => {',
+        "    gm.registerGoalCommand(registerPluginCommand);",
+        "  }",
+        "}).catch((err) => {",
         '  console.error("[goal-monitor] /goal command registration failed:", err?.message || String(err));',
-        '});',
-        '// --- END GOAL MONITOR: COMMAND REGISTRATION ---',
+        "});",
+        "// --- END GOAL MONITOR: COMMAND REGISTRATION ---",
     ]
     return "\n".join(lines)
 
 
-# ── patch application ────────────────────────────────────────────────
+# ── apply patches ────────────────────────────────────────────────────
 
-def apply_gateway_patches(gateway_file):
-    """Apply text capture and lifecycle patches to a gateway chunk file.
 
-    Returns True if patches were applied, False if already patched.
-    """
-    local_original = "/tmp/gateway-original.js"
-    local_patched = "/tmp/gateway-patched.js"
-    docker_cp_from(gateway_file, local_original)
+def patch_gateway_chunk(filepath):
+    """Apply text capture and lifecycle patches to a gateway chunk file."""
+    basename = os.path.basename(filepath)
+    local_original = f"/tmp/{basename}.original"
+    local_patched = f"/tmp/{basename}.patched"
+
+    print(f"\n  Extracting {basename} ...")
+    docker_cp_from(filepath, local_original)
 
     with open(local_original, "r", encoding="utf-8") as f:
         source = f.read()
 
     # Check if already patched
-    if TEXT_CAPTURE_MARKER in source or LIFECYCLE_MARKER in source:
-        print(f"  [SKIP] Already patched — use --revert first to re-patch")
+    if LIFECYCLE_MARKER in source or TEXT_CAPTURE_MARKER in source:
+        print(f"  [SKIP] {basename} already patched. Use --revert first to re-patch.")
         return False
 
     # Create backup
-    print(f"  Creating backup...")
-    docker_exec(f'cp "{gateway_file}" "{gateway_file}{BACKUP_SUFFIX}"')
+    docker_exec(f'cp "{filepath}" "{filepath}{BACKUP_SUFFIX}"')
+    print(f"  Backup created: {filepath}{BACKUP_SUFFIX}")
 
-    # ── PATCH 1: Text Capture (inside emitChatFinal) ─────────────
+    # ── PATCH 1: Text Capture (inside emitChatFinal) ─────────────────
     #
-    # Target pattern in the compiled code:
+    # Target pattern (from compiled output):
     #   const text = chatRunState.buffers.get(clientRunId)?.trim() ?? "";
     #   chatRunState.buffers.delete(clientRunId);
     #
-    # We insert between these two lines to capture text before it's gone.
-
-    print(f"  Applying text capture patch...")
+    # We insert our capture line BETWEEN these two lines.
+    print(f"  Applying text capture patch ...")
 
     tc_pattern = re.compile(
-        r'((?:const|let|var)\s+(\w+)\s*=\s*chatRunState\.buffers\.get\(clientRunId\).*?;)'
-        r'(\s*\n)'
-        r'(\s*chatRunState\.buffers\.delete\(clientRunId\)\s*;)',
+        r"((?:const|let|var)\s+(\w+)\s*=\s*chatRunState\.buffers\.get\(clientRunId\).*?;)"
+        r"(\s*\n)"
+        r"(\s*chatRunState\.buffers\.delete\(clientRunId\)\s*;)",
         re.DOTALL,
     )
 
     tc_match = tc_pattern.search(source)
     if not tc_match:
-        # Fallback: simpler pattern (no variable capture)
+        # Fallback: simpler pattern
         tc_fallback = re.compile(
-            r'(chatRunState\.buffers\.get\(clientRunId\).*?;\s*\n)'
-            r'(\s*)(chatRunState\.buffers\.delete\(clientRunId\)\s*;)',
+            r"(chatRunState\.buffers\.get\(clientRunId\).*?;\s*\n)"
+            r"(\s*)(chatRunState\.buffers\.delete\(clientRunId\)\s*;)",
             re.DOTALL,
         )
         tc_match = tc_fallback.search(source)
         if not tc_match:
-            print("[ERROR] Could not find chatRunState.buffers.get/delete pattern")
-            print("  The compiled code structure may have changed.")
+            print(
+                f"  [ERROR] Could not find chatRunState.buffers.get/delete in {basename}"
+            )
             sys.exit(1)
 
         # Fallback insertion: before buffers.delete
@@ -309,62 +299,49 @@ def apply_gateway_patches(gateway_file):
         )
         source = source[:insert_pos] + capture_code + "\n" + source[insert_pos:]
 
-    # ── PATCH 2: Lifecycle Handler (after clearAgentRunContext) ───
+    # ── PATCH 2: Lifecycle Handler (after clearAgentRunContext) ───────
     #
-    # Target pattern in the compiled code:
+    # Target pattern (from compiled output, around line 2157-2160):
     #   if (lifecyclePhase === "end" || lifecyclePhase === "error") {
     #       toolEventRecipients.markFinal(evt.runId);
     #       clearAgentRunContext(evt.runId);
     #   }
     #
-    # We insert after clearAgentRunContext(evt.runId); to hook into
-    # the lifecycle end. enqueueSystemEvent and requestHeartbeatNow are
-    # local variables in the same chunk, so we reference them directly.
-
-    print(f"  Applying lifecycle patch...")
+    # We insert AFTER clearAgentRunContext (inside the if block).
+    print(f"  Applying lifecycle patch ...")
 
     lc_pattern = re.compile(
-        r'(clearAgentRunContext\s*\([^)]*\)\s*;)',
+        r"(clearAgentRunContext\s*\([^)]*\)\s*;)",
         re.MULTILINE,
     )
     lc_matches = list(lc_pattern.finditer(source))
 
     if not lc_matches:
-        print("[ERROR] Could not find clearAgentRunContext call")
+        print(f"  [ERROR] Could not find clearAgentRunContext in {basename}")
         sys.exit(1)
 
-    # Find the CORRECT clearAgentRunContext call — the one in the
-    # lifecycle block that follows toolEventRecipients.markFinal.
-    # This is the main lifecycle handler (around lines 2157-2160
-    # in the unpatched file).
+    # Find the correct clearAgentRunContext — the one near
+    # toolEventRecipients.markFinal (the lifecycle "end" handler).
     target_match = None
-
-    # Strategy 1: look for toolEventRecipients.markFinal nearby
     for m in lc_matches:
-        context_before = source[max(0, m.start() - 300):m.start()]
+        context_before = source[max(0, m.start() - 300) : m.start()]
         if "toolEventRecipients.markFinal" in context_before:
             target_match = m
             break
 
-    # Strategy 2: look for lifecyclePhase === "end" nearby
     if not target_match:
+        # Fallback: look for clearAgentRunContext near lifecyclePhase === "end"
         for m in lc_matches:
-            context_before = source[max(0, m.start() - 300):m.start()]
+            context_before = source[max(0, m.start() - 300) : m.start()]
             if 'lifecyclePhase === "end"' in context_before:
                 target_match = m
                 break
 
-    # Strategy 3: last match in the first third of the file
     if not target_match:
-        first_third = len(source) // 3
-        for m in reversed(lc_matches):
-            if m.start() < first_third:
-                target_match = m
-                break
-
-    if not target_match:
-        target_match = lc_matches[-1]
-        print(f"  [WARN] Using fallback clearAgentRunContext match at offset {target_match.start()}")
+        # Last resort: use the last match in the first half of the file
+        first_half = len(source) // 2
+        candidates = [m for m in lc_matches if m.start() < first_half]
+        target_match = candidates[-1] if candidates else lc_matches[-1]
 
     insert_pos = target_match.end()
     lifecycle_code = build_lifecycle_patch()
@@ -376,63 +353,62 @@ def apply_gateway_patches(gateway_file):
         (LIFECYCLE_MARKER, "lifecycle"),
     ]:
         if marker not in source:
-            print(f"[ERROR] {name} patch marker missing after patching")
+            print(f"  [ERROR] {name} patch marker missing after patching {basename}")
             sys.exit(1)
 
     with open(local_patched, "w", encoding="utf-8") as f:
         f.write(source)
 
-    docker_cp_to(local_patched, gateway_file)
-    docker_exec(f'chown node:node "{gateway_file}"')
-    print(f"  Patched {os.path.basename(gateway_file)}")
+    # Copy back to container
+    docker_cp_to(local_patched, filepath)
+    docker_exec(f'chown node:node "{filepath}"')
+    print(f"  [OK] Patched: {basename}")
     return True
 
 
-def apply_cmd_registration(ext_api_file):
-    """Append /goal command registration to extensionAPI.js.
+def patch_extension_api(filepath):
+    """Append command registration patch to extensionAPI.js."""
+    basename = os.path.basename(filepath)
+    local_original = f"/tmp/{basename}.original"
+    local_patched = f"/tmp/{basename}.patched"
 
-    registerPluginCommand is a function defined in this same file,
-    so it's directly accessible from the appended code.
-
-    Returns True if patch was applied, False if already patched or skipped.
-    """
-    if not ext_api_file:
-        print("  [SKIP] No extensionAPI.js found — /goal command not registered")
-        return False
-
-    local_original = "/tmp/extapi-original.js"
-    local_patched = "/tmp/extapi-patched.js"
-    docker_cp_from(ext_api_file, local_original)
+    print(f"\n  Patching {basename} for /goal command registration ...")
+    docker_cp_from(filepath, local_original)
 
     with open(local_original, "r", encoding="utf-8") as f:
         source = f.read()
 
     if CMD_REG_MARKER in source:
-        print(f"  [SKIP] Already patched — use --revert first to re-patch")
+        print(f"  [SKIP] {basename} already has command registration patch.")
         return False
 
     # Create backup
-    print(f"  Creating backup...")
-    docker_exec(f'cp "{ext_api_file}" "{ext_api_file}{BACKUP_SUFFIX}"')
+    docker_exec(f'cp "{filepath}" "{filepath}{BACKUP_SUFFIX}"')
+    print(f"  Backup created: {filepath}{BACKUP_SUFFIX}")
 
-    # Append registration code
-    cmd_code = build_cmd_registration_patch()
-    source = source + "\n" + cmd_code + "\n"
+    # Append command registration code
+    cmd_reg_code = build_cmd_registration_patch()
+    source = source + "\n" + cmd_reg_code + "\n"
+
+    if CMD_REG_MARKER not in source:
+        print(f"  [ERROR] Command registration marker missing after patching {basename}")
+        sys.exit(1)
 
     with open(local_patched, "w", encoding="utf-8") as f:
         f.write(source)
 
-    docker_cp_to(local_patched, ext_api_file)
-    docker_exec(f'chown node:node "{ext_api_file}"')
-    print(f"  Patched {os.path.basename(ext_api_file)}")
+    docker_cp_to(local_patched, filepath)
+    docker_exec(f'chown node:node "{filepath}"')
+    print(f"  [OK] Patched: {basename}")
     return True
 
 
 # ── goal-monitor.mjs deployment ──────────────────────────────────────
 
+
 def deploy_goal_monitor():
     """Copy goal-monitor.mjs into the container."""
-    print("  Deploying goal-monitor.mjs to /app/goal-monitor.mjs...")
+    print("  Deploying goal-monitor.mjs to /app/goal-monitor.mjs ...")
     if not os.path.isfile(GOAL_MONITOR_SRC):
         print(f"[ERROR] Cannot find {GOAL_MONITOR_SRC}")
         sys.exit(1)
@@ -447,60 +423,53 @@ def create_initial_goal_store():
     if "exists" in check:
         print("  goals.json already exists — skipping")
         return
+
     store = {"version": 1, "goals": []}
-    docker_exec(
-        f"python3 -c \""
-        f"import json; "
-        f"open('{gf}','w').write(json.dumps({json.dumps(store)},indent=2))"
-        f"\"",
-        check=False,
-    )
-    check2 = docker_exec(f"test -f {gf} && echo exists || echo missing", check=False)
-    if "missing" in check2:
-        docker_exec(f"mkdir -p $(dirname {gf})")
-        data = json.dumps(store, indent=2)
-        escaped = data.replace("'", "'\\''")
-        docker_exec(f"echo '{escaped}' > {gf}")
+    docker_exec(f"mkdir -p $(dirname {gf})", check=False)
+    data = json.dumps(store, indent=2)
+    escaped = data.replace("'", "'\\''")
+    docker_exec(f"echo '{escaped}' > {gf}", check=False)
     docker_exec(f"chown node:node {gf}", check=False)
     print("  Created initial goals.json")
 
 
 # ── revert ───────────────────────────────────────────────────────────
 
+
 def revert_patches(paths):
     """Restore all patched files from their backups."""
-    files_to_revert = list(paths["gateway_files"])
-    if paths.get("extension_api"):
-        files_to_revert.append(paths["extension_api"])
+    all_files = list(paths["gateway_files"]) + [paths["extension_api"]]
+    reverted = 0
 
-    any_reverted = False
-    for f in files_to_revert:
-        backup = f + BACKUP_SUFFIX
+    for filepath in all_files:
+        backup = filepath + BACKUP_SUFFIX
         check = docker_exec(
-            f'test -f "{backup}" && echo exists || echo missing',
-            check=False,
+            f'test -f "{backup}" && echo exists || echo missing', check=False
         )
         if "exists" in check:
-            print(f"  Reverting {os.path.basename(f)} from backup...")
-            docker_exec(f'cp "{backup}" "{f}"')
-            docker_exec(f'chown node:node "{f}"')
-            any_reverted = True
+            basename = os.path.basename(filepath)
+            print(f"  Reverting {basename} from backup ...")
+            docker_exec(f'cp "{backup}" "{filepath}"')
+            docker_exec(f'chown node:node "{filepath}"')
+            reverted += 1
         else:
-            print(f"  No backup for {os.path.basename(f)}")
+            print(f"  No backup for {os.path.basename(filepath)} — skipping")
 
-    if any_reverted:
-        print("  Reverted successfully.")
+    if reverted:
+        print(f"\n  Reverted {reverted} file(s).")
     else:
-        print("  [WARN] No backups found to revert.")
+        print("\n  No backups found. Nothing to revert.")
+        sys.exit(1)
 
 
 # ── verify ───────────────────────────────────────────────────────────
+
 
 def verify_patches(paths):
     """Check if all patches are currently applied."""
     all_ok = True
 
-    # Check gateway patches
+    # Check gateway chunks
     for gf in paths["gateway_files"]:
         basename = os.path.basename(gf)
         for marker, name in [
@@ -510,27 +479,28 @@ def verify_patches(paths):
             count = docker_exec(
                 f'grep -c "{marker}" "{gf}" 2>/dev/null || echo 0',
                 check=False,
-            ).strip().split("\n")[-1]
-            if count and int(count) > 0:
+            )
+            c = count.strip().split("\n")[-1]
+            if c and int(c) > 0:
                 print(f"  [OK] {name} patch in {basename}")
             else:
                 print(f"  [MISSING] {name} patch in {basename}")
                 all_ok = False
 
-    # Check command registration
-    ext_api = paths.get("extension_api")
-    if ext_api:
-        count = docker_exec(
-            f'grep -c "{CMD_REG_MARKER}" "{ext_api}" 2>/dev/null || echo 0',
-            check=False,
-        ).strip().split("\n")[-1]
-        if count and int(count) > 0:
-            print(f"  [OK] command registration in {os.path.basename(ext_api)}")
-        else:
-            print(f"  [MISSING] command registration in {os.path.basename(ext_api)}")
-            all_ok = False
+    # Check extensionAPI.js
+    ext_api = paths["extension_api"]
+    count = docker_exec(
+        f'grep -c "{CMD_REG_MARKER}" "{ext_api}" 2>/dev/null || echo 0',
+        check=False,
+    )
+    c = count.strip().split("\n")[-1]
+    if c and int(c) > 0:
+        print(f"  [OK] command registration patch in extensionAPI.js")
+    else:
+        print(f"  [MISSING] command registration patch in extensionAPI.js")
+        all_ok = False
 
-    # Check deployed files
+    # Check files exist
     gm_check = docker_exec(
         "test -f /app/goal-monitor.mjs && echo exists || echo missing",
         check=False,
@@ -554,22 +524,26 @@ def verify_patches(paths):
     if all_ok:
         print("\n  All patches and files verified.")
     else:
-        print("\n  Some items missing. Re-deploy: python3 deploy.py")
+        print(
+            "\n  Some patches or files are missing. Re-deploy with: python3 deploy.py"
+        )
 
 
 # ── restart ──────────────────────────────────────────────────────────
 
+
 def restart_container():
     """Restart the OpenClaw container."""
-    print("\nRestarting OpenClaw container...")
+    print("\n[7] Restarting OpenClaw container ...")
     run(f"docker restart {CONTAINER}")
-    print("  Waiting 5 seconds for startup...")
+    print("  Waiting 5 seconds for startup ...")
     time.sleep(5)
     status = run(f"docker ps --filter name={CONTAINER} --format '{{{{.Status}}}}'")
     print(f"  Container status: {status}")
 
 
 # ── main ─────────────────────────────────────────────────────────────
+
 
 def main():
     global CONTAINER
@@ -578,9 +552,12 @@ def main():
         description="Deploy the Goal Monitor patch for OpenClaw",
     )
     parser.add_argument("--revert", action="store_true", help="Revert the patch")
-    parser.add_argument("--verify", action="store_true", help="Check if patch is applied")
     parser.add_argument(
-        "--container", default=CONTAINER,
+        "--verify", action="store_true", help="Check if patch is applied"
+    )
+    parser.add_argument(
+        "--container",
+        default=CONTAINER,
         help=f"Docker container name (default: {CONTAINER})",
     )
     args = parser.parse_args()
@@ -607,39 +584,43 @@ def main():
         restart_container()
         return
 
-    # ── Full deploy ──────────────────────────────────────────────
+    # ── Full deploy ──────────────────────────────────────────────────
     print("\n" + "=" * 60)
     print("  Goal Monitor — Deploy & Patch (with AI Analysis Gate)")
     print("=" * 60)
 
-    # Step: Deploy goal-monitor.mjs first (patches import it)
-    print("\n[2] Deploying goal-monitor.mjs...")
-    deploy_goal_monitor()
-    create_initial_goal_store()
-
-    # Step: Patch gateway chunk(s)
     any_patched = False
-    for i, gf in enumerate(paths["gateway_files"]):
-        print(f"\n[{3 + i}] Patching gateway chunk: {os.path.basename(gf)}")
-        if apply_gateway_patches(gf):
+
+    # Step 2-3: Patch gateway chunks
+    print(f"\n[2] Patching gateway chunk(s) ...")
+    for gf in paths["gateway_files"]:
+        if patch_gateway_chunk(gf):
             any_patched = True
 
-    # Step: Patch extensionAPI.js for /goal command
-    print(f"\n[{3 + len(paths['gateway_files'])}] Registering /goal command...")
-    if apply_cmd_registration(paths.get("extension_api")):
+    # Step 4: Patch extensionAPI.js
+    print(f"\n[4] Patching extensionAPI.js for /goal command ...")
+    if patch_extension_api(paths["extension_api"]):
         any_patched = True
 
-    # Step: Restart
+    # Step 5: Deploy goal-monitor.mjs
+    print(f"\n[5] Deploying goal-monitor.mjs ...")
+    deploy_goal_monitor()
+
+    # Step 6: Create goals.json
+    print(f"\n[6] Setting up goal store ...")
+    create_initial_goal_store()
+
+    # Step 7: Restart
     if any_patched:
         restart_container()
     else:
-        print("\n[INFO] No new patches applied (already patched).")
-        print("  Use --revert first if you need to re-patch.")
+        print("\n[INFO] No restart needed (already patched).")
 
     print("\n" + "=" * 60)
     print("  Deployment complete!")
     print("=" * 60)
-    print("""
+    print(
+        """
 Next steps:
   1. Set a goal from Telegram:
      /goal Continue reverse engineering till all phases complete
@@ -658,7 +639,8 @@ Next steps:
      /goal list
      /goal status
      /goal pause
-""")
+"""
+    )
 
 
 if __name__ == "__main__":

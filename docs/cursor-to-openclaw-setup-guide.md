@@ -924,24 +924,24 @@ Goals are managed directly from **Telegram** using the `/goal` command — no SS
 
 ### How It Works
 
-1. The deploy script discovers compiled chunk files inside `/app/dist/` by
-   **content search** (not filenames — the Rolldown bundler uses hashed names).
-2. The gateway chunk (e.g. `gateway-cli-*.js`) is patched with two hooks:
-   - **Text capture**: saves the agent's response text (from `chatRunState.buffers`)
-     to `globalThis.__gmLastResponse` inside `emitChatFinal` before the buffer is cleared.
-   - **Lifecycle patch**: on lifecycle `"end"`, reads the captured text and calls
-     `goal-monitor.mjs` → `onTurnEnd(sessionKey, responseText, deps)`.
-     `enqueueSystemEvent` and `requestHeartbeatNow` are referenced directly
-     (both are local variables in the same chunk — no cross-file imports needed).
-3. `/app/dist/extensionAPI.js` is patched with a command registration hook that
-   registers `/goal` as a plugin command via the local `registerPluginCommand()`
-   function for the Telegram command menu.
-4. `onTurnEnd()` reads the active goal from `goals.json`.
-5. The agent's full response text is sent to Claude (via the cursor proxy API) with a
+1. OpenClaw's compiled chunks in `/app/dist/` are discovered by **content search**
+   (handles Rolldown's hashed filenames automatically) and patched with three hooks:
+   - **Text capture** (in `gateway-cli-*.js`): saves the agent's response text
+     (from `chatRunState.buffers`) to `globalThis.__gmLastResponse` inside
+     `emitChatFinal` before the buffer is cleared.
+   - **Lifecycle patch** (in `gateway-cli-*.js`): on lifecycle `"end"`, reads
+     the captured text and calls `goal-monitor.mjs` → `onTurnEnd()`.
+     References `enqueueSystemEvent` and `requestHeartbeatNow` directly
+     (they are local to the same chunk — no cross-file imports needed).
+   - **Command registration** (in `extensionAPI.js`): registers `/goal` as a
+     plugin command via `registerPluginCommand()` for the Telegram command menu.
+     `extensionAPI.js` has a stable filename (no hash).
+2. `onTurnEnd()` reads the active goal from `goals.json`.
+3. The agent's response text is sent to Claude (via the cursor proxy API) with a
    structured prompt asking: should the agent continue working on this goal? YES/NO.
-6. Only if Claude returns **YES**, a `System:` event is enqueued and
+4. Only if Claude returns **YES**, a `System:` event is enqueued and
    `requestHeartbeatNow` triggers the next turn. If **NO**, nothing happens.
-7. If the AI call fails for any reason (network error, timeout, rate limit),
+5. If the AI call fails for any reason (network error, timeout, rate limit),
    the fail-safe is to **not continue** — preventing accidental loops.
 
 ### Safety Features
@@ -968,13 +968,15 @@ python3 deploy.py
 ```
 
 The deploy script:
-1. Discovers compiled chunk files in `/app/dist/` by content search
-   (greps for `chatRunState`, `registerPluginCommand`, etc.)
-2. Creates backups of each file before patching
-3. Deploys `goal-monitor.mjs` to `/app/goal-monitor.mjs`
-4. Creates initial `goals.json` at `/home/node/.openclaw/goals.json`
-5. Patches the gateway chunk(s) with text capture + lifecycle hooks
-6. Patches `extensionAPI.js` with `/goal` command registration
+1. Discovers compiled chunk files in `/app/dist/` by **content search**
+   (finds `gateway-cli-*.js` via `chatRunState`, and `extensionAPI.js` by stable name)
+2. Creates backups of each file (`.goal-monitor-backup` suffix)
+3. Patches gateway chunk(s): text capture (inside `emitChatFinal`) + lifecycle
+   (after `clearAgentRunContext`, with direct references to `enqueueSystemEvent`
+   and `requestHeartbeatNow`)
+4. Patches `extensionAPI.js`: appends `/goal` command registration
+5. Deploys `goal-monitor.mjs` to `/app/goal-monitor.mjs`
+6. Creates initial `goals.json` at `/home/node/.openclaw/goals.json`
 7. Restarts the OpenClaw container
 
 After restart, `/goal` appears in the Telegram command menu automatically.
@@ -1067,8 +1069,8 @@ python3 deploy.py --verify    # check if all three patches are applied
 9. **OOM kills on low-RAM droplets** — memory-intensive tasks (Jadx, Ghidra, baksmali) can trigger Linux OOM killer on VMs with less than 8GB RAM; add swap space to mitigate (see Add Swap Space under Troubleshooting)
 10. **Stale session locks** — OOM kills or crashes can leave `.lock` files blocking sessions; manual cleanup required (see Stale Session Lock Fix under Troubleshooting)
 11. **ripgrep not pre-installed** — the OpenClaw container does not include `ripgrep` by default; must be installed manually as root, and does not persist across container rebuilds (see Install ripgrep under Troubleshooting)
-12. **Goal monitor patch** — the `server-chat.js` patch and `/app/goal-monitor.mjs` live inside the container filesystem; they survive `docker restart` but are lost on `docker rm` + `docker run`; re-run `python3 deploy.py` to re-apply (see Goal Monitor section)
+12. **Goal monitor patch** — the `gateway-cli-*.js` patch, `extensionAPI.js` patch, and `/app/goal-monitor.mjs` live inside the container filesystem; they survive `docker restart` but are lost on `docker rm` + `docker run`; re-run `python3 deploy.py` to re-apply (see Goal Monitor section)
 
 ---
 
-*Last updated: February 2026 (Goal Monitor with content-based discovery for Rolldown-bundled chunks, AI analysis gate via Telegram /goal command, exec auto-background disable, context management system, proxy error translation, swap space setup, stale session lock fix, ripgrep installation guide). Patched repo: [github.com/pwnapplehat/cursor-proxy-patched](https://github.com/pwnapplehat/cursor-proxy-patched).*
+*Last updated: February 6, 2026 (Goal Monitor rewritten with content-based discovery for Rolldown bundled chunks, direct function references in gateway chunk, extensionAPI.js command registration, exec auto-background disable, context management system, proxy error translation, swap space setup, stale session lock fix, ripgrep installation guide). Patched repo: [github.com/pwnapplehat/cursor-proxy-patched](https://github.com/pwnapplehat/cursor-proxy-patched).*
