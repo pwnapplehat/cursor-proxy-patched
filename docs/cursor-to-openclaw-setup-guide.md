@@ -924,19 +924,24 @@ Goals are managed directly from **Telegram** using the `/goal` command — no SS
 
 ### How It Works
 
-1. OpenClaw's `server-chat.js` is patched with three hooks:
+1. The deploy script discovers compiled chunk files inside `/app/dist/` by
+   **content search** (not filenames — the Rolldown bundler uses hashed names).
+2. The gateway chunk (e.g. `gateway-cli-*.js`) is patched with two hooks:
    - **Text capture**: saves the agent's response text (from `chatRunState.buffers`)
      to `globalThis.__gmLastResponse` inside `emitChatFinal` before the buffer is cleared.
    - **Lifecycle patch**: on lifecycle `"end"`, reads the captured text and calls
      `goal-monitor.mjs` → `onTurnEnd(sessionKey, responseText, deps)`.
-   - **Command registration**: registers `/goal` as a plugin command via
-     `registerPluginCommand()` for the Telegram command menu.
-2. `onTurnEnd()` reads the active goal from `goals.json`.
-3. The agent's response text is sent to Claude (via the cursor proxy API) with a
+     `enqueueSystemEvent` and `requestHeartbeatNow` are referenced directly
+     (both are local variables in the same chunk — no cross-file imports needed).
+3. `/app/dist/extensionAPI.js` is patched with a command registration hook that
+   registers `/goal` as a plugin command via the local `registerPluginCommand()`
+   function for the Telegram command menu.
+4. `onTurnEnd()` reads the active goal from `goals.json`.
+5. The agent's full response text is sent to Claude (via the cursor proxy API) with a
    structured prompt asking: should the agent continue working on this goal? YES/NO.
-4. Only if Claude returns **YES**, a `System:` event is enqueued and
+6. Only if Claude returns **YES**, a `System:` event is enqueued and
    `requestHeartbeatNow` triggers the next turn. If **NO**, nothing happens.
-5. If the AI call fails for any reason (network error, timeout, rate limit),
+7. If the AI call fails for any reason (network error, timeout, rate limit),
    the fail-safe is to **not continue** — preventing accidental loops.
 
 ### Safety Features
@@ -963,16 +968,14 @@ python3 deploy.py
 ```
 
 The deploy script:
-1. Discovers compiled file paths inside the OpenClaw container
-   (`server-chat.js`, `system-events.js`, `heartbeat-wake.js`,
-   `plugins/commands.js`)
-2. Creates a backup at `server-chat.js.goal-monitor-backup`
-3. Inserts the text capture patch (inside `emitChatFinal`, saves response before buffer clear)
-4. Inserts the lifecycle patch (after `clearAgentRunContext`, passes response text to goal-monitor)
-5. Appends the command registration patch (registers `/goal` plugin command)
-6. Deploys `goal-monitor.mjs` to `/app/goal-monitor.mjs`
-7. Creates initial `goals.json` at `/home/node/.openclaw/goals.json`
-8. Restarts the OpenClaw container
+1. Discovers compiled chunk files in `/app/dist/` by content search
+   (greps for `chatRunState`, `registerPluginCommand`, etc.)
+2. Creates backups of each file before patching
+3. Deploys `goal-monitor.mjs` to `/app/goal-monitor.mjs`
+4. Creates initial `goals.json` at `/home/node/.openclaw/goals.json`
+5. Patches the gateway chunk(s) with text capture + lifecycle hooks
+6. Patches `extensionAPI.js` with `/goal` command registration
+7. Restarts the OpenClaw container
 
 After restart, `/goal` appears in the Telegram command menu automatically.
 
@@ -1068,4 +1071,4 @@ python3 deploy.py --verify    # check if all three patches are applied
 
 ---
 
-*Last updated: February 16, 2026 (Goal Monitor now managed via Telegram /goal command with plugin registration, exec auto-background disable, context management system, proxy error translation, swap space setup, stale session lock fix, ripgrep installation guide). Patched repo: [github.com/pwnapplehat/cursor-proxy-patched](https://github.com/pwnapplehat/cursor-proxy-patched).*
+*Last updated: February 2026 (Goal Monitor with content-based discovery for Rolldown-bundled chunks, AI analysis gate via Telegram /goal command, exec auto-background disable, context management system, proxy error translation, swap space setup, stale session lock fix, ripgrep installation guide). Patched repo: [github.com/pwnapplehat/cursor-proxy-patched](https://github.com/pwnapplehat/cursor-proxy-patched).*
