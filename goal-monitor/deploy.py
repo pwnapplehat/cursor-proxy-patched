@@ -43,6 +43,7 @@ EXTENSION_API_PATH = "/app/dist/extensionAPI.js"
 TEXT_CAPTURE_MARKER = "--- GOAL MONITOR: TEXT CAPTURE ---"
 LIFECYCLE_MARKER = "--- GOAL MONITOR PATCH ---"
 CMD_REG_MARKER = "--- GOAL MONITOR: COMMAND REGISTRATION ---"
+STARTUP_TRIGGER_MARKER = "--- GOAL MONITOR: STARTUP TRIGGER ---"
 BACKUP_SUFFIX = ".goal-monitor-backup"
 
 
@@ -224,6 +225,23 @@ def build_cmd_registration_patch():
     return "\n".join(lines)
 
 
+def build_startup_trigger_patch():
+    """Build a trigger import appended to the gateway chunk.
+
+    extensionAPI.js is NOT loaded at startup by default — it's loaded
+    on demand. The gateway chunk IS loaded at startup. By importing
+    extensionAPI.js from the gateway chunk, we force it to load, which
+    executes the command registration code appended to its end.
+    """
+    lines = [
+        f"// {STARTUP_TRIGGER_MARKER}",
+        '// Force extensionAPI.js to load at startup so /goal command gets registered',
+        'import("/app/dist/extensionAPI.js").catch(() => {});',
+        "// --- END GOAL MONITOR: STARTUP TRIGGER ---",
+    ]
+    return "\n".join(lines)
+
+
 # ── gateway chunk patching ───────────────────────────────────────────
 
 
@@ -240,7 +258,7 @@ def patch_gateway_chunk(filepath):
         source = f.read()
 
     # Check if already patched
-    if LIFECYCLE_MARKER in source or TEXT_CAPTURE_MARKER in source:
+    if LIFECYCLE_MARKER in source or TEXT_CAPTURE_MARKER in source or STARTUP_TRIGGER_MARKER in source:
         print(f"  [SKIP] {basename} already patched. Use --revert first to re-patch.")
         return False
 
@@ -324,10 +342,20 @@ def patch_gateway_chunk(filepath):
     lifecycle_code = build_lifecycle_patch()
     source = source[:insert_pos] + "\n" + lifecycle_code + "\n" + source[insert_pos:]
 
-    # Verify both patches are present
+    # ── PATCH 3: Startup Trigger (appended to end of file) ───────────
+    # extensionAPI.js is NOT loaded at startup — only on demand.
+    # The gateway chunk IS loaded at startup. By importing extensionAPI.js
+    # here, we force it to load, which executes the /goal command
+    # registration code that was appended to its end.
+    print(f"  Appending startup trigger to {basename} ...")
+    startup_trigger = build_startup_trigger_patch()
+    source = source + "\n" + startup_trigger + "\n"
+
+    # Verify all patches are present
     for marker, name in [
         (TEXT_CAPTURE_MARKER, "text capture"),
         (LIFECYCLE_MARKER, "lifecycle"),
+        (STARTUP_TRIGGER_MARKER, "startup trigger"),
     ]:
         if marker not in source:
             print(f"  [ERROR] {name} patch marker missing after patching {basename}")
@@ -462,6 +490,7 @@ def verify_patches(paths):
         for marker, name in [
             (TEXT_CAPTURE_MARKER, "text capture"),
             (LIFECYCLE_MARKER, "lifecycle"),
+            (STARTUP_TRIGGER_MARKER, "startup trigger"),
         ]:
             count = docker_exec(
                 f'grep -c "{marker}" "{gf}" 2>/dev/null || echo 0',
