@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """
-Goal CLI — Manage goals for the OpenClaw Goal Monitor
-======================================================
+Goal CLI — SSH fallback for managing goals
+===========================================
+
+NOTE: The primary way to manage goals is via Telegram using /goal.
+      This CLI is an optional fallback for SSH-based management.
 
 Run on the DROPLET host. Uses docker exec to read/write goals
 inside the OpenClaw container.

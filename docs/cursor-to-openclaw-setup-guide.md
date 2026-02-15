@@ -920,10 +920,16 @@ towards a goal without manual intervention. When the agent finishes a text-only 
 and an active goal exists, the monitor automatically enqueues a continuation message
 and triggers a new agent turn.
 
+Goals are managed directly from **Telegram** using the `/goal` command — no SSH required.
+
 ### How It Works
 
-1. OpenClaw's `server-chat.js` is patched to call `goal-monitor.mjs` whenever an
-   agent lifecycle event with `phase: "end"` fires on the **main** session.
+1. OpenClaw's `server-chat.js` is patched with two hooks:
+   - **Lifecycle patch**: calls `goal-monitor.mjs` → `onTurnEnd()` whenever an agent
+     lifecycle event with `phase: "end"` fires on the **main** session.
+   - **Command registration**: registers `/goal` as a plugin command via
+     `registerPluginCommand()` so it appears in Telegram's command menu and
+     has a real handler (not just forwarded to the agent).
 2. `goal-monitor.mjs` reads `/home/node/.openclaw/goals.json`.
 3. If an active goal exists and cooldown/limits are satisfied, it enqueues a
    `System:` event with the goal text and triggers `requestHeartbeatNow`.
@@ -954,45 +960,62 @@ python3 deploy.py
 ```
 
 The deploy script:
-1. Discovers the compiled `server-chat.js` path inside the OpenClaw container
+1. Discovers compiled file paths inside the OpenClaw container
+   (`server-chat.js`, `system-events.js`, `heartbeat-wake.js`,
+   `main-session.js`, `plugins/commands.js`)
 2. Creates a backup at `server-chat.js.goal-monitor-backup`
-3. Inserts the patch code (anchored on `clearAgentRunContext`)
-4. Deploys `goal-monitor.mjs` to `/app/goal-monitor.mjs` inside the container
-5. Creates initial `goals.json` at `/home/node/.openclaw/goals.json`
-6. Restarts the OpenClaw container
+3. Inserts the lifecycle patch (anchored on `clearAgentRunContext`)
+4. Appends the command registration patch (registers `/goal` plugin command)
+5. Deploys `goal-monitor.mjs` to `/app/goal-monitor.mjs`
+6. Creates initial `goals.json` at `/home/node/.openclaw/goals.json`
+7. Restarts the OpenClaw container
+
+After restart, `/goal` appears in the Telegram command menu automatically.
 
 **Note:** if the OpenClaw container is ever **recreated** (`docker rm` + `docker run`),
 re-run `python3 deploy.py` to re-apply the patch. Normal `docker restart` preserves it.
 
-### Managing Goals
+### Managing Goals from Telegram
 
-All CLI commands run from the droplet host:
+All goal management is done via the `/goal` command in Telegram:
+
+```
+/goal <text>                     — Set a new goal (shortcut)
+/goal set <text>                 — Set a new goal
+/goal set <text> --max 50        — With max continuations
+/goal set <text> --cooldown 30   — With cooldown seconds
+/goal set <text> --delay 10      — With heartbeat delay seconds
+/goal list                       — List all goals
+/goal status                     — Show active goal details
+/goal pause [#]                  — Pause a goal (default: active)
+/goal resume [#]                 — Resume a paused goal
+/goal delete [#]                 — Delete a goal
+/goal reset [#]                  — Reset continuation count
+/goal clear                      — Delete ALL goals
+/goal help                       — Show usage
+```
+
+`#` = goal number (1-based index) or goal ID prefix.
+
+**Examples:**
+
+```
+/goal Continue reverse engineering till all phases complete
+/goal set Analyze the APK --max 50 --cooldown 30
+/goal pause
+/goal resume 1
+/goal status
+```
+
+### SSH Fallback (Optional)
+
+If needed, goals can also be managed from the droplet via SSH:
 
 ```bash
 cd /opt/cursor-proxy-patched/goal-monitor
-
-# Set a new goal (deactivates any previous active goal)
-python3 goal-cli.py set "Continue reverse engineering till all phases complete"
-
-# Set with custom limits
-python3 goal-cli.py set "Analyze the APK" --max 50 --cooldown 30 --delay 10
-
-# List all goals
+python3 goal-cli.py set "Continue RE till all phases done"
 python3 goal-cli.py list
-
-# Show active goal details
-python3 goal-cli.py status
-
-# Pause / resume / delete
 python3 goal-cli.py pause 1
-python3 goal-cli.py resume 1
-python3 goal-cli.py delete 1
-
-# Reset continuation count (so it can continue again)
-python3 goal-cli.py reset-count 1
-
-# Delete all goals
-python3 goal-cli.py clear-all
 ```
 
 ### Monitoring
@@ -1007,7 +1030,7 @@ docker logs openclaw -f --tail 50 2>&1 | grep goal-monitor
 ```bash
 cd /opt/cursor-proxy-patched/goal-monitor
 python3 deploy.py --revert    # restores from backup and restarts
-python3 deploy.py --verify    # check if patch is applied
+python3 deploy.py --verify    # check if both patches are applied
 ```
 
 ### Configuration Reference (goals.json)
@@ -1039,4 +1062,4 @@ python3 deploy.py --verify    # check if patch is applied
 
 ---
 
-*Last updated: February 15, 2026 (added Goal Monitor for autonomous agent continuation, exec auto-background disable, context management system, proxy error translation, swap space setup, stale session lock fix, ripgrep installation guide). Patched repo: [github.com/pwnapplehat/cursor-proxy-patched](https://github.com/pwnapplehat/cursor-proxy-patched).*
+*Last updated: February 16, 2026 (Goal Monitor now managed via Telegram /goal command with plugin registration, exec auto-background disable, context management system, proxy error translation, swap space setup, stale session lock fix, ripgrep installation guide). Patched repo: [github.com/pwnapplehat/cursor-proxy-patched](https://github.com/pwnapplehat/cursor-proxy-patched).*
