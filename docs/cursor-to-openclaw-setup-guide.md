@@ -180,8 +180,9 @@ cat > /home/node/.openclaw/openclaw.json << '\''OCEOF'\''
     }
   },
   "tools": {
+    "deny": ["process"],
     "exec": {
-      "backgroundMs": 120000
+      "timeoutSec": 7200
     }
   }
 }
@@ -201,6 +202,8 @@ echo "Config written."
 | `channels.telegram.blockStreaming` | `true` | Enables block streaming for Telegram |
 | `channels.telegram.streamMode` | `"off"` | Disables draft bubble streaming (incompatible with block streaming) |
 | `gateway.bind` | `"loopback"` | Internal connections use 127.0.0.1 (enables auto-pairing for sub-agents) |
+| `tools.deny` | `["process"]` | Disables exec auto-backgrounding — commands run synchronously to completion |
+| `tools.exec.timeoutSec` | `7200` | Hard kill timeout for exec commands (2 hours; increase to `86400` for 24h) |
 
 Restart OpenClaw:
 
@@ -478,11 +481,15 @@ docker exec openclaw cat /home/node/.openclaw/openclaw.json | grep timeoutSecond
 
 > **Note:** The maximum allowed value is `86400` (24 hours) — OpenClaw's schema enforces this hard cap. Setting `0` is invalid (schema requires a positive integer). The CloudClaw dashboard default is 600 seconds (10 minutes) to prevent excessive API credit usage for other users.
 
-### Exec Auto-Background Timeout (tools.exec.backgroundMs)
+### Disable Exec Auto-Backgrounding (tools.deny: ["process"])
 
-OpenClaw's `exec` tool auto-backgrounds any command that takes longer than `tools.exec.backgroundMs` (default: **10000ms = 10 seconds**). When a command is auto-backgrounded, it returns `status: "running"` instead of the actual output — the AI model sees "Command still running" and loses the result.
+OpenClaw's `exec` tool normally auto-backgrounds commands after `yieldMs` milliseconds (default 10s, hard-coded max 120s in OpenClaw source). When auto-backgrounded, the tool returns "Command still running" instead of the actual output — the AI model loses the result.
 
-This is already configured in Step 3 (`"tools": { "exec": { "backgroundMs": 120000 } }`), but if you need to change it on an existing deployment:
+**The `yieldMs` / `backgroundMs` ceiling is hard-coded at 120,000ms (2 minutes)** in OpenClaw's source code (`bash-tools.exec.ts` line 864: `clampWithDefault(..., 10, 120_000)`). You cannot exceed this via config or per-call parameters.
+
+**Solution:** Deny the `process` tool. When `process` is disallowed, OpenClaw sets `allowBackground = false` and `exec` runs **fully synchronously** — no auto-backgrounding at all. Commands run until completion, limited only by `tools.exec.timeoutSec` (which has no hard ceiling).
+
+This is already configured in Step 3 (`"tools": { "deny": ["process"], "exec": { "timeoutSec": 7200 } }`), but if you need to apply it on an existing deployment:
 
 ```bash
 docker exec -u root openclaw bash -c '
@@ -493,12 +500,20 @@ with open(cfg_path) as f:
     cfg = json.load(f)
 if \"tools\" not in cfg:
     cfg[\"tools\"] = {}
+# Deny process tool → disables auto-backgrounding
+deny = cfg[\"tools\"].get(\"deny\", [])
+if \"process\" not in deny:
+    deny.append(\"process\")
+cfg[\"tools\"][\"deny\"] = deny
+# Set high timeoutSec (2 hours) — the only remaining kill limit
 if \"exec\" not in cfg[\"tools\"]:
     cfg[\"tools\"][\"exec\"] = {}
-cfg[\"tools\"][\"exec\"][\"backgroundMs\"] = 120000
+cfg[\"tools\"][\"exec\"][\"timeoutSec\"] = 7200
+# Remove backgroundMs if present (no longer relevant)
+cfg[\"tools\"][\"exec\"].pop(\"backgroundMs\", None)
 with open(cfg_path, \"w\") as f:
     json.dump(cfg, f, indent=2)
-print(\"Done — exec backgroundMs set to 120000 (2 minutes)\")
+print(\"Done — process denied, timeoutSec set to 7200 (2 hours)\")
 "'
 docker exec -u root openclaw chown node:node /home/node/.openclaw/openclaw.json
 docker restart openclaw
@@ -507,10 +522,10 @@ docker restart openclaw
 Verify:
 
 ```bash
-docker exec openclaw cat /home/node/.openclaw/openclaw.json | python3 -c "import sys,json; c=json.load(sys.stdin); print('backgroundMs:', c.get('tools',{}).get('exec',{}).get('backgroundMs','NOT SET'))"
+docker exec openclaw cat /home/node/.openclaw/openclaw.json | python3 -c "import sys,json; c=json.load(sys.stdin); print('deny:', c.get('tools',{}).get('deny','NOT SET')); print('timeoutSec:', c.get('tools',{}).get('exec',{}).get('timeoutSec','NOT SET'))"
 ```
 
-> **Why 120000 (2 minutes)?** On large codebases (3+ GB, 200K+ files), `rg`, `grep`, and `find` commands can legitimately take 15-60 seconds. The default 10s causes these to be auto-backgrounded, which breaks the tool result flow. 120s gives search tools enough time while still catching truly stuck commands.
+> **Why deny `process`?** The proxy doesn't expose OpenClaw's `process` tool to Cursor, so the AI agent can't use it anyway. Denying it has zero downside but removes the 120s hard ceiling on foreground execution. With `timeoutSec: 7200`, commands can run up to 2 hours. Increase to `86400` (24h) if needed — OpenClaw's schema accepts any positive integer for `timeoutSec`.
 
 ---
 
@@ -537,7 +552,7 @@ docker exec openclaw cat /home/node/.openclaw/openclaw.json | python3 -c "import
 | 10+ minute response times | Context bloat from failed tool loops — send `/reset` |
 | `session file locked (timeout 10000ms)` | Stale lock from OOM-killed process — see Stale Session Lock Fix below |
 | Agent OOM-killed during heavy tasks (jadx, baksmali) | VM needs swap space — see Add Swap Space below |
-| `rg`/`grep`/`find` returns "Command still running" | OpenClaw auto-backgrounded the command (default 10s) — increase `tools.exec.backgroundMs` to `120000` (see Exec Auto-Background Timeout above) |
+| `rg`/`grep`/`find` returns "Command still running" | OpenClaw auto-backgrounded the command — deny the `process` tool to disable auto-backgrounding entirely (see Disable Exec Auto-Backgrounding above) |
 | `rg: Permission denied` or `rg: command not found` | ripgrep not installed in container — see Install ripgrep below |
 | `ERR_HTTP2_STREAM_ERROR` / `NGHTTP2_INTERNAL_ERROR` crash | H2 session dropped between requests — ensure patched `app.js` (process-level error handlers) and `h2-bidi.js` (guarded error emit) are deployed |
 

@@ -636,13 +636,12 @@ const CURSOR_TO_OPENCLAW_PARAMS = {
   'contents': 'content',
   'contents_after_edit': 'content',     // EditFileV2Params full-file replace
   'search_term': 'query',
-  'is_background': 'background',        // Cursor sends is_background; OpenClaw exec uses 'background'
 };
 
 // Cursor-specific params to drop (not used by OpenClaw)
-// NOTE: is_background is NOT dropped — it maps to OpenClaw's 'background' param (see above).
-// blocking is dropped because OpenClaw uses yieldMs instead.
-const CURSOR_DROP_PARAMS = new Set(['explanation', 'blocking']);
+// is_background and blocking are dropped because backgrounding is disabled
+// (process tool denied in openclaw.json → allowBackground=false → exec runs synchronously).
+const CURSOR_DROP_PARAMS = new Set(['explanation', 'blocking', 'is_background']);
 
 // ─── Ripgrep command builder ─────────────────────────────────────────
 // Translates Cursor's ripgrep tool args into a proper `rg` shell command.
@@ -713,11 +712,9 @@ function buildRgCommand(args) {
     cmd += ` | head -${headLimit}`;
   }
 
-  // ── yieldMs override ──
-  // OpenClaw auto-backgrounds commands after `yieldMs` (default 10s from tools.exec.backgroundMs).
-  // Ripgrep on large codebases can legitimately take 15-60s with full-content scans.
-  // Set a per-call yieldMs of 120s so rg has time to finish before being auto-backgrounded.
-  return { name: 'exec', arguments: { command: cmd, yieldMs: 120000 } };
+  // No yieldMs needed — backgrounding is disabled via process tool denial in openclaw.json.
+  // Commands run synchronously to completion (limited only by timeoutSec, default 7200s).
+  return { name: 'exec', arguments: { command: cmd } };
 }
 
 // Tools that need full argument restructuring (not just param rename).
@@ -726,11 +723,11 @@ const SPECIAL_TOOL_CONVERSIONS = {
   // ─── Directory listing ──────────────────────────────────────────────
   'list_dir': (args) => ({
     name: 'exec',
-    arguments: { command: `ls -la ${shellEscape(args.target_directory || args.directory_path || args.path || '.')}`, yieldMs: 120000 },
+    arguments: { command: `ls -la ${shellEscape(args.target_directory || args.directory_path || args.path || '.')}` },
   }),
   'list_dir_v2': (args) => ({
     name: 'exec',
-    arguments: { command: `ls -la ${shellEscape(args.target_directory || args.directory_path || args.path || '.')}`, yieldMs: 120000 },
+    arguments: { command: `ls -la ${shellEscape(args.target_directory || args.directory_path || args.path || '.')}` },
   }),
 
   // ─── Search tools ──────────────────────────────────────────────────
@@ -738,11 +735,11 @@ const SPECIAL_TOOL_CONVERSIONS = {
   'ripgrep_search':     (args) => buildRgCommand(args),
   'file_search': (args) => ({
     name: 'exec',
-    arguments: { command: `find ${shellEscape(args.path || '.')} -name ${shellEscape(args.pattern || args.query || '*')} 2>/dev/null`, yieldMs: 120000 },
+    arguments: { command: `find ${shellEscape(args.path || '.')} -name ${shellEscape(args.pattern || args.query || '*')} 2>/dev/null` },
   }),
   'glob_file_search': (args) => ({
     name: 'exec',
-    arguments: { command: `find ${shellEscape(args.path || '.')} -name ${shellEscape(args.glob_pattern || args.pattern || '*')} 2>/dev/null`, yieldMs: 120000 },
+    arguments: { command: `find ${shellEscape(args.path || '.')} -name ${shellEscape(args.glob_pattern || args.pattern || '*')} 2>/dev/null` },
   }),
 
   // ─── File delete ─────────────────────────────────────────────────────
@@ -756,7 +753,7 @@ const SPECIAL_TOOL_CONVERSIONS = {
     }
     return {
       name: 'exec',
-      arguments: { command: `rm -f ${shellEscape(pathVal)}`, yieldMs: 120000 },
+      arguments: { command: `rm -f ${shellEscape(pathVal)}` },
     };
   },
 
@@ -959,14 +956,9 @@ function convertNativeToolCall(tc) {
     mappedArgs[mappedKey] = value;
   }
 
-  // ── Inject yieldMs for all exec calls ──
-  // OpenClaw auto-backgrounds commands after yieldMs (default 10s).
-  // The global config tools.exec.backgroundMs may not hot-reload reliably,
-  // and the PI_BASH_YIELD_MS env var can override it.
-  // Safest: always send yieldMs per-call for exec tools.
-  if (openclawName === 'exec' && !('yieldMs' in mappedArgs)) {
-    mappedArgs.yieldMs = 120000;
-  }
+  // No yieldMs injection needed — backgrounding is disabled via process tool denial
+  // in openclaw.json (allowBackground=false → exec runs synchronously to completion).
+  // Only timeoutSec (default 7200s) limits execution time.
 
   console.log(`[convertNativeToolCall] ${cursorName} → ${openclawName} (params: ${Object.keys(args).join(',')} → ${Object.keys(mappedArgs).join(',')})`);
   return { name: openclawName, arguments: mappedArgs };
