@@ -913,6 +913,115 @@ ls -lh /tmp/snapchat.apk && docker cp /tmp/snapchat.apk openclaw:/home/node/.ope
 
 ---
 
+## Goal Monitor — Autonomous Agent Continuation
+
+The **Goal Monitor** patches OpenClaw's lifecycle handler so the agent keeps working
+towards a goal without manual intervention. When the agent finishes a text-only turn
+and an active goal exists, the monitor automatically enqueues a continuation message
+and triggers a new agent turn.
+
+### How It Works
+
+1. OpenClaw's `server-chat.js` is patched to call `goal-monitor.mjs` whenever an
+   agent lifecycle event with `phase: "end"` fires on the **main** session.
+2. `goal-monitor.mjs` reads `/home/node/.openclaw/goals.json`.
+3. If an active goal exists and cooldown/limits are satisfied, it enqueues a
+   `System:` event with the goal text and triggers `requestHeartbeatNow`.
+4. The heartbeat runner picks up the event and runs a new agent turn — the agent
+   sees the goal instruction and continues working.
+
+### Safety Features
+
+| Feature | Default | Purpose |
+|---|---|---|
+| Per-goal cooldown | 15 s | Prevents immediate re-trigger |
+| Max continuations | 200 | Auto-deactivates the goal after N turns |
+| Rapid-fire detection | 5 in < 30 s | Emergency 2-min pause if looping |
+| Main-session filter | always on | Cursor proxy sessions are never auto-continued |
+
+### Deploying the Goal Monitor
+
+The goal monitor files live inside this repo at `goal-monitor/`. On the droplet
+they are already available after `git pull` at `/opt/cursor-proxy-patched/goal-monitor/`.
+
+```bash
+# On the droplet
+cd /opt/cursor-proxy-patched && git pull origin master
+
+# Run the deploy script
+cd /opt/cursor-proxy-patched/goal-monitor
+python3 deploy.py
+```
+
+The deploy script:
+1. Discovers the compiled `server-chat.js` path inside the OpenClaw container
+2. Creates a backup at `server-chat.js.goal-monitor-backup`
+3. Inserts the patch code (anchored on `clearAgentRunContext`)
+4. Deploys `goal-monitor.mjs` to `/app/goal-monitor.mjs` inside the container
+5. Creates initial `goals.json` at `/home/node/.openclaw/goals.json`
+6. Restarts the OpenClaw container
+
+**Note:** if the OpenClaw container is ever **recreated** (`docker rm` + `docker run`),
+re-run `python3 deploy.py` to re-apply the patch. Normal `docker restart` preserves it.
+
+### Managing Goals
+
+All CLI commands run from the droplet host:
+
+```bash
+cd /opt/cursor-proxy-patched/goal-monitor
+
+# Set a new goal (deactivates any previous active goal)
+python3 goal-cli.py set "Continue reverse engineering till all phases complete"
+
+# Set with custom limits
+python3 goal-cli.py set "Analyze the APK" --max 50 --cooldown 30 --delay 10
+
+# List all goals
+python3 goal-cli.py list
+
+# Show active goal details
+python3 goal-cli.py status
+
+# Pause / resume / delete
+python3 goal-cli.py pause 1
+python3 goal-cli.py resume 1
+python3 goal-cli.py delete 1
+
+# Reset continuation count (so it can continue again)
+python3 goal-cli.py reset-count 1
+
+# Delete all goals
+python3 goal-cli.py clear-all
+```
+
+### Monitoring
+
+```bash
+# Watch goal-monitor logs in real time
+docker logs openclaw -f --tail 50 2>&1 | grep goal-monitor
+```
+
+### Reverting the Patch
+
+```bash
+cd /opt/cursor-proxy-patched/goal-monitor
+python3 deploy.py --revert    # restores from backup and restarts
+python3 deploy.py --verify    # check if patch is applied
+```
+
+### Configuration Reference (goals.json)
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `text` | string | — | Goal description shown to the agent |
+| `active` | boolean | true | Only one goal can be active at a time |
+| `max_continuations` | number | 200 | Auto-deactivate after this many turns |
+| `cooldown_seconds` | number | 15 | Minimum seconds between continuations |
+| `delay_seconds` | number | 5 | Delay before triggering heartbeat (settle time) |
+
+---
+
 ## Caveats
 
 1. **Cookie expiration** — needs periodic refresh from your PC
@@ -926,7 +1035,8 @@ ls -lh /tmp/snapchat.apk && docker cp /tmp/snapchat.apk openclaw:/home/node/.ope
 9. **OOM kills on low-RAM droplets** — memory-intensive tasks (Jadx, Ghidra, baksmali) can trigger Linux OOM killer on VMs with less than 8GB RAM; add swap space to mitigate (see Add Swap Space under Troubleshooting)
 10. **Stale session locks** — OOM kills or crashes can leave `.lock` files blocking sessions; manual cleanup required (see Stale Session Lock Fix under Troubleshooting)
 11. **ripgrep not pre-installed** — the OpenClaw container does not include `ripgrep` by default; must be installed manually as root, and does not persist across container rebuilds (see Install ripgrep under Troubleshooting)
+12. **Goal monitor patch** — the `server-chat.js` patch and `/app/goal-monitor.mjs` live inside the container filesystem; they survive `docker restart` but are lost on `docker rm` + `docker run`; re-run `python3 deploy.py` to re-apply (see Goal Monitor section)
 
 ---
 
-*Last updated: February 14, 2026 (added context management system, proxy error translation, swap space setup, stale session lock fix, ripgrep installation guide). Patched repo: [github.com/pwnapplehat/cursor-proxy-patched](https://github.com/pwnapplehat/cursor-proxy-patched).*
+*Last updated: February 15, 2026 (added Goal Monitor for autonomous agent continuation, exec auto-background disable, context management system, proxy error translation, swap space setup, stale session lock fix, ripgrep installation guide). Patched repo: [github.com/pwnapplehat/cursor-proxy-patched](https://github.com/pwnapplehat/cursor-proxy-patched).*
