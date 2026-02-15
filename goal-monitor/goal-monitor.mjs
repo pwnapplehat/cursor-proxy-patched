@@ -45,7 +45,7 @@ const LOG = "[goal-monitor]";
 // AI analysis
 const DEFAULT_ANALYSIS_MODEL = "claude-4.6-opus-max";
 const ANALYSIS_TIMEOUT_MS = 60_000; // 60s timeout for AI call
-const MAX_RESPONSE_CHARS = 12_000; // truncate very long responses
+// No truncation — Claude always sees the full agent response for best analysis accuracy
 
 // Cooldown (minimum between continuations, also limits AI analysis calls)
 const ABS_MIN_COOLDOWN_MS = 10_000; // 10s absolute minimum
@@ -223,20 +223,12 @@ async function analyzeWithAI(responseText, goalText, model) {
     return false; // fail-safe: don't continue
   }
 
-  // Truncate very long responses (keep the end which has conclusions)
-  let truncatedResponse = responseText;
-  if (responseText.length > MAX_RESPONSE_CHARS) {
-    truncatedResponse =
-      "[...truncated...]\n" +
-      responseText.slice(responseText.length - MAX_RESPONSE_CHARS);
-  }
-
   const userPrompt = [
     `ACTIVE GOAL: "${goalText}"`,
     "",
     "AGENT'S LAST RESPONSE:",
     "---",
-    truncatedResponse,
+    responseText,
     "---",
     "",
     "Based on the goal and the agent's response above, should the agent automatically continue working? Reply YES or NO.",

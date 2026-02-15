@@ -467,6 +467,8 @@ def restart_container():
 # ── main ─────────────────────────────────────────────────────────────
 
 def main():
+    global CONTAINER
+
     parser = argparse.ArgumentParser(
         description="Deploy the Goal Monitor patch for OpenClaw",
     )
@@ -478,7 +480,6 @@ def main():
     )
     args = parser.parse_args()
 
-    global CONTAINER
     CONTAINER = args.container
 
     # Verify container is running
