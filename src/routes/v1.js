@@ -1103,6 +1103,7 @@ router.post('/chat/completions', async (req, res) => {
         // Process protobuf frames as they arrive from Cursor's streaming response.
         // Each frame is decoded immediately — text is streamed, tool calls collected.
         let chunksReceived = 0;
+        let signalFinalize = false;
         try {
           for await (const chunk of response.body) {
             chunksReceived++;
@@ -1115,8 +1116,15 @@ router.post('/chat/completions', async (req, res) => {
               if (endOfTurn) {
                 console.log(`[fetch] ★ TEXT-PHASE-COMPLETE signal in fetch path`);
               }
-              if (parallelToolCallsComplete) {
-                console.log(`[fetch] ★ ALL-TOOL-CALLS-SENT signal in fetch path`);
+              // ── SIGNAL: parallel_tool_calls_complete (field 32) ────────────
+              // All tool calls have been sent. Break out of the streaming loop
+              // immediately — no need to wait for the stream to close naturally.
+              // Pending streaming TCs are flushed after the loop.
+              if (parallelToolCallsComplete && nativeToolCalls.length > 0) {
+                console.log(`[fetch] ★ ALL-TOOL-CALLS-SENT signal — breaking stream loop` +
+                  ` (toolCalls=${nativeToolCalls.length} pending=${toolCallAccumulator.hasPending()})`);
+                signalFinalize = true;
+                break;
               }
 
               // Capture Cursor API errors (e.g., ERROR_CONVERSATION_TOO_LONG)
@@ -1174,6 +1182,7 @@ router.post('/chat/completions', async (req, res) => {
                 }
               }
             }
+            if (signalFinalize) break;
           }
         } catch (streamReadError) {
           console.warn(`[streaming] Stream terminated early (${chunksReceived} chunks received): ${streamReadError.message || streamReadError}`);
