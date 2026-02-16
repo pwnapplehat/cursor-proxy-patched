@@ -1207,7 +1207,7 @@ class IncrementalFrameParser {
  * @returns {{ text: string, thinking: string, nativeToolCalls: Array }}
  */
 function processSingleFrame(magic, data, seenToolCallIds) {
-  const result = { text: '', thinking: '', nativeToolCalls: [], error: null, endOfTurn: false };
+  const result = { text: '', thinking: '', nativeToolCalls: [], error: null, endOfTurn: false, parallelToolCallsComplete: false };
 
   try {
     if (magic === 0 || magic === 1) {
@@ -1268,7 +1268,8 @@ function processSingleFrame(magic, data, seenToolCallIds) {
                   console.log(`[END-OF-TURN] stop_using_dsv3_agentic_model = ${stopDsv3} — Cursor signals turn complete`);
                 }
                 if (parallelDone) {
-                  console.log(`[END-OF-TURN] parallel_tool_calls_complete = ${parallelDone}`);
+                  result.parallelToolCallsComplete = true;
+                  console.log(`[SIGNAL] parallel_tool_calls_complete = ${parallelDone} — all tool calls sent`);
                 }
 
                 // Audit: log truly unknown sub-fields (38+) for future discovery
@@ -1372,7 +1373,8 @@ function processSingleFrame(magic, data, seenToolCallIds) {
   if (result.thinking) parts.push(`thinking=${result.thinking.length}ch`);
   if (result.nativeToolCalls.length > 0) parts.push(`toolCalls=${result.nativeToolCalls.length}`);
   if (result.error) parts.push(`error=${result.error.type}`);
-  if (result.endOfTurn) parts.push('★END-OF-TURN');
+  if (result.endOfTurn) parts.push('★TEXT-COMPLETE');
+  if (result.parallelToolCallsComplete) parts.push('★ALL-TOOLS-SENT');
   if (parts.length === 0) parts.push('empty');
   console.log(`[FRAME] magic=${magic} size=${data.length}B → ${parts.join(' | ')}`);
 

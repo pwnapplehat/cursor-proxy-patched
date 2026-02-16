@@ -279,6 +279,7 @@ async function streamBidiResponse(bidiState, res, model, responseId, hasTools, t
     let turnTimer = null;
     let stallCheckCount = 0;
     let provisionalAckSent = false;
+    let textPhaseComplete = false;
     const TURN_INACTIVITY_MS = 800;
     // OPTIMIZATION (2026-02-14): Reduced from 250ms to 80ms.
     // This is the delay before finalizing non-streaming tool calls (read_file,
@@ -312,13 +313,12 @@ async function streamBidiResponse(bidiState, res, model, responseId, hasTools, t
       turnTimer = setTimeout(() => {
         if (toolCallsEmitted) return; // Already finalized
 
-        // DEBUG: Fallback timer fired — this means the END-OF-TURN signal
-        // from Cursor (should_break_ai_message / stop_using_dsv3_agentic_model)
-        // was NOT received. Under normal operation, the signal fires first and
-        // this timer never triggers. If you see this log, investigate why.
-        console.log(`[TURN-TIMER] ⚠ FALLBACK timer fired after ${overrideMs || TURN_INACTIVITY_MS}ms silence — ` +
+        // Turn timer fired. For tool calls, this means parallel_tool_calls_complete
+        // signal was not received (or not sent by Cursor). For text-only responses,
+        // this is normal — the timer detects the end of content streaming.
+        console.log(`[TURN-TIMER] fired after ${overrideMs || TURN_INACTIVITY_MS}ms silence — ` +
           `toolCalls=${nativeToolCalls.length} pendingStreaming=${toolCallAccumulator.hasPending()} ` +
-          `textLen=${allTextAccumulated.length} thinkingLen=${allThinking.length} ` +
+          `textLen=${allTextAccumulated.length} textPhaseComplete=${textPhaseComplete} ` +
           `action=${nativeToolCalls.length > 0 ? 'FINALIZE' : toolCallAccumulator.hasPending() ? 'STALL-CHECK' : 'NO-OP'}`);
 
         // Try to flush streaming calls with complete JSON (e.g., web_search)
@@ -398,7 +398,7 @@ async function streamBidiResponse(bidiState, res, model, responseId, hasTools, t
       // with smart timeout selection — see bottom of this function.
       resetSafetyTimeout(); // Keep safety timeout alive while data is flowing
 
-      const { text, thinking, nativeToolCalls: frameTCs, error: frameError, endOfTurn } =
+      const { text, thinking, nativeToolCalls: frameTCs, error: frameError, endOfTurn, parallelToolCallsComplete } =
         processSingleFrame(magic, data, seenToolCallIds);
 
       // Capture Cursor API errors (e.g., ERROR_CONVERSATION_TOO_LONG) so
@@ -453,38 +453,37 @@ async function streamBidiResponse(bidiState, res, model, responseId, hasTools, t
         }
       }
 
-      // ── END-OF-TURN SIGNAL (primary mechanism) ─────────────────────
-      // Cursor's native client uses explicit protobuf booleans to signal
-      // that the model's turn is complete:
-      //   should_break_ai_message (field 14) — primary
-      //   stop_using_dsv3_agentic_model (field 26) — secondary
-      // When either fires, finalize immediately — no timer guessing.
-      // This matches exactly how Cursor's IDE works internally.
-      if (endOfTurn && !toolCallsEmitted) {
-        console.log(`[h2-bidi] ★ END-OF-TURN signal received — finalizing immediately` +
+      // ── SIGNAL: should_break_ai_message (field 14) ─────────────────
+      // Means "the TEXT portion is done." Tool call frames arrive AFTER
+      // this signal (verified: 500ms+ gap). Do NOT finalize here.
+      if (endOfTurn) {
+        textPhaseComplete = true;
+        console.log(`[h2-bidi] ★ TEXT-PHASE-COMPLETE signal` +
           ` (toolCalls=${nativeToolCalls.length} pending=${toolCallAccumulator.hasPending()}` +
-          ` textLen=${allTextAccumulated.length})`);
+          ` textLen=${allTextAccumulated.length}) — waiting for tool calls`);
+      }
 
-        // Flush any remaining streaming tool calls — by the time Cursor sends
-        // the end-of-turn signal, all tool call data should be complete.
+      // ── SIGNAL: parallel_tool_calls_complete (field 32) ────────────
+      // Means "ALL tool calls have been sent." This is the REAL end-of-turn
+      // signal for tool call responses. Finalize immediately — zero delay,
+      // matching native Cursor behavior. This fires AFTER all tool call
+      // frames, so nativeToolCalls is fully populated.
+      if (parallelToolCallsComplete && nativeToolCalls.length > 0 && !toolCallsEmitted) {
+        console.log(`[h2-bidi] ★ ALL-TOOL-CALLS-SENT signal — finalizing immediately` +
+          ` (toolCalls=${nativeToolCalls.length} pending=${toolCallAccumulator.hasPending()})`);
         if (toolCallAccumulator.hasPending()) {
-          console.log(`[h2-bidi] Flushing pending streaming tool calls before signal-finalize`);
           const remaining = toolCallAccumulator.flush();
           for (const tc of remaining) handleCompletedToolCall(tc);
         }
-
-        // Cancel the turn timer — we're finalizing via signal, not timer
         if (turnTimer) { clearTimeout(turnTimer); turnTimer = null; }
-
         finalize();
         return;
       }
 
-      // ── FALLBACK turn timer (only fires if signal is missed) ───────
-      // The timer is a safety net for edge cases where Cursor's end-of-turn
-      // signal is somehow not received (protocol change, partial frame, etc).
-      // Under normal operation, the signal above fires first and this timer
-      // never triggers.
+      // ── Fallback turn timer ────────────────────────────────────────
+      // Safety net for when parallel_tool_calls_complete is not sent or
+      // for text-only responses where the stream may stay open. The timer
+      // resets on every frame and only fires during silence.
       if (nativeToolCalls.length > 0 && !toolCallAccumulator.hasPending()) {
         resetTurnTimer(FAST_FINALIZE_MS);
       } else {
@@ -1109,11 +1108,14 @@ router.post('/chat/completions', async (req, res) => {
             const frames = frameParser.addChunk(Buffer.from(chunk));
 
             for (const frame of frames) {
-              const { text, thinking, nativeToolCalls: frameTCs, endOfTurn } =
+              const { text, thinking, nativeToolCalls: frameTCs, endOfTurn, parallelToolCallsComplete } =
                 processSingleFrame(frame.magic, frame.data, seenToolCallIds);
 
               if (endOfTurn) {
-                console.log(`[fetch] ★ END-OF-TURN signal received in fetch path (stream will close naturally)`);
+                console.log(`[fetch] ★ TEXT-PHASE-COMPLETE signal in fetch path`);
+              }
+              if (parallelToolCallsComplete) {
+                console.log(`[fetch] ★ ALL-TOOL-CALLS-SENT signal in fetch path`);
               }
 
               // Feed tool calls through the streaming accumulator.
