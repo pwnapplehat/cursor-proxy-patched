@@ -265,18 +265,17 @@ async function streamBidiResponse(bidiState, res, model, responseId, hasTools, t
     // ─── Turn inactivity timer ───────────────────────────────────────
     // In bidi mode, Cursor does NOT close the stream after sending a tool
     // call — it keeps the stream open waiting for the result. Without this
-    // timer, finalize() only fires on the 5-minute safety timeout, making
-    // every tool call round-trip take 5 minutes of dead waiting.
+    // timer, finalize() only fires on the 30-minute safety timeout, making
+    // every tool call round-trip take 30 minutes of dead waiting.
     //
     // This timer fires after the last frame. If we've detected tool calls,
     // that means Cursor is done with its turn → finalize now.
     //
-    // OPTIMIZATION (2026-02-06): Reduced from 1500ms to 800ms to cut proxy
-    // latency contribution to tool call round-trips. For non-streaming tool
-    // calls (ripgrep, web_search, read_file, etc.), FAST_FINALIZE_MS (250ms)
-    // is used instead — just enough to catch parallel tool calls in a burst.
-    // This reduces the proxy's latency overhead from ~1500ms to ~250ms for
-    // the common case, making ERROR_USER_ABORTED_REQUEST much less likely.
+    // The timer is purely PASSIVE — it never interrupts Cursor's streaming.
+    // During thinking or text generation, frames flow continuously and the
+    // timer resets on each frame. It only fires when Cursor naturally stops
+    // sending, detecting the boundary between "response" and "waiting for
+    // tool result."
     let turnTimer = null;
     let stallCheckCount = 0;
     let provisionalAckSent = false;
@@ -594,84 +593,6 @@ async function streamBidiResponse(bidiState, res, model, responseId, hasTools, t
           })}\n\n`);
 
           bidiState.close();
-        } else if (cursorApiError && cursorApiError.type === 'user_aborted') {
-          // ERROR_USER_ABORTED_REQUEST — Cursor's server aborted the stream.
-          // This is a SERVER-SIDE timeout (not our proxy). Cursor's backend has
-          // a deadline for receiving tool results; if the full round-trip
-          // (proxy → OpenClaw → VPS tool execution → OpenClaw → proxy → Cursor)
-          // exceeds that deadline, Cursor aborts with this error.
-          //
-          // CRITICAL FIX (2026-02-14): The old approach injected a TEXT message
-          // with finish_reason:'stop'. OpenClaw treated this as a normal final
-          // response, sent it to the user, and STOPPED the agent loop. The agent
-          // died every time Cursor aborted.
-          //
-          // NEW APPROACH: Inject a SYNTHETIC TOOL CALL with finish_reason:'tool_calls'.
-          // This forces OpenClaw to continue the agent loop:
-          //   1. OpenClaw sees a tool call → executes it (harmless exec echo)
-          //   2. OpenClaw sends the result back as a new API request
-          //   3. The proxy finds no pending stream (old one is closed)
-          //   4. Falls through to create a NEW bidi stream with full context
-          //   5. Cursor processes it as a fresh request → agent continues
-          //
-          // This makes the agent survive Cursor server-side aborts automatically.
-          const responseIsEmpty = !allTextAccumulated || allTextAccumulated.trim().length === 0;
-
-          if (responseIsEmpty && hasTools) {
-            console.warn('[h2-bidi] User aborted with EMPTY response — injecting synthetic tool call to keep agent alive');
-
-            // Synthetic exec tool call — harmless echo that keeps the loop alive
-            const syntheticCallId = `call_${uuidv4()}`;
-            const syntheticArgs = JSON.stringify({
-              command: 'echo "[proxy-recovery] Cursor API interrupted this request. The agent is resuming automatically. No action needed."'
-            });
-
-            // Send the tool call chunk (same format as real tool calls at line 529-548)
-            res.write(`data: ${JSON.stringify({
-              id: responseId,
-              object: 'chat.completion.chunk',
-              created: Math.floor(Date.now() / 1000),
-              model: model,
-              choices: [{
-                index: 0,
-                delta: {
-                  tool_calls: [{
-                    index: 0,
-                    id: syntheticCallId,
-                    type: 'function',
-                    function: { name: 'exec', arguments: syntheticArgs }
-                  }]
-                },
-                finish_reason: null
-              }]
-            })}\n\n`);
-
-            // Send finish_reason: tool_calls (forces OpenClaw to execute and continue)
-            res.write(`data: ${JSON.stringify({
-              id: responseId,
-              object: 'chat.completion.chunk',
-              created: Math.floor(Date.now() / 1000),
-              model: model,
-              choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }]
-            })}\n\n`);
-
-            toolCallsEmitted = true;
-            bidiState.close();
-          } else {
-            // Response had content (text was already streamed) — send stop
-            if (hasTools) {
-              console.warn('[h2-bidi] WARNING: User aborted request — response had content but no tool calls emitted.');
-            }
-            res.write(`data: ${JSON.stringify({
-              id: responseId,
-              object: 'chat.completion.chunk',
-              created: Math.floor(Date.now() / 1000),
-              model: model,
-              choices: [{ index: 0, delta: {}, finish_reason: 'stop' }]
-            })}\n\n`);
-
-            bidiState.close();
-          }
         } else {
           // ─── Normal text-only response — pass through as stop ───────────
           // When the model responds with text and no tool calls, this is
@@ -707,23 +628,24 @@ async function streamBidiResponse(bidiState, res, model, responseId, hasTools, t
     }
 
     // DYNAMIC safety timeout: resets on every frame so large files that stream
-    // for minutes (or even hours) are never killed. Only fires after 5 minutes
+    // for minutes (or even hours) are never killed. Only fires after 30 minutes
     // of ZERO activity (no frames at all), which means the stream is truly dead.
-    // This replaces the old fixed 5-minute timer that would kill long-running
-    // streaming responses regardless of whether data was still flowing.
+    // 30 minutes accommodates deep thinking models (o1, Claude extended thinking)
+    // that can think for 10+ minutes between frames. This timer NEVER interrupts
+    // active streaming — it only catches genuinely dead/abandoned streams.
     //
     // IMPORTANT: Must be declared BEFORE attaching listeners / processing
     // buffered frames, because onFrame() calls resetSafetyTimeout().
-    const SAFETY_TIMEOUT_MS = 5 * 60 * 1000;
+    const SAFETY_TIMEOUT_MS = 30 * 60 * 1000;
     let safetyTimeout = setTimeout(() => {
-      console.warn('[h2-bidi] Safety timeout (5 min no frames) — finalizing response');
+      console.warn('[h2-bidi] Safety timeout (30 min no frames) — finalizing response');
       finalize();
     }, SAFETY_TIMEOUT_MS);
 
     function resetSafetyTimeout() {
       clearTimeout(safetyTimeout);
       safetyTimeout = setTimeout(() => {
-        console.warn('[h2-bidi] Safety timeout (5 min no frames) — finalizing response');
+        console.warn('[h2-bidi] Safety timeout (30 min no frames) — finalizing response');
         finalize();
       }, SAFETY_TIMEOUT_MS);
     }

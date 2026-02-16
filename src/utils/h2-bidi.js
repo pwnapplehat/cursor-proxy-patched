@@ -669,9 +669,6 @@ class BidiStreamState extends EventEmitter {
    * @param {string} outputText
    */
   sendToolResult(toolEnum, cursorToolCallId, outputText) {
-    // Stop heartbeat — the real result is here
-    this._stopWaitHeartbeat();
-
     if (this.ended || !this.stream || this.stream.destroyed) {
       console.warn('[h2-bidi] Cannot send tool result — stream already ended');
       return false;
@@ -709,80 +706,10 @@ class BidiStreamState extends EventEmitter {
 
   /**
    * Start buffering frames (while waiting for OpenClaw to execute tool).
-   * Also starts the wait-heartbeat interval to keep the bidi stream
-   * active at the application level while OpenClaw executes the tool.
    */
   startBuffering() {
     this._waitingForToolResult = true;
     this.bufferedFrames = [];
-    this._startWaitHeartbeat();
-  }
-
-  /**
-   * Send a lightweight application-level heartbeat on the bidi stream.
-   *
-   * In the Cursor IDE, tool results are sent directly on the bidi stream
-   * with zero intermediate hops. Our proxy introduces an HTTP break
-   * (OpenClaw executes the tool and sends a NEW request with the result).
-   * During this break, the bidi stream is idle at the application level —
-   * only H2 PINGs (transport-level) flow. Cursor's server may interpret
-   * this application-level silence as "client abandoned the request" and
-   * abort with ERROR_USER_ABORTED_REQUEST.
-   *
-   * This heartbeat sends a minimal empty ConnectRPC envelope (5 bytes:
-   * [0x00][0x00000000]) on the stream. It's a valid ConnectRPC frame
-   * with an empty protobuf payload — most servers ignore empty messages
-   * but the DATA frame on the H2 stream keeps the connection alive at
-   * the application level.
-   *
-   * @returns {boolean} true if sent successfully
-   */
-  sendHeartbeat() {
-    if (this.ended || !this.stream || this.stream.destroyed) return false;
-
-    // Empty ConnectRPC frame: flag=0 (uncompressed), length=0, no payload
-    const emptyFrame = frameMessage(Buffer.alloc(0));
-    try {
-      this.stream.write(emptyFrame);
-      this.lastActivityAt = Date.now();
-      console.log(`[h2-bidi:HEARTBEAT] Sent empty frame (${emptyFrame.length} bytes) to keep stream active`);
-      return true;
-    } catch (err) {
-      console.warn(`[h2-bidi:HEARTBEAT] Failed to send: ${err.message}`);
-      return false;
-    }
-  }
-
-  /**
-   * Start periodic heartbeat while waiting for tool results from OpenClaw.
-   *
-   * TUNING (2026-02-14): Interval increased from 8s to 25s.
-   * At 8s, a 100-second tool execution sends ~12 heartbeat frames.
-   * Over 20+ tool calls, that's dozens of extra client→server frames
-   * that native Cursor never sends. Cursor's server may count or rate-limit
-   * client messages. At 25s, the same 100s tool sends ~4 frames, and fast
-   * tools (< 25s, the majority) send ZERO heartbeats — much closer to
-   * native Cursor behavior. Still keeps the stream alive for long operations.
-   */
-  _startWaitHeartbeat() {
-    this._stopWaitHeartbeat();
-    this._waitHeartbeatInterval = setInterval(() => {
-      if (!this._waitingForToolResult || this.ended) {
-        this._stopWaitHeartbeat();
-        return;
-      }
-      this.sendHeartbeat();
-    }, 25 * 1000); // every 25 seconds
-  }
-
-  /**
-   * Stop the wait-heartbeat interval.
-   */
-  _stopWaitHeartbeat() {
-    if (this._waitHeartbeatInterval) {
-      clearInterval(this._waitHeartbeatInterval);
-      this._waitHeartbeatInterval = null;
-    }
   }
 
   /**
@@ -829,61 +756,9 @@ class BidiStreamState extends EventEmitter {
   }
 
   /**
-   * Nudge the H2 session to diagnose if Cursor's server resumes streaming
-   * after receiving client-side activity. This is NOT a workaround — it's
-   * a diagnostic mechanism to test the hypothesis that Cursor's server
-   * pauses sending streaming frames until the client sends something.
-   *
-   * Hypothesis: Cursor's server flushes its write buffer only in response
-   * to incoming client messages. This PING tests if H2-level activity
-   * (not application-level) is sufficient to trigger a resume.
-   *
-   * @returns {boolean} true if ping was sent successfully
-   */
-  nudgeStream() {
-    if (this.ended || !this.session || this.session.destroyed) {
-      console.log(`[h2-bidi:NUDGE] Cannot nudge — session already ended`);
-      return false;
-    }
-
-    const streamState = this.stream ? {
-      destroyed: this.stream.destroyed,
-      readable: this.stream.readable,
-      readableFlowing: this.stream.readableFlowing,
-      readableLength: this.stream.readableLength,
-    } : 'no stream';
-    console.log(`[h2-bidi:NUDGE] Stream state: ${JSON.stringify(streamState)}`);
-
-    // Force resume in case the stream was auto-paused
-    if (this.stream && !this.stream.destroyed && !this.stream.readableFlowing) {
-      console.warn(`[h2-bidi:NUDGE] ⚠ Stream was NOT flowing! Calling resume()...`);
-      this.stream.resume();
-    }
-
-    // Send an HTTP/2 PING to keep the connection alive and potentially
-    // trigger the server to flush any buffered outgoing data
-    try {
-      this.session.ping((err, duration) => {
-        if (err) {
-          console.error(`[h2-bidi:NUDGE] PING failed: ${err.message}`);
-        } else {
-          console.log(`[h2-bidi:NUDGE] PING response received in ${duration}ms — server is alive`);
-        }
-      });
-      console.log(`[h2-bidi:NUDGE] PING sent to keep H2 session active`);
-      return true;
-    } catch (err) {
-      console.error(`[h2-bidi:NUDGE] Failed to send PING: ${err.message}`);
-      return false;
-    }
-  }
-
-  /**
    * Close the stream and session.
    */
   close() {
-    // Stop all intervals first
-    this._stopWaitHeartbeat();
     if (this._keepAliveInterval) {
       clearInterval(this._keepAliveInterval);
       this._keepAliveInterval = null;
