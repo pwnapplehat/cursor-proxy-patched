@@ -1214,6 +1214,59 @@ function processSingleFrame(magic, data, seenToolCallIds) {
       const gunzipData = magic === 0 ? data : zlib.gunzipSync(data);
       const response = $root.StreamUnifiedChatWithToolsResponse.decode(gunzipData);
 
+      // ── RAW PROTOBUF FIELD AUDIT ──────────────────────────────────
+      // Scan ALL fields in the raw protobuf to detect signals Cursor
+      // sends that our compiled proto definition doesn't cover (e.g.,
+      // finish_reason, done, end_turn). Unknown fields are silently
+      // skipped by protobufjs — this scan catches them.
+      try {
+        const rawFields = pbDecodeFields(gunzipData);
+        const fieldNums = Object.keys(rawFields).map(Number).sort((a, b) => a - b);
+        const knownTopLevel = new Set([2, 3]); // 2=message, 3=summary
+        const unknownFields = fieldNums.filter(f => !knownTopLevel.has(f));
+        if (unknownFields.length > 0) {
+          console.log(`[FRAME-AUDIT] UNKNOWN top-level protobuf fields: [${unknownFields.join(', ')}] — may contain end-of-turn signal`);
+          for (const f of unknownFields) {
+            for (const entry of rawFields[f]) {
+              if (entry.wireType === 0) {
+                console.log(`[FRAME-AUDIT]   field ${f}: varint = ${entry.value}`);
+              } else if (entry.wireType === 2 && Buffer.isBuffer(entry.value)) {
+                const preview = entry.value.toString('utf-8').substring(0, 300);
+                console.log(`[FRAME-AUDIT]   field ${f}: bytes (${entry.value.length}B) = "${preview}"`);
+              } else if (entry.wireType === 1 || entry.wireType === 5) {
+                console.log(`[FRAME-AUDIT]   field ${f}: fixed${entry.wireType === 1 ? '64' : '32'}`);
+              }
+            }
+          }
+        }
+        // Also scan inside the message (field 2) for unknown sub-fields
+        if (rawFields[2]) {
+          for (const entry of rawFields[2]) {
+            if (entry.wireType === 2 && Buffer.isBuffer(entry.value)) {
+              try {
+                const msgFields = pbDecodeFields(entry.value);
+                const msgFieldNums = Object.keys(msgFields).map(Number).sort((a, b) => a - b);
+                const knownMsg = new Set([1, 2, 3, 4, 5, 8, 9, 10, 11, 12, 36]); // content, thinking, webtool, etc.
+                const unknownMsg = msgFieldNums.filter(f => !knownMsg.has(f));
+                if (unknownMsg.length > 0) {
+                  console.log(`[FRAME-AUDIT] UNKNOWN message sub-fields: [${unknownMsg.join(', ')}]`);
+                  for (const mf of unknownMsg) {
+                    for (const me of msgFields[mf]) {
+                      if (me.wireType === 0) {
+                        console.log(`[FRAME-AUDIT]   message.field_${mf}: varint = ${me.value}`);
+                      } else if (me.wireType === 2 && Buffer.isBuffer(me.value)) {
+                        const mPreview = me.value.toString('utf-8').substring(0, 200);
+                        console.log(`[FRAME-AUDIT]   message.field_${mf}: bytes (${me.value.length}B) = "${mPreview}"`);
+                      }
+                    }
+                  }
+                }
+              } catch (_) { /* inner parse fail — ok */ }
+            }
+          }
+        }
+      } catch (_) { /* raw scan fail — non-fatal */ }
+
       const thinking = response?.message?.thinking?.content;
       if (thinking !== undefined) result.thinking = thinking;
 
@@ -1270,6 +1323,15 @@ function processSingleFrame(magic, data, seenToolCallIds) {
   } catch (err) {
     console.warn(`[processSingleFrame] Frame error (magic=${magic}): ${err.code || err.message}`);
   }
+
+  // Frame summary — shows exactly what each frame contains
+  const parts = [];
+  if (result.text) parts.push(`text=${result.text.length}ch`);
+  if (result.thinking) parts.push(`thinking=${result.thinking.length}ch`);
+  if (result.nativeToolCalls.length > 0) parts.push(`toolCalls=${result.nativeToolCalls.length}`);
+  if (result.error) parts.push(`error=${result.error.type}`);
+  if (parts.length === 0) parts.push('empty');
+  console.log(`[FRAME] magic=${magic} size=${data.length}B → ${parts.join(' | ')}`);
 
   return result;
 }

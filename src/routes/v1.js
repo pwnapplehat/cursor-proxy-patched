@@ -312,6 +312,12 @@ async function streamBidiResponse(bidiState, res, model, responseId, hasTools, t
       turnTimer = setTimeout(() => {
         if (toolCallsEmitted) return; // Already finalized
 
+        // DEBUG: Log exactly what the turn timer sees when it fires
+        console.log(`[TURN-TIMER] Fired after ${overrideMs || TURN_INACTIVITY_MS}ms silence — ` +
+          `toolCalls=${nativeToolCalls.length} pendingStreaming=${toolCallAccumulator.hasPending()} ` +
+          `textLen=${allTextAccumulated.length} thinkingLen=${allThinking.length} ` +
+          `action=${nativeToolCalls.length > 0 ? 'FINALIZE' : toolCallAccumulator.hasPending() ? 'STALL-CHECK' : 'NO-OP'}`);
+
         // Try to flush streaming calls with complete JSON (e.g., web_search)
         if (toolCallAccumulator.hasPending()) {
           const completeFlushed = toolCallAccumulator.flushIfComplete();
