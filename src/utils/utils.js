@@ -1207,47 +1207,89 @@ class IncrementalFrameParser {
  * @returns {{ text: string, thinking: string, nativeToolCalls: Array }}
  */
 function processSingleFrame(magic, data, seenToolCallIds) {
-  const result = { text: '', thinking: '', nativeToolCalls: [], error: null };
+  const result = { text: '', thinking: '', nativeToolCalls: [], error: null, endOfTurn: false };
 
   try {
     if (magic === 0 || magic === 1) {
       const gunzipData = magic === 0 ? data : zlib.gunzipSync(data);
       const response = $root.StreamUnifiedChatWithToolsResponse.decode(gunzipData);
 
-      // ── RAW PROTOBUF FIELD AUDIT ──────────────────────────────────
-      // Scan ALL fields in the raw protobuf to detect signals Cursor
-      // sends that our compiled proto definition doesn't cover (e.g.,
-      // finish_reason, done, end_turn). Unknown fields are silently
-      // skipped by protobufjs — this scan catches them.
+      // ── END-OF-TURN SIGNAL DETECTION + RAW FIELD AUDIT ────────────
+      // Cursor's native client detects end-of-turn via explicit boolean
+      // fields inside the StreamUnifiedChatResponse (field 2 of outer):
+      //   field 14: should_break_ai_message  (primary end-of-turn)
+      //   field 26: stop_using_dsv3_agentic_model (secondary end-of-turn)
+      //   field 32: parallel_tool_calls_complete
+      // Source: cursor_api_demo, cursor-interceptor-source, cursor-rpc
+      // Our compiled protobufjs definition doesn't include these fields,
+      // so we scan raw bytes with pbDecodeFields to detect them.
       try {
         const rawFields = pbDecodeFields(gunzipData);
         const fieldNums = Object.keys(rawFields).map(Number).sort((a, b) => a - b);
-        const knownTopLevel = new Set([2, 3]); // 2=message, 3=summary
-        const unknownFields = fieldNums.filter(f => !knownTopLevel.has(f));
-        if (unknownFields.length > 0) {
-          console.log(`[FRAME-AUDIT] UNKNOWN top-level protobuf fields: [${unknownFields.join(', ')}] — may contain end-of-turn signal`);
-          for (const f of unknownFields) {
+
+        // Known top-level fields in StreamUnifiedChatWithToolsResponse:
+        // 1=client_side_tool_v2_call, 2=stream_unified_chat_response,
+        // 3=conversation_summary, 4=user_rules, 5=stream_start,
+        // 6=tracing_context, 7=event_id
+        const knownTopLevel = new Set([1, 2, 3, 4, 5, 6, 7]);
+        const unknownTopFields = fieldNums.filter(f => !knownTopLevel.has(f));
+        if (unknownTopFields.length > 0) {
+          console.log(`[FRAME-AUDIT] UNKNOWN top-level protobuf fields: [${unknownTopFields.join(', ')}]`);
+          for (const f of unknownTopFields) {
             for (const entry of rawFields[f]) {
               if (entry.wireType === 0) {
                 console.log(`[FRAME-AUDIT]   field ${f}: varint = ${entry.value}`);
               } else if (entry.wireType === 2 && Buffer.isBuffer(entry.value)) {
                 const preview = entry.value.toString('utf-8').substring(0, 300);
                 console.log(`[FRAME-AUDIT]   field ${f}: bytes (${entry.value.length}B) = "${preview}"`);
-              } else if (entry.wireType === 1 || entry.wireType === 5) {
-                console.log(`[FRAME-AUDIT]   field ${f}: fixed${entry.wireType === 1 ? '64' : '32'}`);
               }
             }
           }
         }
-        // Also scan inside the message (field 2) for unknown sub-fields
+
+        // Scan inside the message sub-message (field 2) for end-of-turn signals
         if (rawFields[2]) {
           for (const entry of rawFields[2]) {
             if (entry.wireType === 2 && Buffer.isBuffer(entry.value)) {
               try {
                 const msgFields = pbDecodeFields(entry.value);
+
+                // ── Detect end-of-turn signals ──
+                const shouldBreak = pbGetInt(msgFields, 14);
+                const stopDsv3 = pbGetInt(msgFields, 26);
+                const parallelDone = pbGetInt(msgFields, 32);
+
+                if (shouldBreak) {
+                  result.endOfTurn = true;
+                  console.log(`[END-OF-TURN] should_break_ai_message = ${shouldBreak} — Cursor signals turn complete`);
+                }
+                if (stopDsv3) {
+                  result.endOfTurn = true;
+                  console.log(`[END-OF-TURN] stop_using_dsv3_agentic_model = ${stopDsv3} — Cursor signals turn complete`);
+                }
+                if (parallelDone) {
+                  console.log(`[END-OF-TURN] parallel_tool_calls_complete = ${parallelDone}`);
+                }
+
+                // Audit: log truly unknown sub-fields (38+) for future discovery
+                // Fields 1-37 are all documented in reverse-engineered schemas:
+                // 1=content, 2=debug_prompt, 3=token_count, 4=doc_citation,
+                // 5=filled_prompt, 6=is_big_file, 7=intermediate_text,
+                // 8=chunk_identity, 9=docs_reference, 10=is_using_slow_request,
+                // 11=web_citation, 12=status_updates, 13=tool_call_legacy,
+                // 14=should_break_ai_message, 15=partial_tool_call,
+                // 16=final_tool_result, 17=symbol_link, 18=conversation_summary,
+                // 19=file_link, 20=service_status_update, 21=viewable_git_context,
+                // 22=server_bubble_id, 23=context_piece_update, 24=used_code,
+                // 25=thinking, 26=stop_using_dsv3_agentic_model, 27=usage_uuid,
+                // 28=conversation_summary_starter, 29=subagent_return,
+                // 30=context_window_status, 31=image_description,
+                // 32=parallel_tool_calls_complete, 33=ai_web_search_results,
+                // 34=stars_feedback_request, 35=model_provider_request_json,
+                // 36=tool_call_v2, 37=thinking_style
+                const knownMsgFields = new Set(Array.from({ length: 37 }, (_, i) => i + 1));
                 const msgFieldNums = Object.keys(msgFields).map(Number).sort((a, b) => a - b);
-                const knownMsg = new Set([1, 2, 3, 4, 5, 8, 9, 10, 11, 12, 36]); // content, thinking, webtool, etc.
-                const unknownMsg = msgFieldNums.filter(f => !knownMsg.has(f));
+                const unknownMsg = msgFieldNums.filter(f => !knownMsgFields.has(f));
                 if (unknownMsg.length > 0) {
                   console.log(`[FRAME-AUDIT] UNKNOWN message sub-fields: [${unknownMsg.join(', ')}]`);
                   for (const mf of unknownMsg) {
@@ -1255,8 +1297,8 @@ function processSingleFrame(magic, data, seenToolCallIds) {
                       if (me.wireType === 0) {
                         console.log(`[FRAME-AUDIT]   message.field_${mf}: varint = ${me.value}`);
                       } else if (me.wireType === 2 && Buffer.isBuffer(me.value)) {
-                        const mPreview = me.value.toString('utf-8').substring(0, 200);
-                        console.log(`[FRAME-AUDIT]   message.field_${mf}: bytes (${me.value.length}B) = "${mPreview}"`);
+                        const preview = me.value.toString('utf-8').substring(0, 200);
+                        console.log(`[FRAME-AUDIT]   message.field_${mf}: bytes (${me.value.length}B) = "${preview}"`);
                       }
                     }
                   }
@@ -1330,6 +1372,7 @@ function processSingleFrame(magic, data, seenToolCallIds) {
   if (result.thinking) parts.push(`thinking=${result.thinking.length}ch`);
   if (result.nativeToolCalls.length > 0) parts.push(`toolCalls=${result.nativeToolCalls.length}`);
   if (result.error) parts.push(`error=${result.error.type}`);
+  if (result.endOfTurn) parts.push('★END-OF-TURN');
   if (parts.length === 0) parts.push('empty');
   console.log(`[FRAME] magic=${magic} size=${data.length}B → ${parts.join(' | ')}`);
 
