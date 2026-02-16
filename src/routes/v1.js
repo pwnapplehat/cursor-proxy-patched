@@ -389,6 +389,11 @@ async function streamBidiResponse(bidiState, res, model, responseId, hasTools, t
     }
 
     function onFrame({ magic, data }) {
+      // Guard: skip frames that arrive after finalize (e.g., during buffer
+      // flush when endOfTurn triggered finalize mid-loop). Prevents leaked
+      // timers and processing content after the response is already sent.
+      if (finalized) return;
+
       // NOTE: resetTurnTimer() is called at the END of onFrame (not here)
       // with smart timeout selection — see bottom of this function.
       resetSafetyTimeout(); // Keep safety timeout alive while data is flowing
@@ -653,6 +658,7 @@ async function streamBidiResponse(bidiState, res, model, responseId, hasTools, t
     }
 
     function onEnd() {
+      console.log(`[h2-bidi] Stream ended — finalizing (toolCalls=${nativeToolCalls.length} textLen=${allTextAccumulated.length} finalized=${finalized})`);
       finalize();
     }
 
@@ -688,10 +694,16 @@ async function streamBidiResponse(bidiState, res, model, responseId, hasTools, t
     // might call finalize, including buffered frame processing below).
     const originalFinalize = finalize;
     let finalized = false;
+    let finalizeTimestamp = 0;
     // eslint-disable-next-line no-func-assign
     finalize = function() {
-      if (finalized) return;
+      if (finalized) {
+        console.log(`[h2-bidi] finalize() called again (already finalized ${Date.now() - finalizeTimestamp}ms ago) — skipped`);
+        return;
+      }
       finalized = true;
+      finalizeTimestamp = Date.now();
+      console.log(`[h2-bidi] ▸ FINALIZE executing — toolCalls=${nativeToolCalls.length} textLen=${allTextAccumulated.length} thinkingLen=${allThinking.length}`);
       clearTimeout(safetyTimeout);
       if (turnTimer) clearTimeout(turnTimer);
       originalFinalize();
