@@ -1081,6 +1081,7 @@ router.post('/chat/completions', async (req, res) => {
       let allTextAccumulated = '';
       let allThinking = '';
       let firstChunkSent = false;
+      let cursorApiError = null;
 
       /** Send a text content SSE chunk to OpenClaw */
       function sendTextChunk(text) {
@@ -1108,7 +1109,7 @@ router.post('/chat/completions', async (req, res) => {
             const frames = frameParser.addChunk(Buffer.from(chunk));
 
             for (const frame of frames) {
-              const { text, thinking, nativeToolCalls: frameTCs, endOfTurn, parallelToolCallsComplete } =
+              const { text, thinking, nativeToolCalls: frameTCs, error: frameError, endOfTurn, parallelToolCallsComplete } =
                 processSingleFrame(frame.magic, frame.data, seenToolCallIds);
 
               if (endOfTurn) {
@@ -1116,6 +1117,13 @@ router.post('/chat/completions', async (req, res) => {
               }
               if (parallelToolCallsComplete) {
                 console.log(`[fetch] ★ ALL-TOOL-CALLS-SENT signal in fetch path`);
+              }
+
+              // Capture Cursor API errors (e.g., ERROR_CONVERSATION_TOO_LONG)
+              // so we can send them as OpenAI-format errors for OpenClaw compaction.
+              if (frameError && !cursorApiError) {
+                cursorApiError = frameError;
+                console.warn(`[fetch:onFrame] Captured Cursor API error: type=${frameError.type} code=${frameError.code}`);
               }
 
               // Feed tool calls through the streaming accumulator.
@@ -1294,6 +1302,16 @@ router.post('/chat/completions', async (req, res) => {
             model: model,
             choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }]
           })}\n\n`);
+        } else if (cursorApiError && cursorApiError.type === 'context_overflow') {
+          // Context overflow — send OpenAI-format error so OpenClaw triggers compaction
+          console.error(`[fetch] CONTEXT OVERFLOW detected — sending OpenAI-format error to trigger compaction`);
+          res.write(`data: ${JSON.stringify({
+            error: {
+              message: cursorApiError.message,
+              type: 'invalid_request_error',
+              code: cursorApiError.code,
+            }
+          })}\n\n`);
         } else {
           // No tool calls — send stop
           if (hasTools) {
@@ -1347,7 +1365,20 @@ router.post('/chat/completions', async (req, res) => {
           throw new Error('No data received from Cursor API (non-stream)');
         }
         const fullBufferNS = Buffer.concat(rawChunksNS);
-        const { thinking: thinkNS, text: textNS } = chunkToUtf8String(fullBufferNS);
+        const { thinking: thinkNS, text: textNS, error: nsError } = chunkToUtf8String(fullBufferNS);
+
+        // Handle Cursor API errors (e.g., context overflow) — send proper error
+        // response so OpenClaw can trigger compaction/summarization
+        if (nsError && nsError.type === 'context_overflow') {
+          console.error(`[non-stream] CONTEXT OVERFLOW detected — returning error to trigger compaction`);
+          return res.status(400).json({
+            error: {
+              message: nsError.message,
+              type: 'invalid_request_error',
+              code: nsError.code,
+            }
+          });
+        }
 
         let content = '';
         if (thinkNS) {

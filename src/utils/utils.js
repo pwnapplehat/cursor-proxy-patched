@@ -979,6 +979,7 @@ function convertNativeToolCall(tc) {
 function chunkToUtf8String(chunk) {
   const thinkingOutput = [];
   const textOutput = [];
+  let detectedError = null;
   const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
   // Cross-frame deduplication: a tool call may appear in multiple protobuf
   // frames (e.g. repeated in a follow-up confirmation frame). Track by ID.
@@ -1075,6 +1076,12 @@ function chunkToUtf8String(chunk) {
           const message = JSON.parse(utf8);
           if (message != null && (typeof message !== 'object' || (Array.isArray(message) ? message.length > 0 : Object.keys(message).length > 0))) {
             console.error(utf8);
+            // Detect Cursor API errors (context overflow, etc.) and propagate them
+            const cursorError = detectCursorApiError(message);
+            if (cursorError) {
+              detectedError = cursorError;
+              console.warn(`[chunkToUtf8String] Detected Cursor API error: ${cursorError.type} — "${cursorError.message}"`);
+            }
           }
         } catch (_) {
           // Non-JSON metadata, ignore
@@ -1113,7 +1120,8 @@ function chunkToUtf8String(chunk) {
 
   return {
     thinking: thinkingOutput.join(''), 
-    text: textOutput.join('') 
+    text: textOutput.join(''),
+    error: detectedError,
   };
 }
 
