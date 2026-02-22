@@ -337,7 +337,8 @@ docker exec openclaw bash -c 'cat > /home/node/.openclaw/openclaw.json << '\''OC
       "mode": "token"
     },
     "controlUi": {
-      "allowInsecureAuth": true
+      "allowInsecureAuth": true,
+      "dangerouslyDisableDeviceAuth": true
     }
   },
   "plugins": {
