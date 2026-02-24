@@ -400,7 +400,7 @@ When the cookie expires (proxy shows 401 errors):
 
 ## How the __oc Tool Gateway Works
 
-The Cursor model only has native protobuf tools: `run_terminal_cmd`, `read_file`, `grep`, `list_dir`, `web_search`. These map 1:1 to OpenClaw's `exec`, `read`, `write`, `edit`, `web_search`.
+The Cursor model has native protobuf tools: `run_terminal_cmd`, `read_file`, `write`/`edit_file`, `search_replace`, `delete_file`, `list_dir`, `ripgrep_search`, `web_search`, and others (14+ total). The proxy maps these to OpenClaw equivalents — `run_terminal_cmd` → `exec`, `read_file` → `read`, `write`/`edit_file` → `write` or `edit` (based on args), `search_replace` → `edit`, `web_search` → `web_search`. Search, directory, and delete tools (`ripgrep_search`, `list_dir`, `delete_file`, etc.) are converted to `exec` shell commands.
 
 But OpenClaw has many more tools with **no native Cursor equivalent**: `sessions_spawn`, `memory_search`, `cron`, `tts`, `image`, `browser`, `message`, `agents_list`, etc.
 
