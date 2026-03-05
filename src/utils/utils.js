@@ -65,6 +65,7 @@ function generateCursorBody(messages, modelName, tools, toolChoice) {
       model: {
         name: modelName,
         empty: '',
+        enableSlowPool: false,
       },
       webTool: "",
       unknown13: 1,

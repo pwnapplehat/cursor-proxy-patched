@@ -1558,11 +1558,6 @@ $root.StreamUnifiedChatWithToolsRequest = (function() {
                 writer.uint32(/* id 27, wireType 0 =*/216).int32(message.unknown27);
             if (message.unknown29 != null && Object.hasOwnProperty.call(message, "unknown29"))
                 writer.uint32(/* id 29, wireType 2 =*/234).string(message.unknown29);
-            // supported_tools: repeated int32 enum at field 29 (wire type 0 = varint)
-            // This encodes ClientSideToolV2 enum values to enable Agent mode tools
-            if (message.supportedTools != null && message.supportedTools.length)
-                for (var i = 0; i < message.supportedTools.length; ++i)
-                    writer.uint32(/* id 29, wireType 0 =*/232).int32(message.supportedTools[i]);
             if (message.messageIds != null && message.messageIds.length)
                 for (var i = 0; i < message.messageIds.length; ++i)
                     $root.StreamUnifiedChatWithToolsRequest.Request.MessageId.encode(message.messageIds[i], writer.uint32(/* id 30, wireType 2 =*/242).fork()).ldelim();
@@ -3171,6 +3166,7 @@ $root.StreamUnifiedChatWithToolsRequest = (function() {
              * @interface IModel
              * @property {string|null} [name] Model name
              * @property {Uint8Array|null} [empty] Model empty
+             * @property {boolean|null} [enableSlowPool] Model enableSlowPool
              */
 
             /**
@@ -3205,6 +3201,14 @@ $root.StreamUnifiedChatWithToolsRequest = (function() {
             Model.prototype.empty = $util.newBuffer([]);
 
             /**
+             * Model enableSlowPool.
+             * @member {boolean} enableSlowPool
+             * @memberof StreamUnifiedChatWithToolsRequest.Request.Model
+             * @instance
+             */
+            Model.prototype.enableSlowPool = false;
+
+            /**
              * Creates a new Model instance using the specified properties.
              * @function create
              * @memberof StreamUnifiedChatWithToolsRequest.Request.Model
@@ -3232,6 +3236,8 @@ $root.StreamUnifiedChatWithToolsRequest = (function() {
                     writer.uint32(/* id 1, wireType 2 =*/10).string(message.name);
                 if (message.empty != null && Object.hasOwnProperty.call(message, "empty"))
                     writer.uint32(/* id 4, wireType 2 =*/34).bytes(message.empty);
+                if (message.enableSlowPool != null && Object.hasOwnProperty.call(message, "enableSlowPool"))
+                    writer.uint32(/* id 5, wireType 0 =*/40).bool(message.enableSlowPool);
                 return writer;
             };
 
@@ -3272,6 +3278,10 @@ $root.StreamUnifiedChatWithToolsRequest = (function() {
                         }
                     case 4: {
                             message.empty = reader.bytes();
+                            break;
+                        }
+                    case 5: {
+                            message.enableSlowPool = reader.bool();
                             break;
                         }
                     default:
@@ -3315,6 +3325,9 @@ $root.StreamUnifiedChatWithToolsRequest = (function() {
                 if (message.empty != null && message.hasOwnProperty("empty"))
                     if (!(message.empty && typeof message.empty.length === "number" || $util.isString(message.empty)))
                         return "empty: buffer expected";
+                if (message.enableSlowPool != null && message.hasOwnProperty("enableSlowPool"))
+                    if (typeof message.enableSlowPool !== "boolean")
+                        return "enableSlowPool: boolean expected";
                 return null;
             };
 
@@ -3337,6 +3350,8 @@ $root.StreamUnifiedChatWithToolsRequest = (function() {
                         $util.base64.decode(object.empty, message.empty = $util.newBuffer($util.base64.length(object.empty)), 0);
                     else if (object.empty.length >= 0)
                         message.empty = object.empty;
+                if (object.enableSlowPool != null)
+                    message.enableSlowPool = Boolean(object.enableSlowPool);
                 return message;
             };
 
@@ -3362,11 +3377,14 @@ $root.StreamUnifiedChatWithToolsRequest = (function() {
                         if (options.bytes !== Array)
                             object.empty = $util.newBuffer(object.empty);
                     }
+                    object.enableSlowPool = false;
                 }
                 if (message.name != null && message.hasOwnProperty("name"))
                     object.name = message.name;
                 if (message.empty != null && message.hasOwnProperty("empty"))
                     object.empty = options.bytes === String ? $util.base64.encode(message.empty, 0, message.empty.length) : options.bytes === Array ? Array.prototype.slice.call(message.empty) : message.empty;
+                if (message.enableSlowPool != null && message.hasOwnProperty("enableSlowPool"))
+                    object.enableSlowPool = message.enableSlowPool;
                 return object;
             };
 
