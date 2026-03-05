@@ -48,7 +48,6 @@ message StreamUnifiedChatWithToolsRequest {
     message Model {
       string name = 1;
       bytes empty = 4;
-      bool enable_slow_pool = 5;
     }
     message CursorSetting {
       message Unknown6 {
