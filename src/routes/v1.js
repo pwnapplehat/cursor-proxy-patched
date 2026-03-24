@@ -280,7 +280,7 @@ async function streamBidiResponse(bidiState, res, model, responseId, hasTools, t
     let stallCheckCount = 0;
     let provisionalAckSent = false;
     let textPhaseComplete = false;
-    const TURN_INACTIVITY_MS = 800;
+    const TURN_INACTIVITY_MS = 3000;
     // OPTIMIZATION (2026-02-14): Reduced from 250ms to 80ms.
     // This is the delay before finalizing non-streaming tool calls (read_file,
     // run_terminal_cmd, ripgrep, etc. — the vast majority of calls).
