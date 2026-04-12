@@ -184,6 +184,8 @@ async function streamBidiResponse(bidiState, res, model, responseId, hasTools, t
     const nativeToolCalls = [];
     let allTextAccumulated = '';
     let allThinking = '';
+    let thinkingStart = "<thinking>";
+    let thinkingEnd = "</thinking>";
     let firstChunkSent = false;
     let toolCallsEmitted = false;
     let cursorApiError = null; // Cursor API error detected from ConnectRPC error frames
@@ -438,19 +440,33 @@ async function streamBidiResponse(bidiState, res, model, responseId, hasTools, t
         }
       }
 
-      if (thinking) allThinking += thinking;
+      let frameContent = "";
+
+      if (thinkingStart !== "" && thinking && thinking.length > 0) {
+        frameContent += thinkingStart + "\n";
+        thinkingStart = "";
+      }
+
+      if (thinking) {
+        allThinking += thinking;
+        frameContent += thinking;
+      }
+
+      if (thinkingEnd !== "" && text && text.length !== 0 && thinkingStart === "") {
+        frameContent += "\n" + thinkingEnd + "\n";
+        thinkingEnd = "";
+      }
 
       if (text) {
         allTextAccumulated += text;
         const safeText = toolCallDetector.addText(text);
         if (safeText) {
-          if (allThinking && !firstChunkSent) {
-            sendTextChunk('<thinking> ' + allThinking + ' </thinking> ' + safeText);
-            allThinking = '';
-          } else {
-            sendTextChunk(safeText);
-          }
+          frameContent += safeText;
         }
+      }
+
+      if (frameContent) {
+        sendTextChunk(frameContent);
       }
 
       // ── SIGNAL: should_break_ai_message (field 14) ─────────────────
@@ -503,10 +519,14 @@ async function streamBidiResponse(bidiState, res, model, responseId, hasTools, t
 
       const { remainingText, toolCallBlocks } = toolCallDetector.finish();
 
-      if (allThinking && !firstChunkSent) {
-        sendTextChunk('<thinking> ' + allThinking + ' </thinking> ');
+      let finalContent = "";
+      if (thinkingEnd !== "" && thinkingStart === "") {
+        finalContent += "\n" + thinkingEnd + "\n";
+        thinkingEnd = "";
       }
-      if (remainingText) sendTextChunk(remainingText);
+      if (remainingText) finalContent += remainingText;
+
+      if (finalContent) sendTextChunk(finalContent);
 
       // Flush any streaming tool calls that were still accumulating when the
       // stream ended. These are incomplete but we process them best-effort.
@@ -1080,6 +1100,8 @@ router.post('/chat/completions', async (req, res) => {
       const seenToolCallIds = new Set();
       let allTextAccumulated = '';
       let allThinking = '';
+      let thinkingStart = "<thinking>";
+      let thinkingEnd = "</thinking>";
       let firstChunkSent = false;
       let cursorApiError = null;
 
@@ -1162,24 +1184,33 @@ router.post('/chat/completions', async (req, res) => {
                 }
               }
 
-              // Accumulate thinking content
-              if (thinking) allThinking += thinking;
+              let frameContent = "";
 
-              // Stream text content in real-time with <tool_call> tag detection.
-              // Safe text (not part of a tool call) is sent immediately.
-              // Tool call blocks are held back by the detector and parsed at the end.
+              if (thinkingStart !== "" && thinking && thinking.length > 0) {
+                frameContent += thinkingStart + "\n";
+                thinkingStart = "";
+              }
+
+              if (thinking) {
+                allThinking += thinking;
+                frameContent += thinking;
+              }
+
+              if (thinkingEnd !== "" && text && text.length !== 0 && thinkingStart === "") {
+                frameContent += "\n" + thinkingEnd + "\n";
+                thinkingEnd = "";
+              }
+
               if (text) {
                 allTextAccumulated += text;
                 const safeText = toolCallDetector.addText(text);
                 if (safeText) {
-                  // Prepend thinking on the very first text chunk if present
-                  if (allThinking && !firstChunkSent) {
-                    sendTextChunk('<thinking> ' + allThinking + ' </thinking> ' + safeText);
-                    allThinking = '';
-                  } else {
-                    sendTextChunk(safeText);
-                  }
+                  frameContent += safeText;
                 }
+              }
+
+              if (frameContent) {
+                sendTextChunk(frameContent);
               }
             }
             if (signalFinalize) break;
@@ -1208,15 +1239,14 @@ router.post('/chat/completions', async (req, res) => {
           if (mapped) nativeToolCalls.push(mapped);
         }
 
-        // Send any unsent thinking content
-        if (allThinking && !firstChunkSent) {
-          sendTextChunk('<thinking> ' + allThinking + ' </thinking> ');
+        let finalContent = "";
+        if (thinkingEnd !== "" && thinkingStart === "") {
+          finalContent += "\n" + thinkingEnd + "\n";
+          thinkingEnd = "";
         }
+        if (remainingText) finalContent += remainingText;
 
-        // Flush remaining clean text held back by the tag detector
-        if (remainingText) {
-          sendTextChunk(remainingText);
-        }
+        if (finalContent) sendTextChunk(finalContent);
 
         // Log response summary
         console.log(`[streaming] Response: ${allTextAccumulated.length} chars, preview: ${allTextAccumulated.substring(0, 500).replace(/\n/g, '\\n')}`);
@@ -1390,8 +1420,8 @@ router.post('/chat/completions', async (req, res) => {
         }
 
         let content = '';
-        if (thinkNS) {
-          content += '<thinking> ' + thinkNS + ' </thinking> ';
+        if (thinkNS && thinkNS.length > 0) {
+          content += '<thinking>\n' + thinkNS + '\n</thinking>\n';
         }
         content += textNS;
 
