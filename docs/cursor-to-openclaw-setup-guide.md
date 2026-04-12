@@ -333,6 +333,139 @@ Proxy logs should show:
 
 ---
 
+## Agent-Watchdog: Continuous Operation Without Human Intervention
+
+By default, OpenClaw agents may pause and wait for user confirmation when tasks require multiple steps or when they encounter errors. For autonomous 24/7 operation, you can set up an **agent-watchdog** cron job that automatically sends "Continue" prompts to idle agents.
+
+### How It Works
+
+The watchdog runs as a dedicated OpenClaw agent session on a schedule (e.g., every 2 minutes). It:
+
+1. Lists all active agent sessions
+2. Checks each session's last activity timestamp
+3. Sends a simple prompt to any session idle for more than 5 minutes: *"If you think you got stopped mid-way, then please continue your work. Ignore this if you already finished."*
+4. Each agent evaluates its own context and decides whether to continue or ignore the prompt
+
+This enables truly autonomous operation where agents can work through multi-step tasks and recover from errors, while respecting task completion - each agent knows its own state best.
+
+### Setup Instructions
+
+**Step 1: Create the watchdog cron job**
+
+```bash
+docker exec openclaw npx openclaw cron add \
+  --name "agent-watchdog" \
+  --every 2m \
+  --session session:watchdog \
+  --message "Check all active agent sessions using sessions_list. For any session that has been idle for more than 5 minutes, send this message using sessions_send: 'If you think you got stopped mid-way, then please continue your work. Ignore this if you already finished.'"
+```
+
+**Step 2: Verify the cron job**
+
+```bash
+docker exec openclaw npx openclaw cron list
+```
+
+You should see output like:
+
+```
+ID                                   Name            Schedule  Next  Last  Status  Target              Agent ID  Model
+72fab1b6-f055-40ca-bba7-4efbe3106524 agent-watchdog  every 2m  in 2m -     idle    session:watchdog    main      -
+```
+
+### Customization
+
+**Change the check interval:**
+
+The `--every` flag accepts various formats:
+- `--every 2m` — every 2 minutes
+- `--every 5m` — every 5 minutes
+- `--every 1h` — every hour
+- `--every 30s` — every 30 seconds (not recommended, too frequent)
+
+**Change the idle timeout threshold:**
+
+Edit the message to use a different threshold:
+- "...idle for more than 3 minutes..." — more aggressive
+- "...idle for more than 10 minutes..." — more conservative
+
+**Customize the continuation message:**
+
+Change the prompt text sent to idle sessions:
+- "If stuck mid-task, please continue. Otherwise ignore."
+- "Check your task status. Continue if incomplete, ignore if done."
+
+**Target a specific agent:**
+
+Change `--agent main` to target a different agent (e.g., `--agent research`, `--agent dev`)
+
+### Management Commands
+
+**List all cron jobs:**
+
+```bash
+docker exec openclaw npx openclaw cron list
+```
+
+**View cron job details:**
+
+```bash
+docker exec openclaw npx openclaw cron show <cron-id>
+```
+
+**Delete the watchdog:**
+
+```bash
+docker exec openclaw npx openclaw cron remove <cron-id>
+```
+
+**Pause/resume the watchdog:**
+
+```bash
+docker exec openclaw npx openclaw cron pause <cron-id>
+docker exec openclaw npx openclaw cron resume <cron-id>
+```
+
+### Monitoring
+
+Watch the watchdog's actions in real-time:
+
+```bash
+docker logs openclaw -f | grep "agent-watchdog"
+```
+
+You'll see log entries when:
+- The watchdog checks sessions
+- It detects an idle session
+- It sends a continuation prompt
+- The target agent resumes work
+
+### Important Notes
+
+1. **Dedicated persistent session** — The `--session session:watchdog` flag creates a dedicated persistent session that doesn't block your main agent while maintaining access to all session management tools (`sessions_list`, `sessions_status`, `sessions_send`)
+2. **Self-evaluation** — Each agent evaluates its own context to decide if it needs to continue, avoiding false positives where the watchdog might misinterpret completion state
+3. **Context preservation** — The persistent session remembers what it's checked across runs, making it more efficient
+4. **Non-intrusive** — Watchdog activity happens in the background without cluttering your main chat history
+5. **Resource usage** — The watchdog makes API calls on its schedule; frequent checks (e.g., every 30s) can consume more tokens
+6. **Agent timeout** — Make sure your OpenClaw agent timeout is set high enough (see Agent Timeout Configuration section); default is 10 minutes (600s), recommended is 86400s (24h) for long-running tasks
+7. **Cursor rate limits** — Heavy watchdog activity combined with active agent sessions can contribute to Cursor API rate limits
+8. **Cost consideration** — Each watchdog execution is a separate LLM API call; balance frequency vs cost based on your needs
+
+### Use Cases
+
+**Perfect for:**
+- Long-running research tasks that require multiple tool calls
+- Agents that need to retry operations after transient failures
+- Complex multi-step workflows (e.g., APK analysis, codebase exploration, data processing)
+- Unattended automation where you want the agent to complete tasks overnight
+
+**Not needed for:**
+- Simple, single-message Q&A interactions
+- Tasks you're actively monitoring and can manually continue
+- Very short tasks that complete in one turn
+
+---
+
 ## Available Models
 
 | Model ID | Description |
@@ -922,11 +1055,12 @@ ls -lh /tmp/snapchat.apk && docker cp /tmp/snapchat.apk openclaw:/home/node/.ope
 5. **Context management** — long sessions are automatically managed via three layers (pruning, compaction, history limit); see Context Management section for setup and the required container patch
 6. **Sub-agent scope** — sub-agents spawned via `sessions_spawn` cannot spawn their own sub-agents (one level deep)
 7. **Agent timeout** — OpenClaw default is 10 minutes (600s); increase to 86400 (24h) for long-running tasks (see Agent Timeout Configuration)
-8. **File transfer** — `scp`/`sftp` may fail on some droplets; use the Python HTTP server method (see Transferring Files section)
-9. **OOM kills on low-RAM droplets** — memory-intensive tasks (Jadx, Ghidra, baksmali) can trigger Linux OOM killer on VMs with less than 8GB RAM; add swap space to mitigate (see Add Swap Space under Troubleshooting)
-10. **Stale session locks** — OOM kills or crashes can leave `.lock` files blocking sessions; manual cleanup required (see Stale Session Lock Fix under Troubleshooting)
-11. **ripgrep not pre-installed** — the OpenClaw container does not include `ripgrep` by default; must be installed manually as root, and does not persist across container rebuilds (see Install ripgrep under Troubleshooting)
+8. **Agent continuity** — by default, agents pause for user confirmation on multi-step tasks; use the agent-watchdog cron job for autonomous 24/7 operation (see Agent-Watchdog section)
+9. **File transfer** — `scp`/`sftp` may fail on some droplets; use the Python HTTP server method (see Transferring Files section)
+10. **OOM kills on low-RAM droplets** — memory-intensive tasks (Jadx, Ghidra, baksmali) can trigger Linux OOM killer on VMs with less than 8GB RAM; add swap space to mitigate (see Add Swap Space under Troubleshooting)
+11. **Stale session locks** — OOM kills or crashes can leave `.lock` files blocking sessions; manual cleanup required (see Stale Session Lock Fix under Troubleshooting)
+12. **ripgrep not pre-installed** — the OpenClaw container does not include `ripgrep` by default; must be installed manually as root, and does not persist across container rebuilds (see Install ripgrep under Troubleshooting)
 
 ---
 
-*Last updated: February 14, 2026 (added context management system, proxy error translation, swap space setup, stale session lock fix, ripgrep installation guide). Patched repo: [github.com/pwnapplehat/cursor-proxy-patched](https://github.com/pwnapplehat/cursor-proxy-patched).*
+*Last updated: February 28, 2026 (added agent-watchdog cron job for continuous autonomous operation). Patched repo: [github.com/pwnapplehat/cursor-proxy-patched](https://github.com/pwnapplehat/cursor-proxy-patched).*

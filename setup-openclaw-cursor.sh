@@ -124,11 +124,30 @@ echo -n "Telegram user ID for owner access (cron, gateway tools)? Get it via /wh
 read -r TELEGRAM_OWNER_ID
 TELEGRAM_OWNER_ID=$(echo "$TELEGRAM_OWNER_ID" | tr -cd '0-9')
 
+# Optional: Agent-watchdog setup
+echo ""
+echo -e "${CYAN}Agent-Watchdog Setup (Optional)${NC}"
+echo "The agent-watchdog automatically sends 'Continue' prompts to idle agents for 24/7 autonomous operation."
+echo ""
+echo -n "Enable agent-watchdog? (yes/no, default: no): "
+read -r ENABLE_WATCHDOG
+WATCHDOG_INTERVAL=""
+if [[ "$ENABLE_WATCHDOG" =~ ^[Yy][Ee]?[Ss]?$ ]]; then
+    echo -n "Check interval? (e.g., 2m, 5m, 10m, default: 2m): "
+    read -r WATCHDOG_INTERVAL
+    WATCHDOG_INTERVAL=$(echo "$WATCHDOG_INTERVAL" | xargs)
+    if [[ -z "$WATCHDOG_INTERVAL" ]]; then
+        WATCHDOG_INTERVAL="2m"
+    fi
+    print_success "Agent-watchdog will be configured with interval: $WATCHDOG_INTERVAL"
+fi
+
 # Confirm before proceeding
 echo -e "\n${YELLOW}Ready to begin setup?${NC}"
 echo "  Cookie length: ${#CURSOR_COOKIE} characters"
 echo "  Server: $(hostname)"
 [[ -n "$TELEGRAM_OWNER_ID" ]] && echo "  Telegram owner: $TELEGRAM_OWNER_ID"
+[[ -n "$WATCHDOG_INTERVAL" ]] && echo "  Agent-watchdog: enabled (interval: $WATCHDOG_INTERVAL)"
 echo ""
 echo -n "Proceed with setup? (yes/no): "
 read -r CONFIRM
@@ -914,6 +933,34 @@ echo ""
 print_success "All automated setup steps completed!"
 
 ###############################################################################
+# Optional: Setup agent-watchdog cron job
+###############################################################################
+
+if [[ -n "$WATCHDOG_INTERVAL" ]]; then
+    print_step "Setting up agent-watchdog cron job"
+    
+    WATCHDOG_RESULT=$(docker exec openclaw npx openclaw cron add \
+      --name "agent-watchdog" \
+      --every "$WATCHDOG_INTERVAL" \
+      --session session:watchdog \
+      --message "Check all active agent sessions using sessions_list. For any session that has been idle for more than 5 minutes, send this message using sessions_send: 'If you think you got stopped mid-way, then please continue your work. Ignore this if you already finished.'" 2>&1)
+    
+    if echo "$WATCHDOG_RESULT" | grep -q "id"; then
+        print_success "Agent-watchdog configured (interval: $WATCHDOG_INTERVAL)"
+        echo ""
+        echo -e "${GREEN}Watchdog details:${NC}"
+        docker exec openclaw npx openclaw cron list 2>/dev/null | grep -A 1 "agent-watchdog" || echo "$WATCHDOG_RESULT"
+    else
+        print_warning "Agent-watchdog setup failed. You can set it up manually later:"
+        echo "  docker exec openclaw npx openclaw cron add --name agent-watchdog --every $WATCHDOG_INTERVAL --session session:watchdog --message \"...\""
+        echo ""
+        echo "Error output:"
+        echo "$WATCHDOG_RESULT"
+    fi
+    echo ""
+fi
+
+###############################################################################
 # Show logs
 ###############################################################################
 
@@ -979,6 +1026,13 @@ docker restart cursor-proxy openclaw
 cd /opt/cursor-proxy-patched && git pull origin master
 cp src/*.js /opt/ && docker restart cursor-proxy
 
+# Manage agent-watchdog cron job:
+docker exec openclaw npx openclaw cron list
+docker exec openclaw npx openclaw cron show <cron-id>
+docker exec openclaw npx openclaw cron pause <cron-id>
+docker exec openclaw npx openclaw cron resume <cron-id>
+docker exec openclaw npx openclaw cron remove <cron-id>
+
 ${CYAN}${SEP}${NC}
 
 ${GREEN}If everything works, you're done! ${NC}
@@ -990,4 +1044,6 @@ If you encounter issues, check:
 
 print_header "Setup Complete!"
 echo -e "${GREEN}The Cursor-To-OpenAI -> OpenClaw integration is ready.${NC}"
-echo -e "${GREEN}Default model: Claude 4.5 Sonnet (Thinking)${NC}\n"
+echo -e "${GREEN}Default model: Claude 4.5 Sonnet (Thinking)${NC}"
+[[ -n "$WATCHDOG_INTERVAL" ]] && echo -e "${GREEN}Agent-watchdog: enabled (interval: $WATCHDOG_INTERVAL)${NC}"
+echo ""
