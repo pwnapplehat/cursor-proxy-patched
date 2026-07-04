@@ -1,3 +1,5 @@
+# Not maintained anymore, Use https://github.com/pwnapplehat/Cursor-OpenAI 
+
 # Cursor-To-OpenAI (Patched Fork)
 
 > Patched fork of [JiuZ-Chn/Cursor-To-OpenAI](https://github.com/JiuZ-Chn/Cursor-To-OpenAI) with six fixes for full [OpenClaw](https://openclaw.io) agent compatibility — including tool calling emulation, agent mode, and developer role handling.
